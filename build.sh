@@ -45,6 +45,7 @@ python3 -m venv "$BUILD_VENV"
     pyinstaller \
     bleak \
     requests \
+    charset-normalizer \
     scapy
 
 echo "      Done."

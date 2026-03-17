@@ -1,0 +1,24 @@
+[Unit]
+Description=DroneAware WiFi Remote ID Feeder
+After=network-online.target droneaware-bt-select.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/opt/droneaware/config.env
+ExecStart=/usr/local/bin/wifi_feeder \
+    --node-id ${NODE_ID} \
+    --server ${SERVER_URL} \
+    --iface ${WIFI_ADAPTER} \
+    --batch-size ${BATCH_SIZE} \
+    --flush-interval ${FLUSH_INTERVAL} \
+    --enrollment-secret ${ENROLLMENT_SECRET}
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=droneaware-wifi
+
+[Install]
+WantedBy=multi-user.target

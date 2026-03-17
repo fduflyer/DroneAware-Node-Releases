@@ -1,0 +1,27 @@
+[Unit]
+Description=DroneAware BLE Remote ID Feeder
+After=network-online.target bluetooth.target droneaware-bt-select.service
+Wants=network-online.target
+Requires=droneaware-bt-select.service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/opt/droneaware/config.env
+ExecStartPre=/usr/sbin/rfkill unblock bluetooth
+ExecStart=/usr/local/bin/ble_feeder \
+    --node-id ${NODE_ID} \
+    --server ${SERVER_URL} \
+    --adapter ${BLE_ADAPTER} \
+    --adapter-mac ${BLE_ADAPTER_MAC} \
+    --batch-size ${BATCH_SIZE} \
+    --flush-interval ${FLUSH_INTERVAL} \
+    --enrollment-secret ${ENROLLMENT_SECRET}
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=droneaware-ble
+
+[Install]
+WantedBy=multi-user.target
