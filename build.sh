@@ -42,10 +42,10 @@ echo "[1/3] Setting up build environment..."
 python3 -m venv "$BUILD_VENV"
 "$BUILD_VENV/bin/pip" install --quiet --upgrade pip
 "$BUILD_VENV/bin/pip" install --quiet \
-    pyinstaller \
-    bleak \
-    requests \
-    charset-normalizer
+    "pyinstaller==6.19.0" \
+    "bleak==2.1.1" \
+    "requests==2.32.5" \
+    "charset-normalizer==3.4.6"
 
 echo "      Done."
 
