@@ -9,7 +9,7 @@
 set -e
 
 RELEASE_TAG="v1.0.0"
-GITHUB_REPO="fduflyer/DroneAware-Node"
+GITHUB_REPO="fduflyer/DroneAware-Node-Releases"
 INSTALL_DIR="/opt/droneaware"
 BIN_DIR="/usr/local/bin"
 SERVER_URL="https://api.droneaware.io/api"
