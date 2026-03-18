@@ -8,7 +8,7 @@
 
 set -e
 
-RELEASE_TAG="v1.0.0"
+RELEASE_TAG="v1.0.1"
 GITHUB_REPO="fduflyer/DroneAware-Node-Releases"
 INSTALL_DIR="/opt/droneaware"
 BIN_DIR="/usr/local/bin"
@@ -34,7 +34,7 @@ show_terms() {
     clear
     echo -e "${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════════════╗"
-    echo "║            DroneAware Feeder Node — Installer v1.0.0               ║"
+    echo "║            DroneAware Feeder Node — Installer v1.0.1               ║"
     echo "╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
