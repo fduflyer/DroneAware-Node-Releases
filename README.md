@@ -2,7 +2,9 @@
 
 **Turn a Raspberry Pi into a live drone detection sensor in under 10 minutes.**
 
-DroneAware nodes listen for FAA-mandated Remote ID broadcasts from drones flying in your area and forward them to the DroneAware network, where they appear on a live map at [droneaware.io](https://droneaware.io).
+DroneAware nodes listen for FAA-mandated Remote ID broadcasts from drones flying
+in your area and forward them to the DroneAware network, where they appear on a
+live map at [droneaware.io](https://droneaware.io).
 
 ---
 
@@ -18,10 +20,53 @@ DroneAware nodes listen for FAA-mandated Remote ID broadcasts from drones flying
 | Ethernet cable or WiFi credentials | For initial setup |
 
 > **Why a USB Bluetooth adapter?**
-> The Pi's built-in Bluetooth works, but its antenna is inside the case. A USB dongle with an external antenna has significantly better range. The Sena UD100 / CSR chipset is confirmed working and widely available for under $20.
+> The Pi's built-in Bluetooth works, but its antenna is inside the case. A USB
+> dongle with an external antenna has significantly better range. The Sena UD100
+> / CSR chipset is confirmed working and widely available for under $20.
 
 > **Why the Alfa WiFi adapter?**
-> The Alfa AWUS036N supports monitor mode, which is required to capture Wi-Fi Remote ID beacon frames (the 802.11 transport used by many newer drones). The Pi's built-in WiFi cannot be put into monitor mode reliably.
+> The Alfa AWUS036N supports monitor mode, which is required to capture Wi-Fi
+> Remote ID beacon frames (the 802.11 transport used by many newer drones). The
+> Pi's built-in WiFi cannot be put into monitor mode reliably.
+
+---
+
+## How It Works
+
+DroneAware nodes run two background services that continuously scan for drone
+Remote ID broadcasts:
+
+**BLE Feeder (`droneaware-ble`)**
+Listens for Bluetooth Low Energy advertisements carrying Remote ID service data
+(UUID 0xFFFA, ASTM F3411). When a drone broadcast is detected, the raw 25-byte
+ODID message is forwarded to the DroneAware server in batches. All decoding
+(drone ID, position, speed, operator location) happens server-side.
+
+**WiFi Feeder (`droneaware-wifi`)**
+Places the Alfa adapter into monitor mode and hops across 2.4 GHz channels
+(1–11) looking for 802.11 beacon frames carrying vendor-specific Remote ID
+payloads (OUI FA:0B:BC, ASTM F3411) and Wi-Fi NAN action frames (OUI 50:6F:9A).
+Detected payloads are forwarded to the server alongside MAC address and RSSI.
+
+**Data Flow**
+```
+Drone (Remote ID broadcast)
+  → Pi USB BT/WiFi adapter (raw capture)
+    → ble_feeder / wifi_feeder (batch over HTTPS)
+      → api.droneaware.io (decode + store)
+        → flight.droneaware.io (live map)
+```
+
+Both services start automatically at boot, restart on crash, and send a
+heartbeat to the server every 60 seconds so the dashboard shows the node as
+online. No data is stored on the Pi — everything is forwarded in real time.
+
+**What data is collected?**
+Only data broadcast publicly by the drones themselves via FAA-mandated Remote ID
+transmissions. Remote ID is an open broadcast — equivalent to a drone's tail
+number visible on a radar screen. No private communications, networks, or
+personal devices are accessed. Your node's GPS coordinates are stored on the
+DroneAware server to correctly place detections on the map.
 
 ---
 
@@ -33,27 +78,28 @@ DroneAware nodes listen for FAA-mandated Remote ID broadcasts from drones flying
 2. Click **Choose OS → Raspberry Pi OS (other) → Raspberry Pi OS Lite (64-bit)**.
 3. Click the **gear icon** (Advanced Options) and configure:
    - Set hostname: e.g. `droneaware-node`
-   - Enable SSH, set a username/password (remember these)
-   - **Optional but recommended:** enter your WiFi network name and password here — this avoids needing an Ethernet cable
+   - Enable SSH and set a username/password
+   - **Optional but recommended:** enter your WiFi credentials here to avoid
+     needing an Ethernet cable
 4. Select your SD card and click **Write**.
 
 ### Step 2 — Boot the Pi
 
 1. Insert the SD card, plug in your USB Bluetooth adapter, connect power.
 2. Wait 60–90 seconds for the Pi to boot.
-3. Find the Pi's IP address:
-   - Check your router's device list, or
-   - If you set a hostname, try `ssh droneaware-node.local` (or whatever hostname you chose)
-4. SSH into the Pi:
-   ```
+3. SSH into the Pi:
+   ```bash
    ssh <your-username>@<pi-ip-address>
    ```
    Then switch to root:
-   ```
+   ```bash
    sudo -i
    ```
 
-### Step 3 — Install DroneAware
+> **Finding your Pi's IP address:** check your router's device list, or if you
+> set a hostname try `ssh droneaware-node.local`.
+
+### Step 3 — Run the Installer
 
 Run this single command:
 
@@ -61,90 +107,61 @@ Run this single command:
 curl -fsSL https://droneaware.io/install | sudo bash
 ```
 
-This downloads all the DroneAware software and takes about 2 minutes.
+The installer will:
 
-When it finishes, run the setup wizard:
+1. **Display the DroneAware Feeder Node Contributor Agreement** — you must type
+   `yes` to accept before installation proceeds. By accepting, you agree to the
+   terms governing data ownership and network participation. See [LICENSE](LICENSE)
+   for full terms.
 
-```bash
-sudo droneaware-setup
-```
+2. **Prompt for a node nickname** — a short name to identify this sensor on the
+   DroneAware network (e.g. `my-garage`, `rooftop-east`).
 
-### Step 4 — Follow the Setup Wizard
+3. **Auto-detect your USB WiFi adapter** — the installer finds the external
+   adapter automatically. If none is found, it will exit with instructions.
 
-The wizard will ask you five things:
+4. **Install system packages and download binaries** from the
+   [v1.0.0 release](https://github.com/fduflyer/DroneAware-Node/releases/tag/v1.0.0).
 
-1. **Internet check** — confirms the Pi can reach the DroneAware servers.
+5. **Enroll the node** with the DroneAware network and display your claim code.
 
-2. **Node ID** — a short unique name for your sensor (e.g. `DA-B1C7`).
-   The wizard auto-generates one from your Bluetooth adapter's MAC address.
-   You can accept the suggestion or type your own.
+### Step 4 — Claim Your Node
 
-3. **Location** — the GPS coordinates and mounting height of your antenna.
-
-   **How to find your coordinates:**
-   - **Google Maps**: right-click exactly where your antenna is located → the coordinates appear at the top of the popup. Click them to copy.
-   - **iPhone Maps**: tap and hold on the map at your antenna location → coordinates appear at the top of the screen.
-   - **Google Earth**: hover your cursor over the antenna location and read from the bottom status bar.
-
-   **Elevation above ground** is how high the antenna is mounted above the surface directly below it — *not* altitude above sea level.
-   - Ground-floor window: ~2 m
-   - Second-floor window or flat rooftop: ~5–8 m
-   - Rooftop antenna mast: 10–15 m
-
-4. **Software install** — runs automatically, no input needed (~3 minutes).
-
-5. **Node registration** — your node contacts the DroneAware server, gets a token, and receives a **claim link**.
-
-### Step 5 — Claim Your Node
-
-At the end of setup, the wizard displays something like:
+At the end of installation, the installer displays:
 
 ```
-╔══════════════════════════════════════════════════════════════╗
-║  Your node is enrolled! Link it to your account below.       ║
-║                                                              ║
-║  Claim URL:  https://droneaware.io/claim/DA-B1C7?code=XXXX  ║
-║  Code:       XXXX-YYYY                                       ║
-║                                                              ║
-║  This link expires in 48 hours.                              ║
-║  Saved to: /etc/droneaware/claim.txt                         ║
-╚══════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════════╗
+║                    Installation Complete!                           ║
+║  Node ID   : my-garage                                              ║
+║  Claim Code: 6F4EZ8                                                 ║
+║  Claim URL : https://flight.droneaware.io/claim.html?code=6F4EZ8   ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  NEXT STEP: Visit the Claim URL above to activate your node on     ║
+║  the DroneAware network.                                            ║
+╚══════════════════════════════════════════════════════════════════════╝
 ```
 
-Open the claim URL in a browser, create a free account (or log in), and link the node to your account. This gives you:
+Open the Claim URL in a browser, log in or create a free account, and link the
+node to your account. This gives you:
 
 - Your node on the live map
 - Detection history and alerts
-- The ability to manage your node remotely
+- Remote node management
 
-> If you miss the 48-hour window, contact support at droneaware.io to reset your claim code.
-> You can also view the URL again any time: `cat /etc/droneaware/claim.txt`
-
----
-
-## What Happens After Setup
-
-Both feeder services start automatically at boot and restart themselves if they crash:
-
-| Service | What it does |
-|---|---|
-| `droneaware-ble` | Scans for Bluetooth Remote ID broadcasts (ASTM F3411 over BLE) |
-| `droneaware-wifi` | Captures Wi-Fi Remote ID beacon frames (requires Alfa adapter) |
-
-Every detection is forwarded to the DroneAware server in real time. Every 60 seconds, the node sends a heartbeat so the dashboard shows it as online.
+> Your claim code is saved to `/etc/droneaware/claim.txt` and expires in 48
+> hours. If you miss the window, contact support at droneaware.io.
 
 ---
 
 ## Useful Commands
 
 ```bash
-# Check if the BLE feeder is running
+# Check service status
 sudo systemctl status droneaware-ble
+sudo systemctl status droneaware-wifi
 
-# Watch live detection log
+# Watch live detection logs
 sudo journalctl -u droneaware-ble -f
-
-# Watch live WiFi feeder log
 sudo journalctl -u droneaware-wifi -f
 
 # View your claim URL
@@ -152,39 +169,61 @@ cat /etc/droneaware/claim.txt
 
 # Edit node config (location, server URL, etc.)
 sudo nano /opt/droneaware/config.env
-sudo systemctl restart droneaware-ble
+sudo systemctl restart droneaware-ble droneaware-wifi
 
-# Re-run setup wizard (e.g. after hardware change)
-sudo rm /opt/droneaware/.configured
-sudo droneaware-setup
+# Start feeders manually (they start automatically on next reboot)
+sudo systemctl start droneaware-ble droneaware-wifi
 ```
 
 ---
 
 ## Troubleshooting
 
-**The wizard says "No USB Bluetooth adapter detected"**
-Make sure the USB dongle is plugged in before running `droneaware-setup`. Unplug and replug it, then run `hciconfig -a` to confirm the Pi sees it.
-
-**"No internet connection detected"**
-- If using Ethernet: check the cable and that your router assigned an IP (`ip addr show eth0`).
-- If using WiFi: verify your credentials in `/boot/wpa_supplicant.conf`, then reboot.
+**"USB WiFi adapter required" — installer exits immediately**
+The installer requires a USB WiFi adapter to be present. Connect your Alfa
+AWUS036N (or compatible monitor-mode adapter) before running the installer, then
+run it again.
 
 **The BLE feeder starts but shows 0 detections**
-This is normal — there may simply be no drones broadcasting Remote ID nearby. Remote ID is only required for drones registered after September 2023 and most recreational fliers. Detection depends on local drone activity.
+This is normal — there may simply be no drones broadcasting Remote ID nearby.
+Remote ID is only required for drones registered after September 2023, and most
+recreational fliers are not yet compliant. Detection depends entirely on local
+drone activity.
 
-**I need to change my node's location**
-Edit `/opt/droneaware/config.env` and update `NODE_LAT`, `NODE_LON`, and `NODE_ELEVATION_AGL_M`. Then restart the services:
+**WiFi feeder fails to start or keeps restarting**
 ```bash
-sudo systemctl restart droneaware-ble droneaware-wifi
+sudo journalctl -u droneaware-wifi -n 50
 ```
-Contact support to update the location on the server side as well.
+Common causes:
+- USB WiFi adapter not plugged in or not detected (`ip link show`)
+- Adapter does not support monitor mode (must be Ralink RT3070 or compatible)
+- Another process (NetworkManager) has taken control of the interface —
+  the installer configures NM to ignore the adapter, but a reinstall of NM
+  may revert this
 
-**The feeder service keeps restarting**
+**The BLE feeder keeps restarting**
 ```bash
 sudo journalctl -u droneaware-ble -n 50
 ```
-Look for error messages. Common causes: Bluetooth adapter not found (`--adapter-mac` mismatch), Python dependency missing, or the server is unreachable.
+Common causes:
+- USB Bluetooth adapter not detected — run `hciconfig -a` to confirm the Pi
+  sees it; unplug and replug the dongle if not
+- Adapter MAC in `config.env` doesn't match the installed adapter — update
+  `BLE_ADAPTER_MAC` in `/opt/droneaware/config.env` and restart
+
+**"No internet connection" during install**
+- Ethernet: check the cable and that your router assigned an IP
+  (`ip addr show eth0`)
+- WiFi: verify your credentials are correct, then reboot and try again
+
+**I need to change my node's location**
+Edit `/opt/droneaware/config.env` and update `NODE_LAT`, `NODE_LON`, and
+`NODE_ELEVATION_AGL_M`, then restart:
+```bash
+sudo nano /opt/droneaware/config.env
+sudo systemctl restart droneaware-ble droneaware-wifi
+```
+Also contact support at droneaware.io to update the location on the server side.
 
 **I lost my claim URL**
 ```bash
@@ -196,29 +235,28 @@ If the file is gone and the 48-hour window has passed, contact support.
 
 ## Node File Locations
 
-| File | Purpose |
+| Path | Purpose |
 |---|---|
-| `/opt/droneaware/config.env` | Main configuration (node ID, location, token) |
-| `/opt/droneaware/ble_feeder.py` | BLE Remote ID capture script |
-| `/opt/droneaware/wifi_feeder.py` | WiFi Remote ID capture script |
+| `/usr/local/bin/ble_feeder` | BLE Remote ID feeder binary |
+| `/usr/local/bin/wifi_feeder` | WiFi Remote ID feeder binary |
+| `/usr/local/bin/droneaware-bt-select` | Boot-time Bluetooth adapter selector |
+| `/opt/droneaware/config.env` | Node configuration (ID, location, adapters, token) |
 | `/etc/droneaware/token` | Node auth token (written at enrollment) |
 | `/etc/droneaware/claim.txt` | Claim URL and code from enrollment |
-| `/opt/droneaware/.configured` | Sentinel file — delete this to re-run setup wizard |
+| `/etc/systemd/system/droneaware-ble.service` | BLE feeder systemd unit |
+| `/etc/systemd/system/droneaware-wifi.service` | WiFi feeder systemd unit |
+| `/etc/systemd/system/droneaware-bt-select.service` | BT selector systemd unit |
+| `/var/log/droneaware_ble.log` | BLE feeder log file |
 | `/var/log/droneaware_wifi.log` | WiFi feeder log file |
-
----
-
-## Privacy
-
-DroneAware captures and forwards **only data broadcast publicly by the drones themselves** via FAA-mandated Remote ID transmissions. Remote ID is an open broadcast — equivalent to a drone's tail number. No private communications, networks, or devices are accessed. Your node's location coordinates are stored on the DroneAware server to correctly place detections on the map.
 
 ---
 
 ## Support
 
 - Website: [droneaware.io](https://droneaware.io)
-- GitHub: [github.com/droneaware-io/node](https://github.com/droneaware-io/node)
+- GitHub: [github.com/fduflyer/DroneAware-Node](https://github.com/fduflyer/DroneAware-Node)
 
 ---
 
-*Copyright (c) 2026 DroneAware, LLC. Use of this software is subject to the terms of the DroneAware Feeder Node Software License. See [LICENSE](LICENSE) for details.*
+*Copyright (c) 2026 DroneAware, LLC. Use of this software is subject to the
+terms of the DroneAware Feeder Node Software License. See [LICENSE](LICENSE) for details.*
