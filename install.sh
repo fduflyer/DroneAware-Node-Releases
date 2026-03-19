@@ -319,6 +319,10 @@ print_summary() {
     echo  "║  Feeders start automatically on next reboot.                       ║"
     echo  "║  To start now:  sudo systemctl start droneaware-ble droneaware-wifi║"
     echo  "║  To view logs:  journalctl -u droneaware-ble -f                    ║"
+    echo  "╠══════════════════════════════════════════════════════════════════════╣"
+    echo  "║  NOTE: On first boot your Pi may reboot once automatically to      ║"
+    echo  "║  configure the Bluetooth adapter. This is normal — wait 30         ║"
+    echo  "║  seconds and reconnect if your SSH drops after rebooting.          ║"
     echo  "╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
