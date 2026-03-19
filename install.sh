@@ -1,6 +1,6 @@
 #!/bin/bash
 # DroneAware Feeder Node Installer
-# Version: 1.0.2
+# Version: 1.0.3
 # Usage:  sudo bash install.sh
 #
 # Requires: Raspberry Pi OS Bookworm 64-bit, internet connection,
@@ -8,7 +8,7 @@
 
 set -e
 
-RELEASE_TAG="v1.0.2"
+RELEASE_TAG="v1.0.3"
 GITHUB_REPO="fduflyer/DroneAware-Node-Releases"
 INSTALL_DIR="/opt/droneaware"
 BIN_DIR="/usr/local/bin"
@@ -34,7 +34,7 @@ show_terms() {
     clear
     echo -e "${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════════════╗"
-    echo "║            DroneAware Feeder Node — Installer v1.0.2               ║"
+    echo "║            DroneAware Feeder Node — Installer v1.0.3               ║"
     echo "╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
@@ -147,7 +147,24 @@ detect_wifi_adapter() {
 }
 
 # ---------------------------------------------------------------------------
-# 4. System packages
+# 4. Pin WiFi monitor adapter as unmanaged in NetworkManager
+# ---------------------------------------------------------------------------
+pin_wifi_unmanaged() {
+    heading "Configuring NetworkManager"
+    mkdir -p /etc/NetworkManager/conf.d
+    cat > /etc/NetworkManager/conf.d/droneaware.conf <<EOF
+# DroneAware — prevent NetworkManager from managing the monitor adapter.
+# If NM manages the monitor interface it fights the feeder's monitor mode
+# setup, causing zero packet capture and intermittent SSH instability.
+[keyfile]
+unmanaged-devices=interface-name:${WIFI_ADAPTER}
+EOF
+    systemctl reload NetworkManager > /dev/null 2>&1 || systemctl restart NetworkManager > /dev/null 2>&1
+    info "${WIFI_ADAPTER} set as unmanaged (monitor-only) in NetworkManager."
+}
+
+# ---------------------------------------------------------------------------
+# 5. System packages
 # ---------------------------------------------------------------------------
 install_packages() {
     heading "Installing System Packages"
@@ -161,7 +178,7 @@ install_packages() {
 }
 
 # ---------------------------------------------------------------------------
-# 5. Download binaries from GitHub Release
+# 6. Download binaries from GitHub Release
 # ---------------------------------------------------------------------------
 download_binaries() {
     heading "Downloading DroneAware Binaries ($RELEASE_TAG)"
@@ -179,7 +196,7 @@ download_binaries() {
 }
 
 # ---------------------------------------------------------------------------
-# 6. Install bt-select script and service files
+# 7. Install bt-select script and service files
 # ---------------------------------------------------------------------------
 install_services() {
     heading "Installing Services"
@@ -206,7 +223,7 @@ install_services() {
 }
 
 # ---------------------------------------------------------------------------
-# 7. Write config.env
+# 8. Write config.env
 # ---------------------------------------------------------------------------
 write_config() {
     heading "Writing Configuration"
@@ -232,7 +249,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# 8. Enroll node — requires a logged-in DroneAware account
+# 9. Enroll node — requires a logged-in DroneAware account
 # ---------------------------------------------------------------------------
 enroll_node() {
     heading "Node Enrollment"
@@ -285,7 +302,7 @@ enroll_node() {
 }
 
 # ---------------------------------------------------------------------------
-# 9. Print summary
+# 10. Print summary
 # ---------------------------------------------------------------------------
 print_summary() {
     echo ""
@@ -312,6 +329,7 @@ require_root
 accept_terms
 prompt_node_id
 detect_wifi_adapter
+pin_wifi_unmanaged
 install_packages
 download_binaries
 install_services
