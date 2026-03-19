@@ -1,6 +1,6 @@
 #!/bin/bash
 # DroneAware Feeder Node Installer
-# Version: 1.0.3
+# Version: 1.0.4
 # Usage:  sudo bash install.sh
 #
 # Requires: Raspberry Pi OS Bookworm 64-bit, internet connection,
@@ -8,7 +8,7 @@
 
 set -e
 
-RELEASE_TAG="v1.0.3"
+RELEASE_TAG="v1.0.4"
 GITHUB_REPO="fduflyer/DroneAware-Node-Releases"
 INSTALL_DIR="/opt/droneaware"
 BIN_DIR="/usr/local/bin"
@@ -34,7 +34,7 @@ show_terms() {
     clear
     echo -e "${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════════════╗"
-    echo "║            DroneAware Feeder Node — Installer v1.0.3               ║"
+    echo "║            DroneAware Feeder Node — Installer v1.0.4               ║"
     echo "╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
@@ -256,9 +256,9 @@ enroll_node() {
     echo ""
     echo "  To enroll this node you need a DroneAware account."
     echo ""
-    echo "  1. Open ${BOLD}https://flight.droneaware.io/nodes${NC} in your browser"
+    echo -e "  1. Open ${BOLD}https://flight.droneaware.io/nodes${NC} in your browser"
     echo "  2. Log in (or create a free account)"
-    echo "  3. Click ${BOLD}Add Node${NC}"
+    echo -e "  3. Click ${BOLD}Add Node${NC}"
     echo "  4. Accept the Contributor Agreement if prompted"
     echo "  5. Copy the enrollment token shown (valid for 15 minutes)"
     echo ""
