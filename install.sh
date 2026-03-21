@@ -1,6 +1,6 @@
 #!/bin/bash
 # DroneAware Feeder Node Installer
-# Version: 1.0.7
+# Version: 1.0.8
 # Usage:  sudo bash install.sh
 #
 # Requires: Raspberry Pi OS Bookworm 64-bit, internet connection,
@@ -8,7 +8,7 @@
 
 set -e
 
-RELEASE_TAG="v1.0.7"
+RELEASE_TAG="v1.0.8"
 GITHUB_REPO="fduflyer/DroneAware-Node-Releases"
 INSTALL_DIR="/opt/droneaware"
 BIN_DIR="/usr/local/bin"
@@ -34,7 +34,7 @@ show_terms() {
     clear
     echo -e "${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════════════╗"
-    echo "║            DroneAware Feeder Node — Installer v1.0.7               ║"
+    echo "║            DroneAware Feeder Node — Installer v1.0.8               ║"
     echo "╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
@@ -122,7 +122,98 @@ prompt_node_id() {
 }
 
 # ---------------------------------------------------------------------------
-# 3. Detect external USB WiFi adapter
+# 3. Node location — mobile vs. static
+# ---------------------------------------------------------------------------
+prompt_location() {
+    heading "Node Location"
+    echo ""
+    echo "  Is this node fixed in one place, or will it move around"
+    echo "  (e.g. mounted in a vehicle or carried on a drone)"
+    echo ""
+
+    while true; do
+        read -rp "  Node type — [S]tatic or [M]obile: " loc_type </dev/tty
+        case "${loc_type,,}" in
+            s|static)
+                NODE_MOBILE=false
+                _prompt_coordinates
+                break
+                ;;
+            m|mobile)
+                NODE_MOBILE=true
+                _detect_gps
+                break
+                ;;
+            *)
+                warn "Please enter S for Static or M for Mobile."
+                ;;
+        esac
+    done
+}
+
+_prompt_coordinates() {
+    echo ""
+    echo "  Enter the GPS coordinates of this node's fixed location."
+    echo ""
+    echo "  How to find your coordinates:"
+    echo "    1. Open https://maps.google.com in your browser"
+    echo "    2. Navigate to the exact spot where this node is installed"
+    echo "    3. Right-click on that spot"
+    echo "    4. The coordinates appear at the top of the menu — click them to copy"
+    echo ""
+    echo "    Example: 40.457568, -74.339130"
+    echo ""
+    echo -e "  ${BOLD}Note:${NC} Your precise location is never publicly visible. DroneAware"
+    echo "  displays only a 2-mile detection ring around your node — your exact"
+    echo "  coordinates are kept private."
+    echo ""
+
+    while true; do
+        read -rp "  Latitude  (e.g. 40.457568): " NODE_LAT </dev/tty
+        NODE_LAT="${NODE_LAT// /}"
+        if [[ "$NODE_LAT" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] && \
+           awk -v v="$NODE_LAT" 'BEGIN{exit !(v>=-90&&v<=90)}'; then
+            break
+        fi
+        warn "Invalid latitude. Must be a number between -90 and 90."
+    done
+
+    while true; do
+        read -rp "  Longitude (e.g. -74.339130): " NODE_LON </dev/tty
+        NODE_LON="${NODE_LON// /}"
+        if [[ "$NODE_LON" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] && \
+           awk -v v="$NODE_LON" 'BEGIN{exit !(v>=-180&&v<=180)}'; then
+            break
+        fi
+        warn "Invalid longitude. Must be a number between -180 and 180."
+    done
+
+    info "Location set: $NODE_LAT, $NODE_LON"
+    GPS_DEVICE=""
+}
+
+_detect_gps() {
+    heading "Detecting USB GPS"
+    GPS_DEVICE=""
+    NODE_LAT=""
+    NODE_LON=""
+
+    for dev in /dev/ttyUSB* /dev/ttyACM*; do
+        [[ -e "$dev" ]] || continue
+        GPS_DEVICE="$dev"
+        info "USB GPS device detected: $GPS_DEVICE"
+        break
+    done
+
+    if [[ -z "$GPS_DEVICE" ]]; then
+        warn "No USB GPS device detected."
+        warn "Connect a USB GPS module (e.g. u-blox 7/8) before starting the feeder."
+        warn "The node will operate without GPS — detections will have no location data."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 4. Detect external USB WiFi adapter
 # ---------------------------------------------------------------------------
 detect_wifi_adapter() {
     heading "Detecting WiFi Adapter"
@@ -275,6 +366,10 @@ SERVER_URL=${SERVER_URL}
 BLE_ADAPTER=${BLE_ADAPTER}
 BLE_ADAPTER_MAC=${BLE_ADAPTER_MAC}
 WIFI_ADAPTER=${WIFI_ADAPTER}
+NODE_MOBILE=${NODE_MOBILE}
+NODE_LAT=${NODE_LAT:-}
+NODE_LON=${NODE_LON:-}
+GPS_DEVICE=${GPS_DEVICE:-}
 BATCH_SIZE=200
 FLUSH_INTERVAL=5.0
 EOF
@@ -366,6 +461,7 @@ print_summary() {
 require_root
 accept_terms
 prompt_node_id
+prompt_location
 detect_wifi_adapter
 persist_wifi_profiles
 pin_wifi_unmanaged
