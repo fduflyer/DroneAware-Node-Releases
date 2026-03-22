@@ -73,7 +73,7 @@ Both services start automatically at boot, restart on crash, and send a
 heartbeat to the server every 60 seconds so the dashboard shows the node as
 online. No data is stored on the Pi — everything is forwarded in real time.
 
-![DroneAware Screenshot3](https://github.com/fduflyer/DroneAware-Node-Releases/blob/10c30b8860323ae1a3d88da870fb7073cec8d9a1/IMG_3537.png)
+![DroneAware Screenshot3](https://github.com/fduflyer/DroneAware-Node-Releases/blob/9f281478b26e8545b85dd908a041c1dbfccfd6f5/IMG_3537.jpeg)
 
 **What data is collected?**
 Only data broadcast publicly by the drones themselves via FAA-mandated Remote ID
