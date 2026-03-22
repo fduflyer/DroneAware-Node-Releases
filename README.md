@@ -2,6 +2,8 @@
 
 Detect nearby drones (Remote ID) with a Raspberry Pi in minutes
 
+![DroneAware Screenshot](https://github.com/fduflyer/DroneAware-Node-Releases/blob/6ad45edcb46c6b23012bfdd0ee40fc80a8e9320b/IMG_3421.jpeg)
+
 Get a Raspberry Pi 4 and an external wifi adapter, run this single command,and you could be detecting drones around you in 10-15 minutes. 
 
 ```bash
@@ -14,6 +16,7 @@ live map at [droneaware.io](https://droneaware.io).
 
 Once connected, you'll also get real-time email alerts anytime your node(s) detect a drone. You can also go back and view all of your detectioms by date and time to watch a replay of their flight paths. 
 
+![DroneAware Screenshot](https://github.com/fduflyer/DroneAware-Node-Releases/blob/6ad45edcb46c6b23012bfdd0ee40fc80a8e9320b/IMG_3538.jpeg)
 ---
 
 ## What You Need
