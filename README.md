@@ -1,6 +1,6 @@
 # DroneAware Node — Setup Guide
 
-Detect nearby drones (Remote ID) with a Raspberry Pi in minutes
+Detect nearby drones (Remote ID) with a Raspberry Pi in minutes.
 
 ![DroneAware Screenshot](https://github.com/fduflyer/DroneAware-Node-Releases/blob/6ad45edcb46c6b23012bfdd0ee40fc80a8e9320b/IMG_3421.jpeg)
 
@@ -16,7 +16,8 @@ live map at [droneaware.io](https://droneaware.io).
 
 Once connected, you'll also get real-time email alerts anytime your node(s) detect a drone. You can also go back and view all of your detectioms by date and time to watch a replay of their flight paths. 
 
-![DroneAware Screenshot](https://github.com/fduflyer/DroneAware-Node-Releases/blob/6ad45edcb46c6b23012bfdd0ee40fc80a8e9320b/IMG_3538.jpeg)
+![DroneAware Screenshot2](https://github.com/fduflyer/DroneAware-Node-Releases/blob/10c30b8860323ae1a3d88da870fb7073cec8d9a1/IMG_3538.png)
+
 ---
 
 ## What You Need
@@ -71,6 +72,8 @@ Drone (Remote ID broadcast)
 Both services start automatically at boot, restart on crash, and send a
 heartbeat to the server every 60 seconds so the dashboard shows the node as
 online. No data is stored on the Pi — everything is forwarded in real time.
+
+![DroneAware Screenshot3](https://github.com/fduflyer/DroneAware-Node-Releases/blob/10c30b8860323ae1a3d88da870fb7073cec8d9a1/IMG_3537.png)
 
 **What data is collected?**
 Only data broadcast publicly by the drones themselves via FAA-mandated Remote ID
