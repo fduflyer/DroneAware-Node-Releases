@@ -1,6 +1,6 @@
 #!/bin/bash
 # DroneAware Feeder Node Installer
-# Version: 1.0.12
+# Version: 1.0.13
 # Usage:  sudo bash install.sh
 #
 # Requires: Raspberry Pi OS Bookworm 64-bit, internet connection,
@@ -8,7 +8,7 @@
 
 set -e
 
-INSTALLER_VERSION="v1.0.12"
+INSTALLER_VERSION="v1.0.13"
 BINARY_VERSION="v1.0.12"  # last release containing updated binaries
 SERVICE_VERSION="v1.0.6"  # last release containing service files and bt-select script
 GITHUB_REPO="fduflyer/DroneAware-Node-Releases"
@@ -36,7 +36,7 @@ show_terms() {
     clear
     echo -e "${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════════════╗"
-    echo "║            DroneAware Feeder Node — Installer v1.0.12              ║"
+    echo "║            DroneAware Feeder Node — Installer v1.0.13              ║"
     echo "╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
@@ -402,9 +402,6 @@ enroll_node() {
         warn "Enrollment token cannot be empty."
     done
 
-    echo ""
-    echo "  Contacting DroneAware network..."
-
     # Build JSON-safe values for optional numeric/boolean fields
     local lat_json lon_json has_gps_json
     if [[ -n "${NODE_LAT:-}" ]]; then
@@ -416,31 +413,64 @@ enroll_node() {
     fi
     [[ -n "${GPS_DEVICE:-}" ]] && has_gps_json="true" || has_gps_json="false"
 
-    local response
-    response=$(curl -sf --max-time 15 \
-        -H "Content-Type: application/json" \
-        -d "{\"node_id\":\"${NODE_ID}\",\"enrollment_token\":\"${enrollment_token}\",\"mobile\":${NODE_MOBILE},\"has_gps\":${has_gps_json},\"lat\":${lat_json},\"lon\":${lon_json}}" \
-        "${SERVER_URL}/node/enroll" 2>/dev/null) || true
+    while true; do
+        echo ""
+        echo "  Contacting DroneAware network..."
 
-    if [[ -z "$response" ]]; then
-        fatal "Enrollment request failed. Check your internet connection and try again."
-    fi
+        local http_status response
+        http_status=$(curl -s --max-time 15 \
+            -o /tmp/droneaware_enroll.json \
+            -w "%{http_code}" \
+            -H "Content-Type: application/json" \
+            -d "{\"node_id\":\"${NODE_ID}\",\"enrollment_token\":\"${enrollment_token}\",\"mobile\":${NODE_MOBILE},\"has_gps\":${has_gps_json},\"lat\":${lat_json},\"lon\":${lon_json}}" \
+            "${SERVER_URL}/node/enroll" 2>/dev/null) || true
+        response=$(cat /tmp/droneaware_enroll.json 2>/dev/null || true)
 
-    local node_credential
-    node_credential=$(echo "$response" | grep -oP '"node_credential"\s*:\s*"\K[^"]+' || true)
-
-    if [[ -z "$node_credential" ]]; then
-        local error_msg
-        error_msg=$(echo "$response" | grep -oP '"detail"\s*:\s*"\K[^"]+' || true)
-        if [[ -n "$error_msg" ]]; then
-            fatal "Enrollment failed: ${error_msg}"
+        if [[ -z "$http_status" || "$http_status" == "000" ]]; then
+            rm -f /tmp/droneaware_enroll.json
+            fatal "Enrollment request failed. Check your internet connection and try again."
         fi
-        fatal "Enrollment failed. The token may have expired — generate a new one and try again."
-    fi
 
-    echo "$node_credential" > /etc/droneaware/token
-    chmod 600 /etc/droneaware/token
-    info "Node enrolled and credential saved."
+        if [[ "$http_status" == "409" ]]; then
+            warn "That node name is already taken by another account. Please choose a different name."
+            echo ""
+            while true; do
+                read -rp "  New node nickname: " NODE_ID </dev/tty
+                NODE_ID="${NODE_ID// /-}"
+                NODE_ID="${NODE_ID,,}"
+                if [[ -z "$NODE_ID" ]]; then
+                    warn "Nickname cannot be empty."
+                elif [[ ! "$NODE_ID" =~ ^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$ ]]; then
+                    warn "Use 3–32 lowercase letters, numbers, or hyphens. Cannot start/end with a hyphen."
+                else
+                    info "Node ID: $NODE_ID"
+                    sed -i "s/^NODE_ID=.*/NODE_ID=${NODE_ID}/" "${INSTALL_DIR}/config.env"
+                    break
+                fi
+            done
+            continue
+        elif [[ "$http_status" == "200" || "$http_status" == "201" ]]; then
+            local node_credential
+            node_credential=$(echo "$response" | grep -oP '"node_credential"\s*:\s*"\K[^"]+' || true)
+            if [[ -z "$node_credential" ]]; then
+                rm -f /tmp/droneaware_enroll.json
+                fatal "Enrollment failed: server returned success but no credential was found in the response."
+            fi
+            echo "$node_credential" > /etc/droneaware/token
+            chmod 600 /etc/droneaware/token
+            rm -f /tmp/droneaware_enroll.json
+            info "Node enrolled and credential saved."
+            break
+        else
+            local error_msg
+            error_msg=$(echo "$response" | grep -oP '"detail"\s*:\s*"\K[^"]+' || true)
+            rm -f /tmp/droneaware_enroll.json
+            if [[ -n "$error_msg" ]]; then
+                fatal "Enrollment failed: ${error_msg}"
+            fi
+            fatal "Enrollment failed (HTTP ${http_status}). The token may have expired — generate a new one and try again."
+        fi
+    done
 }
 
 # ---------------------------------------------------------------------------
