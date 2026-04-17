@@ -17,10 +17,12 @@ Requirements:
 """
 
 import asyncio
+import json
 import logging
 import argparse
 import time
 import socket
+import struct
 import collections
 import os
 import subprocess
@@ -45,6 +47,43 @@ log = logging.getLogger("droneaware.ble")
 # -- Constants -----------------------------------------------------------------
 REMOTE_ID_SERVICE_UUID = "0000fffa-0000-1000-8000-00805f9b34fb"
 MAX_BUFFER = 1000  # ring buffer capacity (events); oldest dropped when full
+
+MSG_TYPE = {
+    0x0: "Basic ID",
+    0x1: "Location/Vector",
+    0x2: "Authentication",
+    0x3: "Self ID",
+    0x4: "System",
+    0x5: "Operator ID",
+    0xF: "Message Pack",
+}
+
+ID_TYPE = {
+    0: "None",
+    1: "Serial Number (ANSI/CTA-2063-A)",
+    2: "CAA Assigned",
+    3: "UTM Assigned",
+    4: "Specific Session ID",
+}
+
+UA_TYPE = {
+    0: "None",
+    1: "Aeroplane",
+    2: "Helicopter/Multirotor",
+    3: "Gyroplane",
+    4: "Hybrid Lift",
+    5: "Ornithopter",
+    6: "Glider",
+    7: "Kite",
+    8: "Free Balloon",
+    9: "Captive Balloon",
+    10: "Airship",
+    11: "Free Fall/Parachute",
+    12: "Rocket",
+    13: "Tethered Powered Aircraft",
+    14: "Ground Obstacle",
+    255: "Other",
+}
 
 
 # -- Adapter Resolution --------------------------------------------------------
@@ -131,6 +170,174 @@ def extract_rid_payload(service_data: bytes) -> tuple[str, str] | tuple[None, No
     return None, None
 
 
+# -- Remote ID Decoder ---------------------------------------------------------
+# (mirrors wifi_feeder.py — pure functions, no shared state)
+
+def parse_basic_id(data: bytes) -> dict:
+    if len(data) < 25:
+        return {}
+    id_type = (data[1] >> 4) & 0x0F
+    ua_type = data[1] & 0x0F
+    uas_id  = data[2:22].rstrip(b'\x00').decode('ascii', errors='replace')
+    return {
+        "id_type": ID_TYPE.get(id_type, f"Unknown({id_type})"),
+        "ua_type": UA_TYPE.get(ua_type, f"Unknown({ua_type})"),
+        "uas_id":  uas_id,
+    }
+
+
+def parse_location(data: bytes) -> dict:
+    if len(data) < 25:
+        return {}
+    speed_mult  = data[1] & 0x01
+    height_type = (data[1] >> 2) & 0x01
+    lat = struct.unpack_from('<i', data, 2)[0] * 1e-7
+    lon = struct.unpack_from('<i', data, 6)[0] * 1e-7
+    if abs(lat) > 90.0 or abs(lon) > 180.0:
+        return {}
+    alt_geodetic = struct.unpack_from('<H', data, 12)[0] * 0.5 - 1000.0
+    height       = struct.unpack_from('<H', data, 14)[0] * 0.5 - 1000.0
+    speed        = data[16] * (0.75 if speed_mult else 0.25)
+    vspeed       = data[17] * 0.5 - 62.0
+    heading      = struct.unpack_from('<H', data, 18)[0] * 0.01
+    return {
+        "latitude":       round(lat, 7),
+        "longitude":      round(lon, 7),
+        "altitude_geo":   round(alt_geodetic, 1),
+        "height_agl":     round(height, 1),
+        "ground_speed":   round(speed, 2),
+        "vertical_speed": round(vspeed, 2),
+        "heading":        round(heading, 1),
+        "height_type":    "AGL" if height_type == 0 else "Above Takeoff",
+    }
+
+
+def parse_system_msg(data: bytes) -> dict:
+    if len(data) < 16:
+        return {}
+    op_lat      = struct.unpack_from('<i', data, 4)[0] * 1e-7
+    op_lon      = struct.unpack_from('<i', data, 8)[0] * 1e-7
+    area_count  = data[12]
+    area_radius = data[13] * 10
+    alt_takeoff = struct.unpack_from('<H', data, 14)[0] * 0.5 - 1000.0
+    return {
+        "operator_lat":    round(op_lat, 7),
+        "operator_lon":    round(op_lon, 7),
+        "area_count":      area_count,
+        "area_radius_m":   area_radius,
+        "alt_takeoff_geo": round(alt_takeoff, 1),
+    }
+
+
+def parse_operator_id(data: bytes) -> dict:
+    if len(data) < 22:
+        return {}
+    return {
+        "operator_id_type": data[1],
+        "operator_id":      data[2:22].rstrip(b'\x00').decode('ascii', errors='replace'),
+    }
+
+
+def parse_message_pack(data: bytes) -> list:
+    if len(data) < 3:
+        return []
+    msg_size  = data[1]
+    msg_count = data[2]
+    messages  = []
+    for i in range(msg_count):
+        offset = 3 + i * msg_size
+        if offset + msg_size > len(data):
+            break
+        messages.append(data[offset: offset + msg_size])
+    return messages
+
+
+def decode_rid_message(raw_bytes: bytes) -> dict | None:
+    if len(raw_bytes) < 2:
+        return None
+    msg_type  = (raw_bytes[0] >> 4) & 0x0F
+    type_name = MSG_TYPE.get(msg_type, f"Unknown(0x{msg_type:X})")
+    result    = {"message_type": type_name, "raw_hex": raw_bytes.hex().upper()}
+    if msg_type == 0x0:
+        result.update(parse_basic_id(raw_bytes))
+    elif msg_type == 0x1:
+        result.update(parse_location(raw_bytes))
+    elif msg_type == 0x4:
+        result.update(parse_system_msg(raw_bytes))
+    elif msg_type == 0x5:
+        result.update(parse_operator_id(raw_bytes))
+    elif msg_type == 0xF:
+        sub_msgs = parse_message_pack(raw_bytes)
+        result["messages"] = [m for m in (decode_rid_message(s) for s in sub_msgs) if m]
+    return result
+
+
+# -- Local Publisher -----------------------------------------------------------
+
+class LocalPublisher:
+    """
+    Writes decoded detections to a tmpfs ring buffer and UDP LAN broadcast.
+
+    Buffer: /run/droneaware/detections.jsonl  (RAM only — gone on reboot,
+            zero SD card wear). Bounded to MAX_LINES entries.
+    UDP:    255.255.255.255:9999 — any device on the LAN can listen.
+    """
+    BUFFER_PATH = "/run/droneaware/detections.jsonl"
+    UDP_PORT    = 9999
+    MAX_LINES   = 3600  # ~60 min at 1 event/sec
+
+    def __init__(self):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        os.makedirs(os.path.dirname(self.BUFFER_PATH), exist_ok=True)
+        self._line_count = 0
+
+    def publish(self, event: dict):
+        decoded = event.get("decoded") or {}
+        if not decoded:
+            return
+
+        record = {
+            "t":     event.get("timestamp") or event.get("observed_at"),
+            "mac":   event.get("source_mac") or event.get("mac"),
+            "radio": event.get("radio"),
+            "rssi":  event.get("rssi"),
+            "type":  decoded.get("message_type"),
+            "lat":   decoded.get("latitude"),
+            "lon":   decoded.get("longitude"),
+            "alt":   decoded.get("altitude_geo"),
+            "speed": decoded.get("ground_speed"),
+            "hdg":   decoded.get("heading"),
+            "id":    decoded.get("uas_id"),
+        }
+        line = json.dumps(record, separators=(',', ':'))
+
+        try:
+            self._sock.sendto((line + '\n').encode(), ('255.255.255.255', self.UDP_PORT))
+        except Exception:
+            pass
+
+        try:
+            with open(self.BUFFER_PATH, 'a') as f:
+                f.write(line + '\n')
+            self._line_count += 1
+            if self._line_count > self.MAX_LINES:
+                self._trim()
+        except Exception:
+            pass
+
+    def _trim(self):
+        try:
+            with open(self.BUFFER_PATH, 'r') as f:
+                lines = f.readlines()
+            if len(lines) > self.MAX_LINES:
+                with open(self.BUFFER_PATH, 'w') as f:
+                    f.writelines(lines[-self.MAX_LINES:])
+            self._line_count = min(len(lines), self.MAX_LINES)
+        except Exception:
+            pass
+
+
 # -- HTTP Forwarder ------------------------------------------------------------
 
 class Forwarder:
@@ -214,6 +421,7 @@ class BLEFeeder:
         self.token        = token
         self.start_time   = time.monotonic()
         self.forwarder    = Forwarder(server_url, node_id, batch_size, flush_interval, token)
+        self.publisher    = LocalPublisher()
         self.count        = 0
 
     def on_advertisement(self, device: BLEDevice, adv: AdvertisementData):
@@ -265,6 +473,18 @@ class BLEFeeder:
 
         self.forwarder.add(event)
 
+        # Local publish — decode and fan out sub-messages for Message Pack
+        decoded = decode_rid_message(bytes.fromhex(rid_payload_hex))
+        if decoded:
+            if decoded.get("message_type") == "Message Pack":
+                sub_messages = decoded.get("messages", [])
+            else:
+                sub_messages = [decoded]
+            for msg in sub_messages:
+                pub_event = dict(event)
+                pub_event["decoded"] = msg
+                self.publisher.publish(pub_event)
+
     async def run(self):
         log.info(f"DroneAware BLE Feeder - Node: {self.node_id}  Adapter: {self.adapter}")
         log.info(f"Scanning for Remote ID broadcasts (UUID 0xFFFA)...")
@@ -302,7 +522,7 @@ class BLEFeeder:
                                 json={
                                     "node_id":      self.node_id,
                                     "uptime_s":     int(time.monotonic() - self.start_time),
-                                    "fw_version":   "1.0.7",
+                                    "fw_version":   "1.0.14",
                                     "cpu_temp_c":   cpu_temp,
                                     "ble_ok":       ble_ok,
                                     "wifi_ok":      wifi_ok,

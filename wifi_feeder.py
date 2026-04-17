@@ -23,6 +23,7 @@ import threading
 import subprocess
 import time
 import struct
+import json
 import logging
 import argparse
 import socket
@@ -418,6 +419,72 @@ class Forwarder:
             log.warning(f"Forward failed: {e} ({self.failed_total} events lost)")
 
 
+# -- Local Publisher -----------------------------------------------------------
+
+class LocalPublisher:
+    """
+    Writes decoded detections to a tmpfs ring buffer and UDP LAN broadcast.
+
+    Buffer: /run/droneaware/detections.jsonl  (RAM only — gone on reboot,
+            zero SD card wear). Bounded to MAX_LINES entries.
+    UDP:    255.255.255.255:9999 — any device on the LAN can listen.
+    """
+    BUFFER_PATH = "/run/droneaware/detections.jsonl"
+    UDP_PORT    = 9999
+    MAX_LINES   = 3600  # ~60 min at 1 event/sec
+
+    def __init__(self):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        os.makedirs(os.path.dirname(self.BUFFER_PATH), exist_ok=True)
+        self._line_count = 0
+
+    def publish(self, event: dict):
+        decoded = event.get("decoded") or {}
+        if not decoded:
+            return
+
+        record = {
+            "t":     event.get("timestamp") or event.get("observed_at"),
+            "mac":   event.get("source_mac") or event.get("mac"),
+            "radio": event.get("radio"),
+            "rssi":  event.get("rssi"),
+            "type":  decoded.get("message_type"),
+            "lat":   decoded.get("latitude"),
+            "lon":   decoded.get("longitude"),
+            "alt":   decoded.get("altitude_geo"),
+            "speed": decoded.get("ground_speed"),
+            "hdg":   decoded.get("heading"),
+            "id":    decoded.get("uas_id"),
+        }
+        line = json.dumps(record, separators=(',', ':'))
+
+        try:
+            self._sock.sendto((line + '\n').encode(), ('255.255.255.255', self.UDP_PORT))
+        except Exception:
+            pass
+
+        try:
+            with open(self.BUFFER_PATH, 'a') as f:
+                f.write(line + '\n')
+            self._line_count += 1
+            if self._line_count > self.MAX_LINES:
+                self._trim()
+        except Exception:
+            pass
+
+    def _trim(self):
+        try:
+            with open(self.BUFFER_PATH, 'r') as f:
+                lines = f.readlines()
+            if len(lines) > self.MAX_LINES:
+                with open(self.BUFFER_PATH, 'w') as f:
+                    f.writelines(lines[-self.MAX_LINES:])
+            self._line_count = min(len(lines), self.MAX_LINES)
+        except Exception:
+            pass
+
+
 # -- WiFi Feeder ---------------------------------------------------------------
 
 class WiFiFeeder:
@@ -431,6 +498,7 @@ class WiFiFeeder:
         self.token       = token
         self.start_time  = time.time()
         self.forwarder   = Forwarder(server_url, node_id, batch_size, flush_interval, token)
+        self.publisher   = LocalPublisher()
         self.hopper      = ChannelHopper(iface, CHANNELS_24, channel_dwell)
         self.count       = 0
         self.nan_count   = 0
@@ -494,6 +562,7 @@ class WiFiFeeder:
                         f"Type={mtype}  {detail}"
                     )
                 self.forwarder.add(event)
+                self.publisher.publish(event)
             return
 
         # ---- Wi-Fi NAN Remote ID (subtype 13 — action frame) ----
@@ -568,7 +637,7 @@ class WiFiFeeder:
                             json={
                                 "node_id":    self.node_id,
                                 "uptime_s":   int(time.time() - self.start_time),
-                                "fw_version": "1.0.12",
+                                "fw_version": "1.0.14",
                             },
                             headers={"X-Node-Token": self.token},
                             timeout=5,
