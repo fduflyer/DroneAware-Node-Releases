@@ -1,5 +1,7 @@
 # DroneAware Node — Setup Guide
 
+DroneAware Network is a community-built, open Remote ID detection network. The goal is to create a distributed, real-time view of drone activity — where the value isn't just the software, but the shared detection network everyone contributes to.
+
 Detect nearby drones (Remote ID) with a Raspberry Pi.
 
 ![DroneAware Screenshot](https://github.com/fduflyer/DroneAware-Node-Releases/blob/6ad45edcb46c6b23012bfdd0ee40fc80a8e9320b/IMG_3421.jpeg)
@@ -282,6 +284,18 @@ your node, and update its location there. Node location is managed server-side.
 | `/etc/systemd/system/droneaware-ble.service` | BLE feeder systemd unit |
 | `/etc/systemd/system/droneaware-wifi.service` | WiFi feeder systemd unit |
 | `/etc/systemd/system/droneaware-bt-select.service` | BT selector systemd unit |
+
+---
+
+## Contributing & Direction
+
+DroneAware Network is an open project and forks are welcome. If you're building on this or experimenting, we'd love to hear what you're working on — especially around detection accuracy, range improvements, or new visualization approaches.
+
+The real power of this project is the shared detection network. If you're running nodes, consider feeding data into the main DroneAware Network so detections benefit everyone.
+
+**Join the community on Discord: [discord.gg/J4ZHpdgzeb](https://discord.gg/J4ZHpdgzeb)**
+
+Have an idea or improvement? Open an issue or start a discussion — we're actively building.
 
 ---
 
