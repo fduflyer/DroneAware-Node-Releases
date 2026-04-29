@@ -6,11 +6,13 @@ Detections from nodes already running on the network:
 
 ![DroneAware_Screenshot1](https://github.com/fduflyer/DroneAware-Node-Releases/blob/c6f2f37dc3cdacef408afa28104e1fcccff734e3/Global%20Detections.png)
 
-See drones flying near you in real time — most people never see Remote ID unless they build something like this. Nodes are already running in the US, Germany, and Canada - and growing daily.
+See drones flying near you in real time - most people never see Remote ID unless they build something like this. 
 
-DroneAware Network is a community-built, open Remote ID detection network. The goal is to create a distributed, real-time view of drone activity with low-cost sensors — where the value isn't just the software, but the shared detection network everyone contributes to.
+Nodes are already running in the US, Germany, and Canada - and growing daily.
 
-Run one command and start detecting drones around you (up to miles away with the right antenna):
+DroneAware Network is a community-built, open Remote ID detection network. The goal is to create a distributed, real-time view of drone activity with low-cost sensors - where the value isn't just the software, but the shared detection network everyone contributes to.
+
+Run one command and start detecting drones around you, from a few hundred yards to miles away depending on your setup::
 
 ```bash
 curl -fsSL https://github.com/fduflyer/DroneAware-Node-Releases/releases/download/v1.0.16/install.sh | sudo bash
