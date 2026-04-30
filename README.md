@@ -28,7 +28,7 @@ Once connected, you'll also get real-time email alerts anytime your node(s) dete
 |---|---|
 | Raspberry Pi 4 (1 GB or more) | 2 GB+ recommended if running other software |
 | MicroSD card (16 GB+, Class 10) | Samsung Endurance or SanDisk High Endurance preferred |
-| USB Bluetooth adapter | **Sena UD100** or any CSR/Cambridge Silicon Radio USB dongle |
+| USB Bluetooth adapter | **Sena UD100** (newer variants with Bluetooth 4.0+ only) or any CSR/Cambridge Silicon Radio USB dongle. **Older UD100 variants (G01, G02, G03 and similar) are Bluetooth Classic (BT 2.0/2.1) only and will not work.** If unsure which version you have, the Pi's built-in Bluetooth works out of the box at shorter range. |
 | WiFi adapter (required) | **Alfa AWUS036N** (Ralink RT3070 chipset, 2.4 GHz) |
 | 5V/3A USB-C power supply | Official Raspberry Pi PSU recommended |
 | Ethernet cable or WiFi credentials | For initial setup |
@@ -250,6 +250,18 @@ Common causes:
 - Another process (NetworkManager) has taken control of the interface —
   the installer configures NM to ignore the adapter, but a reinstall of NM
   may revert this
+
+**BLE feeder fails to start or reports a BLE error on startup**
+Your Bluetooth adapter may not support BLE. The Sena UD100 product line spans multiple generations — older variants (including the G01, G02, and G03) are Bluetooth Classic (BT 2.0/2.1) only and will not work for Remote ID, which requires BLE advertising. Newer UD100 variants with Bluetooth 4.0+ are BLE-capable and will work.
+
+Confirm what you have by running:
+```bash
+hciconfig -a | grep "LMP Version"
+```
+`LMP Version: 2.0` or `2.1` = Bluetooth Classic only, won't work.
+`LMP Version: 4.0` or higher = BLE capable, should work.
+
+If your adapter isn't BLE-capable, you can use the Pi's built-in Bluetooth instead — it supports BLE out of the box on all Pi 4 models, just with shorter range than an external dongle.
 
 **The BLE feeder keeps restarting**
 ```bash
