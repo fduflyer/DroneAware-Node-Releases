@@ -45,7 +45,8 @@ python3 -m venv "$BUILD_VENV"
     "pyinstaller==6.19.0" \
     "bleak==2.1.1" \
     "requests==2.32.5" \
-    "charset-normalizer==3.4.6"
+    "charset-normalizer==3.4.6" \
+    "pyserial==3.5"
 
 echo "      Done."
 
@@ -78,6 +79,7 @@ echo "      Building wifi_feeder..."
     --workpath "$SCRIPT_DIR/.build_work/wifi" \
     --specpath "$SCRIPT_DIR/.build_specs" \
     --name wifi_feeder \
+    --hidden-import serial \
     "$SCRIPT_DIR/wifi_feeder.py" \
     > /dev/null 2>&1
 

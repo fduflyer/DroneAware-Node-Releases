@@ -1,6 +1,6 @@
 #!/bin/bash
 # DroneAware Feeder Node Installer
-# Version: 1.0.16
+# Version: 1.0.17
 # Usage:  sudo bash install.sh
 #
 # Requires: Raspberry Pi OS Bookworm 64-bit, internet connection,
@@ -8,8 +8,8 @@
 
 set -e
 
-INSTALLER_VERSION="v1.0.16"
-BINARY_VERSION="v1.0.16"  # last release containing updated binaries
+INSTALLER_VERSION="v1.0.17"
+BINARY_VERSION="v1.0.17"  # last release containing updated binaries
 SERVICE_VERSION="v1.0.6"  # last release containing service files and bt-select script
 GITHUB_REPO="fduflyer/DroneAware-Node-Releases"
 INSTALL_DIR="/opt/droneaware"
@@ -36,7 +36,7 @@ show_terms() {
     clear
     echo -e "${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════════════╗"
-    echo "║            DroneAware Feeder Node — Installer v1.0.16              ║"
+    echo "║            DroneAware Feeder Node — Installer v1.0.17              ║"
     echo "╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
@@ -301,6 +301,8 @@ install_packages() {
     systemctl disable NetworkManager-wait-online.service > /dev/null 2>&1 || true
     info "Boot optimisations applied."
 
+    # Allow feeder to read GPS serial device without root
+    usermod -aG dialout "$SUDO_USER" 2>/dev/null || true
     info "System packages ready."
 }
 

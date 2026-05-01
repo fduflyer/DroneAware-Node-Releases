@@ -27,8 +27,10 @@ import json
 import logging
 import argparse
 import socket
+import glob
 import os
 import sys
+import serial
 import requests
 
 # -- Logging -------------------------------------------------------------------
@@ -41,6 +43,13 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("droneaware.wifi")
+
+# -- GPS State -----------------------------------------------------------------
+
+_gps_lat  = None
+_gps_lon  = None
+_gps_lock = threading.Lock()
+
 
 # -- Constants -----------------------------------------------------------------
 
@@ -422,6 +431,55 @@ class Forwarder:
             log.warning(f"Forward failed: {e} ({self.failed_total} events lost)")
 
 
+# -- GPS Reader ----------------------------------------------------------------
+
+def nmea_to_decimal(value: str, direction: str) -> float:
+    d = int(float(value) / 100)
+    m = float(value) - d * 100
+    decimal = d + m / 60.0
+    if direction in ('S', 'W'):
+        decimal = -decimal
+    return round(decimal, 6)
+
+
+def find_gps_device() -> str | None:
+    env_device = os.environ.get("GPS_DEVICE", "").strip()
+    if env_device:
+        return env_device
+    candidates = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
+    return candidates[0] if candidates else None
+
+
+def gps_reader_thread(device: str):
+    """Background thread: reads NMEA sentences, updates _gps_lat/_gps_lon."""
+    global _gps_lat, _gps_lon
+    while True:
+        try:
+            with serial.Serial(device, baudrate=9600, timeout=2) as ser:
+                log.info(f"[GPS] Reading from {device}")
+                while True:
+                    line = ser.readline().decode('ascii', errors='ignore').strip()
+                    if not line.startswith(('$GPRMC', '$GNRMC')):
+                        continue
+                    parts = line.split(',')
+                    if len(parts) < 7 or parts[2] != 'A':
+                        continue
+                    try:
+                        lat = nmea_to_decimal(parts[3], parts[4])
+                        lon = nmea_to_decimal(parts[5], parts[6].split('*')[0])
+                        with _gps_lock:
+                            _gps_lat = lat
+                            _gps_lon = lon
+                    except (ValueError, IndexError):
+                        continue
+        except serial.SerialException as e:
+            log.warning(f"[GPS] Serial error: {e} — retrying in 10s")
+            time.sleep(10)
+        except Exception as e:
+            log.warning(f"[GPS] Unexpected error: {e} — retrying in 10s")
+            time.sleep(10)
+
+
 # -- Local Publisher -----------------------------------------------------------
 
 class LocalPublisher:
@@ -635,12 +693,16 @@ class WiFiFeeder:
                 )
                 if self.token:
                     try:
+                        with _gps_lock:
+                            lat, lon = _gps_lat, _gps_lon
                         requests.post(
                             "https://api.droneaware.io/api/node/heartbeat",
                             json={
                                 "node_id":    self.node_id,
                                 "uptime_s":   int(time.time() - self.start_time),
-                                "fw_version": "1.0.16",
+                                "fw_version": "1.0.17",
+                                "lat":        lat,
+                                "lon":        lon,
                             },
                             headers={"X-Node-Token": self.token},
                             timeout=5,
@@ -710,6 +772,14 @@ def main():
     args = parser.parse_args()
 
     token = resolve_token()
+
+    gps_device = find_gps_device()
+    if gps_device:
+        log.info(f"[GPS] Dongle detected at {gps_device}")
+        t = threading.Thread(target=gps_reader_thread, args=(gps_device,), daemon=True)
+        t.start()
+    else:
+        log.info("[GPS] No GPS dongle detected — position will not be reported")
 
     feeder = WiFiFeeder(
         iface=args.iface,
