@@ -1,0 +1,104 @@
+#!/bin/bash
+# DroneAware Node CLI
+# Usage: sudo droneaware <command>
+
+GITHUB_REPO="fduflyer/DroneAware-Node-Releases"
+INSTALL_DIR="/opt/droneaware"
+VERSION_FILE="${INSTALL_DIR}/version"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
+info()  { echo -e "  ${GREEN}✓${NC}  $*"; }
+warn()  { echo -e "  ${YELLOW}!${NC}  $*"; }
+fatal() { echo -e "\n  ${RED}✗  ERROR: $*${NC}\n"; exit 1; }
+
+require_root() { [[ $EUID -eq 0 ]] || fatal "Run with sudo: sudo droneaware $1"; }
+
+cmd_update() {
+    require_root "update"
+    echo ""
+    echo -e "${BOLD}DroneAware Update${NC}"
+    echo ""
+
+    CURRENT=$(cat "$VERSION_FILE" 2>/dev/null || echo "unknown")
+    echo "  Checking latest release..."
+    LATEST=$(curl -sf "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" \
+        | grep '"tag_name"' | cut -d'"' -f4)
+    [[ -n "$LATEST" ]] || fatal "Could not reach GitHub — check internet connection."
+
+    echo "  Installed : ${CURRENT}"
+    echo "  Latest    : ${LATEST}"
+    echo ""
+
+    if [[ "$CURRENT" == "$LATEST" ]]; then
+        info "Already up to date."
+        echo ""
+        return
+    fi
+
+    BASE="https://github.com/${GITHUB_REPO}/releases/download/${LATEST}"
+    echo "  Downloading binaries..."
+    curl -fsSL --retry 3 "${BASE}/ble_feeder"  -o /tmp/da_ble_feeder  || fatal "Failed to download ble_feeder"
+    curl -fsSL --retry 3 "${BASE}/wifi_feeder" -o /tmp/da_wifi_feeder || fatal "Failed to download wifi_feeder"
+    chmod +x /tmp/da_ble_feeder /tmp/da_wifi_feeder
+    info "Downloaded ${LATEST}."
+
+    echo "  Stopping services..."
+    systemctl stop droneaware-ble droneaware-wifi 2>/dev/null || true
+
+    cp /tmp/da_ble_feeder  "${INSTALL_DIR}/ble_feeder"
+    cp /tmp/da_wifi_feeder "${INSTALL_DIR}/wifi_feeder"
+    rm -f /tmp/da_ble_feeder /tmp/da_wifi_feeder
+    echo "$LATEST" > "$VERSION_FILE"
+    info "Binaries installed."
+
+    systemctl start droneaware-ble droneaware-wifi
+    info "Services restarted."
+    echo ""
+    info "Update complete — now running ${LATEST}."
+    echo ""
+}
+
+cmd_status() {
+    echo ""
+    echo -e "${BOLD}DroneAware Node Status${NC}"
+    echo ""
+    local ver
+    ver=$(cat "$VERSION_FILE" 2>/dev/null || echo "unknown")
+    echo "  Firmware : ${ver}"
+    echo "  Node ID  : $(grep '^NODE_ID=' "${INSTALL_DIR}/config.env" 2>/dev/null | cut -d= -f2 || echo "unknown")"
+    echo ""
+    for svc in droneaware-ble droneaware-wifi; do
+        local state
+        state=$(systemctl is-active "$svc" 2>/dev/null)
+        if [[ "$state" == "active" ]]; then
+            echo -e "  ${GREEN}●${NC}  ${svc}  (running)"
+        else
+            echo -e "  ${RED}●${NC}  ${svc}  (${state})"
+        fi
+    done
+    echo ""
+}
+
+cmd_logs() {
+    local svc="droneaware-wifi"
+    [[ "${2:-}" == "ble" ]] && svc="droneaware-ble"
+    journalctl -u "$svc" -f
+}
+
+case "$1" in
+    update)  cmd_update ;;
+    status)  cmd_status ;;
+    logs)    cmd_logs "$@" ;;
+    *)
+        echo ""
+        echo -e "${BOLD}DroneAware Node CLI${NC}"
+        echo ""
+        echo "  Usage: sudo droneaware <command>"
+        echo ""
+        echo "  Commands:"
+        echo "    update    Download and install the latest firmware"
+        echo "    status    Show service status and firmware version"
+        echo "    logs      Tail live logs  (wifi by default, or: droneaware logs ble)"
+        echo ""
+        ;;
+esac

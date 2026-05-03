@@ -1,6 +1,6 @@
 #!/bin/bash
 # DroneAware Feeder Node Installer
-# Version: 1.0.17
+# Version: 1.0.18
 # Usage:  sudo bash install.sh
 #
 # Requires: Raspberry Pi OS Bookworm 64-bit, internet connection,
@@ -8,12 +8,12 @@
 
 set -e
 
-INSTALLER_VERSION="v1.0.17"
-BINARY_VERSION="v1.0.17"  # last release containing updated binaries
+INSTALLER_VERSION="v1.0.18"
+BINARY_VERSION="v1.0.18"  # last release containing updated binaries
 SERVICE_VERSION="v1.0.6"  # last release containing service files and bt-select script
 GITHUB_REPO="fduflyer/DroneAware-Node-Releases"
 INSTALL_DIR="/opt/droneaware"
-BIN_DIR="/usr/local/bin"
+CLI_DIR="/usr/local/bin"
 SERVER_URL="https://api.droneaware.io/api"
 
 # ---------------------------------------------------------------------------
@@ -36,7 +36,7 @@ show_terms() {
     clear
     echo -e "${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════════════╗"
-    echo "║            DroneAware Feeder Node — Installer v1.0.17              ║"
+    echo "║            DroneAware Feeder Node — Installer v1.0.18              ║"
     echo "╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
@@ -312,16 +312,27 @@ install_packages() {
 download_binaries() {
     heading "Downloading DroneAware Binaries ($BINARY_VERSION)"
     local base_url="https://github.com/${GITHUB_REPO}/releases/download/${BINARY_VERSION}"
-    mkdir -p "$BIN_DIR"
+    mkdir -p "$INSTALL_DIR" "$CLI_DIR"
 
     for binary in ble_feeder wifi_feeder; do
         echo "    Downloading $binary..."
         curl -fsSL --retry 3 \
             "${base_url}/${binary}" \
-            -o "${BIN_DIR}/${binary}"
-        chmod +x "${BIN_DIR}/${binary}"
-        info "$binary → ${BIN_DIR}/${binary}"
+            -o "${INSTALL_DIR}/${binary}"
+        chmod +x "${INSTALL_DIR}/${binary}"
+        info "$binary → ${INSTALL_DIR}/${binary}"
     done
+
+    # Version file — used by droneaware update to track installed version
+    echo "${BINARY_VERSION}" > "${INSTALL_DIR}/version"
+
+    # droneaware CLI
+    echo "    Downloading droneaware CLI..."
+    curl -fsSL --retry 3 \
+        "${base_url}/droneaware" \
+        -o "${CLI_DIR}/droneaware"
+    chmod +x "${CLI_DIR}/droneaware"
+    info "droneaware → ${CLI_DIR}/droneaware"
 }
 
 # ---------------------------------------------------------------------------

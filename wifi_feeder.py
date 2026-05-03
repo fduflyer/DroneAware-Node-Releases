@@ -44,6 +44,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("droneaware.wifi")
 
+FW_VERSION = "1.0.18"
+
 # -- GPS State -----------------------------------------------------------------
 
 _gps_lat  = None
@@ -442,6 +444,9 @@ def nmea_to_decimal(value: str, direction: str) -> float:
     return round(decimal, 6)
 
 
+GPS_BAUD_RATES = [4800, 9600, 38400, 115200]
+
+
 def find_gps_device() -> str | None:
     env_device = os.environ.get("GPS_DEVICE", "").strip()
     if env_device:
@@ -450,13 +455,33 @@ def find_gps_device() -> str | None:
     return candidates[0] if candidates else None
 
 
+def detect_baud_rate(device: str) -> int | None:
+    """Try common baud rates and return the first that produces valid NMEA."""
+    for baud in GPS_BAUD_RATES:
+        try:
+            with serial.Serial(device, baudrate=baud, timeout=2) as ser:
+                for _ in range(16):
+                    line = ser.readline().decode('ascii', errors='ignore').strip()
+                    if line.startswith(('$GP', '$GN')):
+                        log.info(f"[GPS] Detected baud rate {baud} on {device}")
+                        return baud
+        except serial.SerialException:
+            pass
+    return None
+
+
 def gps_reader_thread(device: str):
     """Background thread: reads NMEA sentences, updates _gps_lat/_gps_lon."""
     global _gps_lat, _gps_lon
     while True:
         try:
-            with serial.Serial(device, baudrate=9600, timeout=2) as ser:
-                log.info(f"[GPS] Reading from {device}")
+            baud = detect_baud_rate(device)
+            if baud is None:
+                log.warning(f"[GPS] Could not detect baud rate on {device} — retrying in 10s")
+                time.sleep(10)
+                continue
+            with serial.Serial(device, baudrate=baud, timeout=2) as ser:
+                log.info(f"[GPS] Reading from {device} at {baud} baud")
                 while True:
                     line = ser.readline().decode('ascii', errors='ignore').strip()
                     if not line.startswith(('$GPRMC', '$GNRMC')):
@@ -700,7 +725,7 @@ class WiFiFeeder:
                             json={
                                 "node_id":    self.node_id,
                                 "uptime_s":   int(time.time() - self.start_time),
-                                "fw_version": "1.0.17",
+                                "fw_version": FW_VERSION,
                                 "lat":        lat,
                                 "lon":        lon,
                             },

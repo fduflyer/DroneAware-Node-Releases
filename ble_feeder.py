@@ -44,6 +44,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("droneaware.ble")
 
+FW_VERSION = "1.0.18"
+
 # -- Constants -----------------------------------------------------------------
 REMOTE_ID_SERVICE_UUID = "0000fffa-0000-1000-8000-00805f9b34fb"
 MAX_BUFFER = 1000  # ring buffer capacity (events); oldest dropped when full
@@ -522,7 +524,7 @@ class BLEFeeder:
                                 json={
                                     "node_id":      self.node_id,
                                     "uptime_s":     int(time.monotonic() - self.start_time),
-                                    "fw_version":   "1.0.16",
+                                    "fw_version":   FW_VERSION,
                                     "cpu_temp_c":   cpu_temp,
                                     "ble_ok":       ble_ok,
                                     "wifi_ok":      wifi_ok,
