@@ -15,7 +15,7 @@ DroneAware Network is a community-built, open Remote ID detection network. The g
 Run one command and start detecting drones around you, from a few hundred yards to miles away depending on your setup::
 
 ```bash
-curl -fsSL https://github.com/fduflyer/DroneAware-Node-Releases/releases/download/v1.0.16/install.sh | sudo bash
+curl -fsSL https://github.com/fduflyer/DroneAware-Node-Releases/releases/download/v1.0.18/install.sh | sudo bash
 ```
 _No Linux experience needed — if you can plug in a USB device, you can run this._
 
@@ -130,7 +130,7 @@ DroneAware server to correctly place detections on the map.
 Run this single command:
 
 ```bash
-curl -fsSL https://github.com/fduflyer/DroneAware-Node-Releases/releases/download/v1.0.16/install.sh | sudo bash
+curl -fsSL https://github.com/fduflyer/DroneAware-Node-Releases/releases/download/v1.0.18/install.sh | sudo bash
 ```
 
 The installer will:
@@ -147,7 +147,7 @@ The installer will:
    adapter automatically. If none is found, it will exit with instructions.
 
 4. **Install system packages and download binaries** from the
-   [v1.0.16 release](https://github.com/fduflyer/DroneAware-Node/releases/tag/v1.0.16).
+   [v1.0.18 release](https://github.com/fduflyer/DroneAware-Node/releases/tag/v1.0.18).
 
 5. **Enroll the node** — you will be prompted to open
    [droneaware.io/nodes](https://droneaware.io/nodes), log in,
