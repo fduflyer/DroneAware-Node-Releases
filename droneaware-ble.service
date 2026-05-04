@@ -9,7 +9,7 @@ Type=simple
 User=root
 EnvironmentFile=/opt/droneaware/config.env
 ExecStartPre=/usr/sbin/rfkill unblock bluetooth
-ExecStart=/usr/local/bin/ble_feeder \
+ExecStart=/opt/droneaware/ble_feeder \
     --node-id ${NODE_ID} \
     --server ${SERVER_URL} \
     --adapter ${BLE_ADAPTER} \

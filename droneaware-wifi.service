@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=root
 EnvironmentFile=/opt/droneaware/config.env
-ExecStart=/usr/local/bin/wifi_feeder \
+ExecStart=/opt/droneaware/wifi_feeder \
     --node-id ${NODE_ID} \
     --server ${SERVER_URL} \
     --iface ${WIFI_ADAPTER} \
