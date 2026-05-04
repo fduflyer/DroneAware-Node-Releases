@@ -8,9 +8,10 @@ with an **Alfa AWUS036N** or **AWUS036NHA**. Everything in this folder is beyond
 
 ## Confirmed Working
 
-| Adapter | Chipset | Guide | Contributor |
+| Adapter / Setup | Chipset | Guide | Contributor |
 |---|---|---|---|
 | Alfa AWUS036ACH (USB-C) | RTL8812AU | [Setup Guide](AWUS036ACH.md) | AndyVickers |
+| Existing FlightAware / ADS-B Pi | Various | [Upgrade Guide](flightaware-upgrade.md) | DroneAware Community |
 
 ## Adding a Guide
 
