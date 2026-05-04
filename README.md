@@ -316,6 +316,8 @@ The real power of this project is the shared detection network. If you're runnin
 
 **Join the community on Discord: [discord.gg/J4ZHpdgzeb](https://discord.gg/J4ZHpdgzeb)**
 
+Already a FlightAware or ADS-B feeder? [See the upgrade guide →](https://github.com/fduflyer/DroneAware-Node-Releases/blob/main/docs/hardware/flightaware-upgrade.md)
+
 Have an idea or improvement? Open an issue or start a discussion — we're actively building.
 
 ---
