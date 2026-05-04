@@ -12,6 +12,12 @@ with an **Alfa AWUS036N** or **AWUS036NHA**. Everything in this folder is beyond
 |---|---|---|---|
 | Alfa AWUS036ACH (USB-C) | RTL8812AU | [Setup Guide](AWUS036ACH.md) | AndyVickers |
 
+## Integration Guides
+
+| Guide | Description |
+|---|---|
+| [FlightAware / ADS-B Upgrade](flightaware-upgrade.md) | Add DroneAware to an existing ADS-B feeder node |
+
 ## Adding a Guide
 
 Open a [GitHub Discussion](https://github.com/fduflyer/DroneAware-Network/discussions) 
