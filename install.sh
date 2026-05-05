@@ -10,7 +10,7 @@ set -e
 
 INSTALLER_VERSION="v1.0.21"
 BINARY_VERSION="v1.0.21"  # last release containing updated binaries
-SERVICE_VERSION="v1.0.19"  # last release containing service files and bt-select script
+SERVICE_VERSION="v1.0.21"  # last release containing service files and bt-select script
 GITHUB_REPO="fduflyer/DroneAware-Node-Releases"
 INSTALL_DIR="/opt/droneaware"
 CLI_DIR="/usr/local/bin"
