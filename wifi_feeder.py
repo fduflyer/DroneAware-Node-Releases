@@ -44,7 +44,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("droneaware.wifi")
 
-FW_VERSION = "1.0.19"
+FW_VERSION = "1.0.20"
 
 # -- GPS State -----------------------------------------------------------------
 
@@ -387,6 +387,30 @@ class ChannelHopper(threading.Thread):
         self._stop.set()
 
 
+# -- Health Checks -------------------------------------------------------------
+
+def get_cpu_temp() -> float | None:
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            return round(int(f.read().strip()) / 1000.0, 1)
+    except Exception:
+        return None
+
+
+def get_wifi_health(adapter: str | None) -> tuple[bool | None, str | None]:
+    if not adapter:
+        return None, None
+    try:
+        path = f"/sys/class/net/{adapter}/operstate"
+        if not os.path.exists(path):
+            return False, adapter
+        with open(path) as f:
+            state = f.read().strip()
+        return state in ("up", "unknown"), adapter
+    except Exception:
+        return False, adapter
+
+
 # -- HTTP Forwarder ------------------------------------------------------------
 # (identical contract to ble_feeder.Forwarder)
 
@@ -588,6 +612,7 @@ class WiFiFeeder:
         self.hopper      = ChannelHopper(iface, CHANNELS_24, channel_dwell)
         self.count       = 0
         self.nan_count   = 0
+        self._scanning   = False
 
     def _on_packet(self, data: bytes):
         # Parse RadioTap header to get RSSI and skip to 802.11 MAC header
@@ -682,6 +707,7 @@ class WiFiFeeder:
         sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
         sock.bind((self.iface, 0))
         sock.settimeout(1.0)
+        self._scanning = True
 
         flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
         flush_thread.start()
@@ -720,14 +746,26 @@ class WiFiFeeder:
                     try:
                         with _gps_lock:
                             lat, lon = _gps_lat, _gps_lon
+                        wifi_ok, wifi_adp = get_wifi_health(self.iface)
+                        cpu_temp          = get_cpu_temp()
+                        has_gps           = os.path.exists(os.environ.get("GPS_DEVICE", "/dev/ttyUSB0"))
+                        mobile            = os.environ.get("NODE_MOBILE", "false").lower() == "true"
                         requests.post(
                             "https://api.droneaware.io/api/node/heartbeat",
                             json={
-                                "node_id":    self.node_id,
-                                "uptime_s":   int(time.time() - self.start_time),
-                                "fw_version": FW_VERSION,
-                                "lat":        lat,
-                                "lon":        lon,
+                                "node_id":      self.node_id,
+                                "uptime_s":     int(time.time() - self.start_time),
+                                "fw_version":   FW_VERSION,
+                                "cpu_temp_c":   cpu_temp,
+                                "wifi_ok":      wifi_ok,
+                                "wifi_adapter": wifi_adp,
+                                "ble_ok":       None,
+                                "ble_adapter":  None,
+                                "scanning":     self._scanning,
+                                "mobile":       mobile,
+                                "has_gps":      has_gps,
+                                "lat":          lat,
+                                "lon":          lon,
                             },
                             headers={"X-Node-Token": self.token},
                             timeout=5,

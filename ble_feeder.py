@@ -44,7 +44,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("droneaware.ble")
 
-FW_VERSION = "1.0.19"
+FW_VERSION = "1.0.20"
 
 # -- Constants -----------------------------------------------------------------
 REMOTE_ID_SERVICE_UUID = "0000fffa-0000-1000-8000-00805f9b34fb"
