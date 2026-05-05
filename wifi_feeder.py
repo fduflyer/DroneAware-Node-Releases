@@ -44,7 +44,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("droneaware.wifi")
 
-FW_VERSION = "1.0.20"
+FW_VERSION = "1.0.21"
 
 # -- GPS State -----------------------------------------------------------------
 

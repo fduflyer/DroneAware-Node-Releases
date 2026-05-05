@@ -49,8 +49,15 @@ cmd_update() {
     cp /tmp/da_wifi_feeder "${INSTALL_DIR}/wifi_feeder"
     rm -f /tmp/da_ble_feeder /tmp/da_wifi_feeder
     echo "$LATEST" > "$VERSION_FILE"
+
+    # Nodes installed before v1.0.19 have service files pointing to /usr/local/bin/.
+    # Symlink both paths to /opt/droneaware/ so the correct binary runs regardless
+    # of which path the service file references.
+    ln -sf "${INSTALL_DIR}/ble_feeder"  /usr/local/bin/ble_feeder  2>/dev/null || true
+    ln -sf "${INSTALL_DIR}/wifi_feeder" /usr/local/bin/wifi_feeder 2>/dev/null || true
     info "Binaries installed."
 
+    systemctl daemon-reload
     systemctl start droneaware-ble droneaware-wifi
     info "Services restarted."
     echo ""
