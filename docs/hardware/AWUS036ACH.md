@@ -33,7 +33,7 @@ sudo apt update && sudo apt upgrade -y
 sudo apt install -y build-essential bc dkms git linux-headers-rpi-v8
 ```
 
-> **Note on `linux-headers-rpi-v8`:** The `-v8` suffix refers to **ARMv8 architecture** (64-bit ARM), not a specific OS version. This is the correct kernel headers package for Raspberry Pi 3, 4, and Zero 2 W running 64-bit Raspberry Pi OS (Bookworm or Trixie). If you are on a 32-bit OS, omit the `-v8` suffix.
+> **Note on `linux-headers-rpi-v8`:** The `-v8` suffix refers to **ARMv8 architecture** (64-bit ARM), not a specific OS version. This is the correct kernel headers package for Raspberry Pi 3, 4, and Zero 2 W running 64-bit Raspberry Pi OS (Bookworm or Trixie).
 
 ## Step 2 — Install the Driver (lwfinger rtw88 backport)
 
