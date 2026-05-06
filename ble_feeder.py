@@ -44,7 +44,15 @@ logging.basicConfig(
 )
 log = logging.getLogger("droneaware.ble")
 
-FW_VERSION = "1.0.21"
+def _read_fw_version(fallback: str) -> str:
+    try:
+        with open("/opt/droneaware/version") as f:
+            v = f.read().strip()
+            return v if v else fallback
+    except Exception:
+        return fallback
+
+FW_VERSION = _read_fw_version("1.0.23")
 
 # -- Constants -----------------------------------------------------------------
 REMOTE_ID_SERVICE_UUID = "0000fffa-0000-1000-8000-00805f9b34fb"

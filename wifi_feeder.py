@@ -44,7 +44,15 @@ logging.basicConfig(
 )
 log = logging.getLogger("droneaware.wifi")
 
-FW_VERSION = "1.0.21"
+def _read_fw_version(fallback: str) -> str:
+    try:
+        with open("/opt/droneaware/version") as f:
+            v = f.read().strip()
+            return v if v else fallback
+    except Exception:
+        return fallback
+
+FW_VERSION = _read_fw_version("1.0.23")
 
 # -- GPS State -----------------------------------------------------------------
 
@@ -337,6 +345,7 @@ def _is_nan_action(body: bytes) -> bool:
 def set_monitor_mode(iface: str):
     """Bring interface up in monitor mode."""
     log.info(f"Setting {iface} to monitor mode...")
+    subprocess.run(["rfkill", "unblock", "all"], check=False, capture_output=True)
     subprocess.run(["ip", "link", "set", iface, "down"],  check=True)
     subprocess.run(["iw", "dev", iface, "set", "type", "monitor"], check=True)
     subprocess.run(["ip", "link", "set", iface, "up"],   check=True)

@@ -58,7 +58,12 @@ cmd_update() {
     info "Binaries installed."
 
     systemctl daemon-reload
-    systemctl start droneaware-ble droneaware-wifi
+    systemctl start droneaware-wifi
+    if hciconfig 2>/dev/null | grep -q "hci"; then
+        systemctl start droneaware-ble
+    else
+        warn "No Bluetooth adapter detected — skipping droneaware-ble"
+    fi
     info "Services restarted."
     echo ""
     info "Update complete — now running ${LATEST}."

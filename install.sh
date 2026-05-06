@@ -1,6 +1,6 @@
 #!/bin/bash
 # DroneAware Feeder Node Installer
-# Version: 1.0.22
+# Version: 1.0.23
 # Usage:  sudo bash install.sh
 #
 # Requires: Raspberry Pi OS Bookworm 64-bit, internet connection,
@@ -8,8 +8,8 @@
 
 set -e
 
-INSTALLER_VERSION="v1.0.22"
-BINARY_VERSION="v1.0.21"  # last release containing updated binaries
+INSTALLER_VERSION="v1.0.23"
+BINARY_VERSION="v1.0.23"  # last release containing updated binaries
 SERVICE_VERSION="v1.0.21"  # last release containing service files and bt-select script
 GITHUB_REPO="fduflyer/DroneAware-Node-Releases"
 INSTALL_DIR="/opt/droneaware"
@@ -36,7 +36,7 @@ show_terms() {
     clear
     echo -e "${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════════════╗"
-    echo "║            DroneAware Feeder Node — Installer v1.0.22              ║"
+    echo "║            DroneAware Feeder Node — Installer v1.0.23              ║"
     echo "╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
@@ -326,6 +326,8 @@ install_packages() {
 # ---------------------------------------------------------------------------
 download_binaries() {
     heading "Downloading DroneAware Binaries ($BINARY_VERSION)"
+    # Stop any running feeders so binaries aren't locked during download
+    systemctl stop droneaware-ble droneaware-wifi 2>/dev/null || true
     local base_url="https://github.com/${GITHUB_REPO}/releases/download/${BINARY_VERSION}"
     mkdir -p "$INSTALL_DIR" "$CLI_DIR"
 
