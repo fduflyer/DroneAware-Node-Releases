@@ -1,6 +1,6 @@
 #!/bin/bash
 # DroneAware Feeder Node Installer
-# Version: 1.0.24
+# Version: 1.0.25
 # Usage:  sudo bash install.sh
 #
 # Requires: Raspberry Pi OS Bookworm 64-bit, internet connection,
@@ -8,8 +8,21 @@
 
 set -e
 
-INSTALLER_VERSION="v1.0.24"
+NM_TOUCHED=0
+_rollback_nm() {
+    if [[ "${NM_TOUCHED}" == "1" ]]; then
+        echo -e "\n  Installer failed — rolling back NetworkManager changes..."
+        rm -f /etc/NetworkManager/conf.d/droneaware.conf
+        nmcli device set "${WIFI_ADAPTER:-}" managed yes > /dev/null 2>&1 || true
+        systemctl reload NetworkManager > /dev/null 2>&1 || true
+        echo "  NetworkManager restored. Your WiFi connection should recover."
+    fi
+}
+trap '_rollback_nm' ERR
+
+INSTALLER_VERSION="v1.0.25"
 BINARY_VERSION="v1.0.23"  # last release containing updated binaries
+
 SERVICE_VERSION="v1.0.21"  # last release containing service files and bt-select script
 GITHUB_REPO="fduflyer/DroneAware-Node-Releases"
 INSTALL_DIR="/opt/droneaware"
@@ -36,7 +49,7 @@ show_terms() {
     clear
     echo -e "${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════════════╗"
-    echo "║            DroneAware Feeder Node — Installer v1.0.24              ║"
+    echo "║            DroneAware Feeder Node — Installer v1.0.25              ║"
     echo "╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
@@ -296,6 +309,16 @@ persist_wifi_profiles() {
 # ---------------------------------------------------------------------------
 pin_wifi_unmanaged() {
     heading "Configuring NetworkManager"
+
+    # Safety check: refuse to mark the active backhaul interface as unmanaged.
+    # If the USB adapter is currently carrying SSH/internet, marking it unmanaged
+    # will kill the connection with no recovery path on a headless Pi.
+    local active_iface
+    active_iface=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1); exit}' || true)
+    if [[ -n "$active_iface" && "$active_iface" == "$WIFI_ADAPTER" ]]; then
+        fatal "Refusing to mark ${WIFI_ADAPTER} as monitor-only — it is currently your active network interface (SSH/internet would be lost). Connect via Ethernet or use a second USB WiFi adapter for DroneAware."
+    fi
+
     echo ""
     echo -e "  ${YELLOW}⚠  SSH NOTICE${NC}"
     echo "  The next step marks your WiFi adapter as monitor-only in"
@@ -319,6 +342,7 @@ pin_wifi_unmanaged() {
 [keyfile]
 unmanaged-devices=interface-name:${WIFI_ADAPTER}
 EOF
+    NM_TOUCHED=1
     # Apply immediately without restarting NM (restart drops SSH)
     nmcli device set "${WIFI_ADAPTER}" managed no > /dev/null 2>&1 || true
     info "${WIFI_ADAPTER} set as unmanaged (monitor-only) in NetworkManager."
@@ -387,8 +411,8 @@ install_services() {
     # bt-select helper
     curl -fsSL --retry 3 \
         "${base_url}/droneaware-bt-select" \
-        -o "${BIN_DIR}/droneaware-bt-select"
-    chmod +x "${BIN_DIR}/droneaware-bt-select"
+        -o "${CLI_DIR}/droneaware-bt-select"
+    chmod +x "${CLI_DIR}/droneaware-bt-select"
     info "droneaware-bt-select installed."
 
     # Systemd service files
