@@ -1,6 +1,6 @@
 #!/bin/bash
 # DroneAware Feeder Node Installer
-# Version: 1.0.21
+# Version: 1.0.22
 # Usage:  sudo bash install.sh
 #
 # Requires: Raspberry Pi OS Bookworm 64-bit, internet connection,
@@ -8,7 +8,7 @@
 
 set -e
 
-INSTALLER_VERSION="v1.0.21"
+INSTALLER_VERSION="v1.0.22"
 BINARY_VERSION="v1.0.21"  # last release containing updated binaries
 SERVICE_VERSION="v1.0.21"  # last release containing service files and bt-select script
 GITHUB_REPO="fduflyer/DroneAware-Node-Releases"
@@ -36,7 +36,7 @@ show_terms() {
     clear
     echo -e "${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════════════╗"
-    echo "║            DroneAware Feeder Node — Installer v1.0.21              ║"
+    echo "║            DroneAware Feeder Node — Installer v1.0.22              ║"
     echo "╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
@@ -271,6 +271,21 @@ persist_wifi_profiles() {
 # ---------------------------------------------------------------------------
 pin_wifi_unmanaged() {
     heading "Configuring NetworkManager"
+    echo ""
+    echo -e "  ${YELLOW}⚠  SSH NOTICE${NC}"
+    echo "  The next step marks your WiFi adapter as monitor-only in"
+    echo "  NetworkManager. In some configurations this may briefly"
+    echo "  interrupt your SSH session."
+    echo ""
+    echo "  If you get disconnected:"
+    echo "    1. Wait 15 seconds"
+    echo "    2. Reconnect via SSH"
+    echo "    3. Re-run the installer — this step will already be done"
+    echo "       and you will only need to enter your node name and location."
+    echo ""
+    read -rp "  Press Enter to continue..." </dev/tty
+    echo ""
+
     mkdir -p /etc/NetworkManager/conf.d
     cat > /etc/NetworkManager/conf.d/droneaware.conf <<EOF
 # DroneAware — prevent NetworkManager from managing the monitor adapter.
@@ -516,11 +531,11 @@ print_summary() {
 # ---------------------------------------------------------------------------
 require_root
 accept_terms
-prompt_node_id
-prompt_location
 detect_wifi_adapter
 persist_wifi_profiles
 pin_wifi_unmanaged
+prompt_node_id
+prompt_location
 install_packages
 download_binaries
 install_services
