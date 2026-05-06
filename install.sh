@@ -1,6 +1,6 @@
 #!/bin/bash
 # DroneAware Feeder Node Installer
-# Version: 1.0.23
+# Version: 1.0.24
 # Usage:  sudo bash install.sh
 #
 # Requires: Raspberry Pi OS Bookworm 64-bit, internet connection,
@@ -8,7 +8,7 @@
 
 set -e
 
-INSTALLER_VERSION="v1.0.23"
+INSTALLER_VERSION="v1.0.24"
 BINARY_VERSION="v1.0.23"  # last release containing updated binaries
 SERVICE_VERSION="v1.0.21"  # last release containing service files and bt-select script
 GITHUB_REPO="fduflyer/DroneAware-Node-Releases"
@@ -36,7 +36,7 @@ show_terms() {
     clear
     echo -e "${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════════════╗"
-    echo "║            DroneAware Feeder Node — Installer v1.0.23              ║"
+    echo "║            DroneAware Feeder Node — Installer v1.0.24              ║"
     echo "╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
@@ -246,8 +246,33 @@ persist_wifi_profiles() {
     heading "Securing WiFi Profiles"
     local count=0
 
+    # Identify the onboard (non-USB) wlan adapter so we can rebind mis-bound profiles.
+    # If a profile is active on the ALFA/monitor adapter when we flush it to disk,
+    # it snapshots connection.interface-name=wlan1 — then pin_wifi_unmanaged marks
+    # wlan1 unmanaged and the profile is permanently locked to an interface NM won't touch.
+    local onboard_wlan=""
+    for iface_path in /sys/class/net/wlan*/; do
+        [[ -d "$iface_path" ]] || continue
+        local iface; iface=$(basename "$iface_path")
+        [[ "$iface" == "$WIFI_ADAPTER" ]] && continue
+        local sub; sub=$(readlink -f "${iface_path}device/subsystem" 2>/dev/null || true)
+        if [[ "$sub" != */usb* ]]; then
+            onboard_wlan="$iface"
+            break
+        fi
+    done
+
     while IFS= read -r name; do
         [[ -z "$name" ]] && continue
+
+        # If this profile is bound to the monitor adapter, rebind to onboard wlan first.
+        local cur_iface
+        cur_iface=$(nmcli -g connection.interface-name con show "$name" 2>/dev/null | tr -d ' ')
+        if [[ -n "$cur_iface" && "$cur_iface" == "$WIFI_ADAPTER" && -n "$onboard_wlan" ]]; then
+            nmcli con modify "$name" connection.interface-name "$onboard_wlan" 2>/dev/null || true
+            info "Rebound $name → $onboard_wlan (was mis-bound to $WIFI_ADAPTER)"
+        fi
+
         # Check if this profile is backed by a real system-connections file
         local fname
         fname=$(nmcli -f FILENAME con show "$name" 2>/dev/null | awk 'NR==2{print $1}')
