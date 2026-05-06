@@ -1,12 +1,17 @@
 #!/bin/bash
 # DroneAware Feeder Node Installer
-# Version: 1.0.25
+# Version: 1.0.26
 # Usage:  sudo bash install.sh
 #
 # Requires: Raspberry Pi OS Bookworm 64-bit, internet connection,
 #           USB BT dongle (UD100 or equivalent), USB WiFi adapter (Alfa AWUS036N or equivalent)
 
 set -e
+
+# LOCAL_INSTALL=1 skips GitHub downloads and copies from local dist/ instead.
+# Usage: sudo LOCAL_INSTALL=1 bash install.sh
+LOCAL_INSTALL="${LOCAL_INSTALL:-0}"
+LOCAL_DIST="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dist"
 
 NM_TOUCHED=0
 _rollback_nm() {
@@ -20,7 +25,7 @@ _rollback_nm() {
 }
 trap '_rollback_nm' ERR
 
-INSTALLER_VERSION="v1.0.25"
+INSTALLER_VERSION="v1.0.26"
 BINARY_VERSION="v1.0.23"  # last release containing updated binaries
 
 SERVICE_VERSION="v1.0.21"  # last release containing service files and bt-select script
@@ -49,7 +54,7 @@ show_terms() {
     clear
     echo -e "${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════════════╗"
-    echo "║            DroneAware Feeder Node — Installer v1.0.25              ║"
+    echo "║            DroneAware Feeder Node — Installer v1.0.26              ║"
     echo "╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
@@ -310,13 +315,36 @@ persist_wifi_profiles() {
 pin_wifi_unmanaged() {
     heading "Configuring NetworkManager"
 
-    # Safety check: refuse to mark the active backhaul interface as unmanaged.
-    # If the USB adapter is currently carrying SSH/internet, marking it unmanaged
-    # will kill the connection with no recovery path on a headless Pi.
-    local active_iface
+    # Safety check: if the USB adapter is currently the active network interface,
+    # try to migrate the connection to the onboard wlan first before marking it
+    # unmanaged. Only fail hard if there is no onboard interface to fall back to.
+    local active_iface onboard_wlan
     active_iface=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1); exit}' || true)
     if [[ -n "$active_iface" && "$active_iface" == "$WIFI_ADAPTER" ]]; then
-        fatal "Refusing to mark ${WIFI_ADAPTER} as monitor-only — it is currently your active network interface (SSH/internet would be lost). Connect via Ethernet or use a second USB WiFi adapter for DroneAware."
+        warn "${WIFI_ADAPTER} is currently your active network interface — migrating connection to onboard WiFi first..."
+        onboard_wlan=""
+        for iface_path in /sys/class/net/wlan*/; do
+            [[ -d "$iface_path" ]] || continue
+            local iface; iface=$(basename "$iface_path")
+            [[ "$iface" == "$WIFI_ADAPTER" ]] && continue
+            local sub; sub=$(readlink -f "${iface_path}device/subsystem" 2>/dev/null || true)
+            if [[ "$sub" != */usb* ]]; then
+                onboard_wlan="$iface"
+                break
+            fi
+        done
+        if [[ -z "$onboard_wlan" ]]; then
+            fatal "No onboard WiFi found to migrate to. Connect via Ethernet or use a dedicated USB adapter for DroneAware monitoring."
+        fi
+        nmcli device set "$onboard_wlan" managed yes > /dev/null 2>&1 || true
+        nmcli device connect "$onboard_wlan" > /dev/null 2>&1 || true
+        sleep 3
+        local new_active
+        new_active=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1); exit}' || true)
+        if [[ "$new_active" == "$WIFI_ADAPTER" ]]; then
+            fatal "Could not migrate network connection from ${WIFI_ADAPTER} to ${onboard_wlan}. Connect via Ethernet and re-run the installer."
+        fi
+        info "Network migrated to ${onboard_wlan}."
     fi
 
     echo ""
@@ -377,28 +405,38 @@ download_binaries() {
     heading "Downloading DroneAware Binaries ($BINARY_VERSION)"
     # Stop any running feeders so binaries aren't locked during download
     systemctl stop droneaware-ble droneaware-wifi 2>/dev/null || true
-    local base_url="https://github.com/${GITHUB_REPO}/releases/download/${BINARY_VERSION}"
     mkdir -p "$INSTALL_DIR" "$CLI_DIR"
 
-    for binary in ble_feeder wifi_feeder; do
-        echo "    Downloading $binary..."
+    if [[ "$LOCAL_INSTALL" == "1" ]]; then
+        info "LOCAL_INSTALL mode — copying from ${LOCAL_DIST}"
+        for binary in ble_feeder wifi_feeder; do
+            cp "${LOCAL_DIST}/${binary}" "${INSTALL_DIR}/${binary}"
+            chmod +x "${INSTALL_DIR}/${binary}"
+            info "$binary → ${INSTALL_DIR}/${binary}"
+        done
+        cp "${LOCAL_DIST}/../droneaware" "${CLI_DIR}/droneaware"
+        chmod +x "${CLI_DIR}/droneaware"
+        info "droneaware → ${CLI_DIR}/droneaware"
+    else
+        local base_url="https://github.com/${GITHUB_REPO}/releases/download/${BINARY_VERSION}"
+        for binary in ble_feeder wifi_feeder; do
+            echo "    Downloading $binary..."
+            curl -fsSL --retry 3 \
+                "${base_url}/${binary}" \
+                -o "${INSTALL_DIR}/${binary}"
+            chmod +x "${INSTALL_DIR}/${binary}"
+            info "$binary → ${INSTALL_DIR}/${binary}"
+        done
+        echo "    Downloading droneaware CLI..."
         curl -fsSL --retry 3 \
-            "${base_url}/${binary}" \
-            -o "${INSTALL_DIR}/${binary}"
-        chmod +x "${INSTALL_DIR}/${binary}"
-        info "$binary → ${INSTALL_DIR}/${binary}"
-    done
+            "${base_url}/droneaware" \
+            -o "${CLI_DIR}/droneaware"
+        chmod +x "${CLI_DIR}/droneaware"
+        info "droneaware → ${CLI_DIR}/droneaware"
+    fi
 
     # Version file — used by droneaware update to track installed version
     echo "${BINARY_VERSION}" > "${INSTALL_DIR}/version"
-
-    # droneaware CLI
-    echo "    Downloading droneaware CLI..."
-    curl -fsSL --retry 3 \
-        "${base_url}/droneaware" \
-        -o "${CLI_DIR}/droneaware"
-    chmod +x "${CLI_DIR}/droneaware"
-    info "droneaware → ${CLI_DIR}/droneaware"
 }
 
 # ---------------------------------------------------------------------------
