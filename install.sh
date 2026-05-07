@@ -1,6 +1,6 @@
 #!/bin/bash
 # DroneAware Feeder Node Installer
-# Version: 1.0.26
+# Version: 1.0.27
 # Usage:  sudo bash install.sh
 #
 # Requires: Raspberry Pi OS Bookworm 64-bit, internet connection,
@@ -25,7 +25,7 @@ _rollback_nm() {
 }
 trap '_rollback_nm' ERR
 
-INSTALLER_VERSION="v1.0.26"
+INSTALLER_VERSION="v1.0.27"
 BINARY_VERSION="v1.0.23"  # last release containing updated binaries
 
 SERVICE_VERSION="v1.0.21"  # last release containing service files and bt-select script
@@ -54,7 +54,7 @@ show_terms() {
     clear
     echo -e "${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════════════╗"
-    echo "║            DroneAware Feeder Node — Installer v1.0.26              ║"
+    echo "║            DroneAware Feeder Node — Installer v1.0.27              ║"
     echo "╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
@@ -238,17 +238,25 @@ _detect_gps() {
 detect_wifi_adapter() {
     heading "Detecting WiFi Adapter"
     WIFI_ADAPTER=""
+    WIFI_ADAPTER_MAC=""
 
-    for iface_path in /sys/class/net/wlan*/; do
-        [[ -d "$iface_path" ]] || continue
-        iface=$(basename "$iface_path")
-        subsystem=$(readlink -f "${iface_path}device/subsystem" 2>/dev/null || true)
+    local active_iface
+    active_iface=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1); exit}' || true)
+
+    # Use iw dev to enumerate all wireless interfaces — handles wlx* names
+    # as well as wlan* and skips the active backhaul interface.
+    while IFS= read -r iface; do
+        [[ -z "$iface" ]] && continue
+        [[ "$iface" == "$active_iface" ]] && continue
+        local subsystem
+        subsystem=$(readlink -f "/sys/class/net/${iface}/device/subsystem" 2>/dev/null || true)
         if [[ "$subsystem" == */usb* ]]; then
             WIFI_ADAPTER="$iface"
-            info "Found USB WiFi adapter: $WIFI_ADAPTER"
+            WIFI_ADAPTER_MAC=$(cat "/sys/class/net/${iface}/address" 2>/dev/null || true)
+            info "Found USB WiFi adapter: $WIFI_ADAPTER ($WIFI_ADAPTER_MAC)"
             break
         fi
-    done
+    done < <(iw dev 2>/dev/null | awk '$1=="Interface"{print $2}')
 
     if [[ -z "$WIFI_ADAPTER" ]]; then
         warn "No USB WiFi adapter detected."
@@ -337,8 +345,8 @@ pin_wifi_unmanaged() {
             fatal "No onboard WiFi found to migrate to. Connect via Ethernet or use a dedicated USB adapter for DroneAware monitoring."
         fi
         nmcli device set "$onboard_wlan" managed yes > /dev/null 2>&1 || true
-        nmcli device connect "$onboard_wlan" > /dev/null 2>&1 || true
-        sleep 3
+        timeout 15 nmcli device connect "$onboard_wlan" > /dev/null 2>&1 || true
+        sleep 5
         local new_active
         new_active=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1); exit}' || true)
         if [[ "$new_active" == "$WIFI_ADAPTER" ]]; then
@@ -363,12 +371,18 @@ pin_wifi_unmanaged() {
     echo ""
 
     mkdir -p /etc/NetworkManager/conf.d
+    # Pin by MAC address — more robust than interface name since USB enumeration
+    # order can change across reboots, which would bind the wrong interface.
+    local unmanaged_entry="interface-name:${WIFI_ADAPTER}"
+    if [[ -n "$WIFI_ADAPTER_MAC" ]]; then
+        unmanaged_entry="mac:${WIFI_ADAPTER_MAC}"
+    fi
     cat > /etc/NetworkManager/conf.d/droneaware.conf <<EOF
 # DroneAware — prevent NetworkManager from managing the monitor adapter.
 # If NM manages the monitor interface it fights the feeder's monitor mode
 # setup, causing zero packet capture and intermittent SSH instability.
 [keyfile]
-unmanaged-devices=interface-name:${WIFI_ADAPTER}
+unmanaged-devices=${unmanaged_entry}
 EOF
     NM_TOUCHED=1
     # Apply immediately without restarting NM (restart drops SSH)
