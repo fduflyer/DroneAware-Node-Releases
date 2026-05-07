@@ -21,9 +21,22 @@ cmd_update() {
 
     CURRENT=$(cat "$VERSION_FILE" 2>/dev/null || echo "unknown")
     echo "  Checking latest release..."
-    LATEST=$(curl -sf "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" \
+
+    # Find the most recent release that actually contains binaries.
+    # Installer-only releases (no ble_feeder asset) are skipped.
+    LATEST=""
+    while IFS= read -r tag; do
+        [[ -z "$tag" ]] && continue
+        has_binary=$(curl -sf "https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${tag}" \
+            | grep '"name"' | grep -c 'ble_feeder' || true)
+        if [[ "$has_binary" -gt 0 ]]; then
+            LATEST="$tag"
+            break
+        fi
+    done < <(curl -sf "https://api.github.com/repos/${GITHUB_REPO}/releases" \
         | grep '"tag_name"' | cut -d'"' -f4)
-    [[ -n "$LATEST" ]] || fatal "Could not reach GitHub — check internet connection."
+
+    [[ -n "$LATEST" ]] || fatal "Could not reach GitHub or no binary release found — check internet connection."
 
     echo "  Installed : ${CURRENT}"
     echo "  Latest    : ${LATEST}"
