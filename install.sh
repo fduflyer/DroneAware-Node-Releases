@@ -1,6 +1,6 @@
 #!/bin/bash
 # DroneAware Feeder Node Installer
-# Version: 1.0.28
+# Version: 1.1.0
 # Usage:  sudo bash install.sh
 #
 # Requires: Raspberry Pi OS Bookworm 64-bit, internet connection,
@@ -25,8 +25,8 @@ _rollback_nm() {
 }
 trap '_rollback_nm' ERR
 
-INSTALLER_VERSION="v1.0.28"
-BINARY_VERSION="v1.0.23"  # last release containing updated binaries
+INSTALLER_VERSION="v1.1.0"
+BINARY_VERSION="v1.1.0"  # last release containing updated binaries
 
 SERVICE_VERSION="v1.0.21"  # last release containing service files and bt-select script
 GITHUB_REPO="fduflyer/DroneAware-Node-Releases"
@@ -54,7 +54,7 @@ show_terms() {
     clear
     echo -e "${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════════════╗"
-    echo "║            DroneAware Feeder Node — Installer v1.0.28              ║"
+    echo "║            DroneAware Feeder Node — Installer v1.1.0               ║"
     echo "╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 

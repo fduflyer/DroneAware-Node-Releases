@@ -110,10 +110,297 @@ cmd_logs() {
     journalctl -u "$svc" -f
 }
 
+cmd_test() {
+    require_root "test"
+
+    local dry_run=0
+    [[ "${2:-}" == "--dry-run" ]] && dry_run=1
+
+    # Read node config
+    local cfg="${INSTALL_DIR}/config.env"
+    local node_id lat lon iface server_url token
+    node_id=$(   grep '^NODE_ID='      "$cfg" 2>/dev/null | cut -d= -f2)
+    lat=$(       grep '^NODE_LAT='     "$cfg" 2>/dev/null | cut -d= -f2)
+    lon=$(       grep '^NODE_LON='     "$cfg" 2>/dev/null | cut -d= -f2)
+    iface=$(     grep '^WIFI_ADAPTER=' "$cfg" 2>/dev/null | cut -d= -f2)
+    server_url=$(grep '^SERVER_URL='   "$cfg" 2>/dev/null | cut -d= -f2)
+    iface="${iface:-wlan1}"
+    server_url="${server_url:-https://api.droneaware.io/api}"
+    token=$(cat /etc/droneaware/token 2>/dev/null | tr -d '[:space:]')
+    [[ -z "$token" ]] && fatal "No node credential found. Re-run the installer to enroll this node."
+
+    # Fall back to GPS fix if available and static coords are missing
+    if [[ -z "$lat" || "$lat" == "0" || -z "$lon" || "$lon" == "0" ]]; then
+        local gps_dev
+        gps_dev=$(grep '^GPS_DEVICE=' "$cfg" 2>/dev/null | cut -d= -f2)
+        if [[ -n "$gps_dev" && -e "$gps_dev" ]]; then
+            local nmea
+            nmea=$(stty -F "$gps_dev" 4800 2>/dev/null; timeout 8 cat "$gps_dev" 2>/dev/null \
+                | grep -m1 '^\$GPRMC.*,A,')
+            if [[ -n "$nmea" ]]; then
+                lat=$(echo "$nmea" | python3 -c "
+import sys, re
+parts = sys.stdin.read().strip().split(',')
+d=int(float(parts[3])/100); m=float(parts[3])-d*100
+lat=round(d+m/60,6)
+if parts[4]=='S': lat=-lat
+d=int(float(parts[5])/100); m=float(parts[5])-d*100
+lon=round(d+m/60,6)
+if parts[6].split('*')[0]=='W': lon=-lon
+print(lat, lon)" | awk '{print $1}')
+                lon=$(echo "$nmea" | python3 -c "
+import sys
+parts = sys.stdin.read().strip().split(',')
+d=int(float(parts[5])/100); m=float(parts[5])-d*100
+lon=round(d+m/60,6)
+if parts[6].split('*')[0]=='W': lon=-lon
+print(lon)")
+            fi
+        fi
+    fi
+
+    [[ -z "$lat" || "$lat" == "0" ]] && \
+        fatal "No location configured. Set NODE_LAT/NODE_LON in /opt/droneaware/config.env first."
+
+    # Build test UAS_ID: TESTFA + up to 8 chars of node_id (uppercase, alphanumeric)
+    local test_id
+    test_id="TESTFA$(echo "$node_id" | tr '[:lower:]' '[:upper:]' | tr -dc 'A-Z0-9' | \
+        head -c 8 | awk '{printf "%-8s", $0}' | tr ' ' '0')"
+
+    echo ""
+    echo -e "${BOLD}DroneAware Test Flight${NC}"
+    echo ""
+    echo "  Node     : ${node_id}"
+    echo "  Test ID  : ${test_id}"
+    echo "  Location : ${lat}, ${lon}"
+    echo "  Interface: ${iface}"
+    echo ""
+
+    # Ask the server for permission — it is the source of truth for rate limits
+    echo "  Checking with server..."
+    local start_resp http_status start_body
+    start_resp=$(curl -s --max-time 10 \
+        -o /tmp/da_test_start.json \
+        -w "%{http_code}" \
+        -X POST \
+        -H "X-Node-Token: ${token}" \
+        "${server_url}/nodes/${node_id}/test/start" 2>/dev/null) || true
+    http_status="$start_resp"
+    start_body=$(cat /tmp/da_test_start.json 2>/dev/null || true)
+    rm -f /tmp/da_test_start.json
+
+    case "$http_status" in
+        200)
+            local remaining started_at
+            remaining=$(echo "$start_body" | python3 -c \
+                "import sys,json; d=json.load(sys.stdin); print(d.get('remaining_in_hour',''))" 2>/dev/null || true)
+            started_at=$(echo "$start_body" | python3 -c \
+                "import sys,json; d=json.load(sys.stdin); print(d.get('started_at',''))" 2>/dev/null || true)
+            info "Test authorized by server.${remaining:+  (${remaining} more allowed this hour)}"
+            [[ -n "$started_at" ]] && echo "  Started    : ${started_at}"
+            ;;
+        401)
+            fatal "Node authentication failed — re-run installer if this persists."
+            ;;
+        403)
+            local msg
+            msg=$(echo "$start_body" | python3 -c \
+                "import sys,json; print(json.load(sys.stdin).get('detail','Access denied.'))" 2>/dev/null || true)
+            fatal "${msg:-Access denied.}"
+            ;;
+        404)
+            fatal "Node ID not recognized — re-run installer."
+            ;;
+        429)
+            local user_msg
+            user_msg=$(echo "$start_body" | python3 -c \
+                "import sys,json
+d=json.load(sys.stdin)
+detail=d.get('detail',{})
+print(detail.get('message', str(detail)))" 2>/dev/null || true)
+            echo -e "\n  ${YELLOW}!${NC}  ${user_msg:-Rate limit reached. Try again later.}"
+            echo ""
+            exit 1
+            ;;
+        000|"")
+            fatal "Could not reach server. Check internet connection."
+            ;;
+        *)
+            fatal "Unexpected server response (HTTP ${http_status}). Try again later."
+            ;;
+    esac
+
+    if [[ "$dry_run" == "1" ]]; then
+        info "Dry run — server says OK. No transmission sent."
+        echo ""
+        exit 0
+    fi
+
+    echo ""
+    echo "  Transmitting 60-second test flight..."
+    echo "  Check your My Nodes page — a test detection should appear within 30s."
+    echo ""
+
+    # Transmit test beacons via Python (embedded)
+    python3 - "$iface" "$lat" "$lon" "$test_id" <<'PYEOF'
+import sys, socket, struct, time, math
+
+iface, lat, lon, uas_id = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+
+# --- ODID builders (ASTM F3411-22a correct byte layout) ---
+
+def build_basic_id(uas_id):
+    msg = bytearray(25)
+    msg[0] = 0x00          # type=Basic ID, protocol version=0
+    msg[1] = 0x12          # id_type=1 (Serial), ua_type=2 (Multirotor)
+    msg[2:2+len(uas_id)] = uas_id.encode('ascii')[:20]
+    return bytes(msg)
+
+def build_location(lat, lon, alt_geo=0.0, vspeed=0.0, heading=0.0):
+    # F3411-22a Location message byte layout:
+    # 0: type+version  1: status byte  2: track direction (0-179)
+    # 3: speed  4: vert_speed  5-8: lat  9-12: lon
+    # 13-14: pressure_alt  15-16: geodetic_alt  17-18: height_agl
+    # 19-24: accuracy/timestamp/reserved
+    msg = bytearray(25)
+    msg[0] = 0x10  # type=Location/Vector
+
+    # Status byte: bit0=speed_mult(0=x0.25), bit1=EW_dir, bit2=height_type
+    ew_dir = 1 if heading >= 180 else 0
+    msg[1] = (ew_dir << 1)
+
+    # Byte 2: track direction 0-179° (EW bit adds 180° for full 360)
+    msg[2] = int(heading) % 180
+
+    # Byte 3: speed (stationary = 0)
+    msg[3] = 0
+
+    # Byte 4: vertical speed encoded as (vspeed + 62) / 0.5
+    msg[4] = max(0, min(254, int((vspeed + 62.0) / 0.5)))
+
+    # Bytes 5-8: latitude
+    struct.pack_into('<i', msg, 5, int(lat * 1e7))
+
+    # Bytes 9-12: longitude
+    struct.pack_into('<i', msg, 9, int(lon * 1e7))
+
+    # Bytes 13-14: pressure altitude = (alt + 1000) / 0.5
+    alt_enc = max(0, int((alt_geo + 1000.0) / 0.5))
+    struct.pack_into('<H', msg, 13, alt_enc)
+
+    # Bytes 15-16: geodetic altitude
+    struct.pack_into('<H', msg, 15, alt_enc)
+
+    # Bytes 17-18: height AGL — raw 2002 decodes to 1.0m
+    # (server treats raw 0x0000 as unpopulated/None)
+    struct.pack_into('<H', msg, 17, 2002)
+
+    return bytes(msg)
+
+def build_system_msg(op_lat, op_lon, alt_takeoff=0.0):
+    # F3411-22a System message byte layout (server-verified offsets):
+    # 0: type+version  1: op_location_type+classification
+    # 2-5: op_lat  6-9: op_lon
+    # 10-11: area_count  12: area_radius
+    # 13-14: alt_takeoff_geo
+    msg = bytearray(25)
+    msg[0] = 0x40  # type=System
+    msg[1] = 0x00  # op_location_type=0 (takeoff), classification=0
+    struct.pack_into('<i', msg, 2, int(op_lat * 1e7))   # operator lat
+    struct.pack_into('<i', msg, 6, int(op_lon * 1e7))   # operator lon
+    struct.pack_into('<H', msg, 10, 1)                   # area_count = 1
+    msg[12] = 0                                          # area_radius = 0 (point)
+    struct.pack_into('<H', msg, 13, max(0, int((alt_takeoff + 1000.0) / 0.5)))
+    return bytes(msg)
+
+def build_message_pack(messages):
+    pack = bytearray(3 + 25 * len(messages))
+    pack[0] = 0xF0; pack[1] = 25; pack[2] = len(messages)
+    for i, m in enumerate(messages):
+        pack[3 + i*25:3 + (i+1)*25] = m[:25]
+    return bytes(pack)
+
+def build_beacon(src_mac, payload):
+    radiotap = struct.pack('<BBHI', 0, 0, 8, 0)
+    fc = bytes([0x80, 0x00])
+    dur = bytes([0x00, 0x00])
+    da = bytes([0xFF]*6)
+    rid_data = bytes([0xFA, 0x0B, 0xBC, 0x0D]) + payload
+    rid_ie = bytes([0xDD, len(rid_data)]) + rid_data
+    body = (bytes(8) + struct.pack('<H', 100) + bytes([0x01, 0x00]) +
+            bytes([0x00, 0x00]) +
+            bytes([0x01, 0x08, 0x82, 0x84, 0x8B, 0x96, 0x24, 0x30, 0x48, 0x6C]) +
+            rid_ie)
+    frame = radiotap + fc + dur + da + src_mac + src_mac + bytes([0x00, 0x00]) + body
+    return frame
+
+# Flight path: paper-airplane shape (simplified) centred on node location
+# Offsets in degrees (~0.0001 deg ≈ 11m)
+R = 0.0004   # ~44m radius
+waypoints = []
+# Nose of plane (forward point)
+waypoints.append((lat + R*1.5, lon))
+# Right wing tip
+waypoints.append((lat - R*0.5, lon + R*1.2))
+# Tail centre
+waypoints.append((lat - R*0.8, lon))
+# Left wing tip
+waypoints.append((lat - R*0.5, lon - R*1.2))
+# Back to nose
+waypoints.append((lat + R*1.5, lon))
+# Tight circle around centre to finish
+for i in range(8):
+    angle = math.radians(i * 45)
+    waypoints.append((lat + R*0.4*math.sin(angle), lon + R*0.4*math.cos(angle)))
+
+src_mac = bytes([0x60, 0x60, 0x1F, 0x00, 0x01, 0x02])
+basic_id  = build_basic_id(uas_id)
+system_msg = build_system_msg(lat, lon)   # operator = node location
+
+sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+sock.bind((iface, 0))
+
+steps    = len(waypoints)
+interval = 60.0 / steps
+
+for i, (wlat, wlon) in enumerate(waypoints):
+    location = build_location(wlat, wlon, alt_geo=0.0, vspeed=0.0, heading=0.0)
+    pack = build_message_pack([basic_id, location, system_msg])
+    frame = build_beacon(src_mac, pack)
+
+    # Send 3 times to cover channel hopper cycle
+    for _ in range(3):
+        try:
+            sock.send(frame)
+        except Exception:
+            pass
+        time.sleep(0.3)
+
+    print(f"  [{i+1}/{steps}] lat={wlat:.6f} lon={wlon:.6f}")
+    time.sleep(max(0, interval - 0.9))
+
+sock.close()
+print("\n  Transmission complete.")
+PYEOF
+
+    # Check local detection ring buffer
+    echo ""
+    echo "  Checking local detection buffer..."
+    sleep 3
+    if grep -q "$test_id" /run/droneaware/detections.jsonl 2>/dev/null; then
+        info "Local detection confirmed — your node received the test signal."
+    else
+        warn "No local detection found yet — the server may still be processing."
+        warn "Check your My Nodes page in 30 seconds."
+    fi
+    echo ""
+}
+
 case "$1" in
     update)  cmd_update ;;
     status)  cmd_status ;;
     logs)    cmd_logs "$@" ;;
+    test)    cmd_test "$@" ;;
     *)
         echo ""
         echo -e "${BOLD}DroneAware Node CLI${NC}"
@@ -121,9 +408,11 @@ case "$1" in
         echo "  Usage: sudo droneaware <command>"
         echo ""
         echo "  Commands:"
-        echo "    update    Download and install the latest firmware"
-        echo "    status    Show service status and firmware version"
-        echo "    logs      Tail live logs  (wifi by default, or: droneaware logs ble)"
+        echo "    update       Download and install the latest firmware"
+        echo "    status       Show service status and firmware version"
+        echo "    logs         Tail live logs  (wifi by default, or: droneaware logs ble)"
+        echo "    test         Transmit a 60-second test flight and verify detection"
+        echo "    test --dry-run  Check rate-limit availability without transmitting"
         echo ""
         ;;
 esac

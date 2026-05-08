@@ -52,7 +52,7 @@ def _read_fw_version(fallback: str) -> str:
     except Exception:
         return fallback
 
-FW_VERSION = _read_fw_version("1.0.23")
+FW_VERSION = _read_fw_version("1.1.0")
 
 # -- Constants -----------------------------------------------------------------
 REMOTE_ID_SERVICE_UUID = "0000fffa-0000-1000-8000-00805f9b34fb"
