@@ -236,6 +236,32 @@ tail -f /run/droneaware/detections.jsonl
 
 ---
 
+## Testing Your Node
+
+Not seeing any detections and want to confirm your node is working? Run the
+built-in test command:
+
+```bash
+sudo droneaware test
+```
+
+This transmits a 60-second sanctioned test flight from your WiFi adapter. Your
+node captures it, decodes it, and forwards it to the server — the same path a
+real drone detection takes. A test marker will appear on the Live map within 30 seconds —
+visible only to you when signed in to the account that owns the node.
+
+**Rate limits:** 3-minute cooldown between tests, 5 per hour.
+
+**Check availability without transmitting:**
+```bash
+sudo droneaware test --dry-run
+```
+
+Test detections are tagged server-side and never appear on the public live map
+or anyone else's dashboard.
+
+---
+
 ## Troubleshooting
 
 **"USB WiFi adapter required" — installer exits immediately**
