@@ -58,9 +58,16 @@ cmd_update() {
     echo "  Stopping services..."
     systemctl stop droneaware-ble droneaware-wifi 2>/dev/null || true
 
+    # Also update the droneaware CLI itself
+    curl -fsSL --retry 3 "${BASE}/droneaware" -o /tmp/da_cli || true
+    if [[ -s /tmp/da_cli ]]; then
+        chmod +x /tmp/da_cli
+    fi
+
     cp /tmp/da_ble_feeder  "${INSTALL_DIR}/ble_feeder"
     cp /tmp/da_wifi_feeder "${INSTALL_DIR}/wifi_feeder"
-    rm -f /tmp/da_ble_feeder /tmp/da_wifi_feeder
+    [[ -s /tmp/da_cli ]] && cp /tmp/da_cli /usr/local/bin/droneaware
+    rm -f /tmp/da_ble_feeder /tmp/da_wifi_feeder /tmp/da_cli
     echo "$LATEST" > "$VERSION_FILE"
 
     # Nodes installed before v1.0.19 have service files pointing to /usr/local/bin/.
