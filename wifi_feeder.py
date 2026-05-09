@@ -24,6 +24,7 @@ import subprocess
 import time
 import struct
 import json
+import hashlib
 import logging
 import argparse
 import socket
@@ -52,7 +53,7 @@ def _read_fw_version(fallback: str) -> str:
     except Exception:
         return fallback
 
-FW_VERSION = _read_fw_version("1.1.0")
+FW_VERSION = _read_fw_version("1.1.2")
 
 # -- GPS State -----------------------------------------------------------------
 
@@ -70,6 +71,11 @@ ASTM_OUI_TYPE = 0x0D  # Remote ID app code
 # Wi-Fi Alliance NAN OUI (action frames)
 NAN_OUI      = bytes([0x50, 0x6F, 0x9A])
 NAN_OUI_TYPE = 0x13  # NAN
+
+# ASTM F3411-22a Open Drone ID NAN Service ID
+# First 6 bytes of SHA-256("org.opendroneid.remoteid")
+# Consumer NAN (Apple AirDrop, Google Nearby Share, etc.) will never match this.
+ODID_NAN_SERVICE_ID = hashlib.sha256(b"org.opendroneid.remoteid").digest()[:6]
 
 # 2.4 GHz channels (RT3070 is 2.4 GHz only)
 CHANNELS_24 = list(range(1, 12))  # 1-11 (US band)
@@ -328,16 +334,23 @@ def _extract_beacon_rid(body: bytes) -> bytes | None:
 
 def _is_nan_action(body: bytes) -> bool:
     """
-    Detect Wi-Fi NAN action frames (category 4, OUI 50:6F:9A, type 0x13).
-    body: frame body starting after the 24-byte MAC header.
-    Full NAN RID parsing is a future enhancement — raw capture only for now.
+    Detect Wi-Fi NAN action frames carrying ODID (ASTM F3411-22a).
+    Requires the ODID NAN Service ID (sha256('org.opendroneid.remoteid')[:6])
+    to be present in the frame body. This filters out consumer NAN traffic
+    (Apple AirDrop/Handoff, Google Nearby Share, etc.) which uses the same
+    OUI/type but a completely different Service ID.
     """
-    return (
+    if not (
         len(body) >= 6 and
         body[0] == 4 and           # Category: Public Action
         body[2:5] == NAN_OUI and
         body[5] == NAN_OUI_TYPE
-    )
+    ):
+        return False
+    # Scan the first 64 bytes of frame body for the ODID Service ID.
+    # In a well-formed NAN SDF the Service ID appears at a known offset inside
+    # the Service Descriptor attribute — scanning is simpler and equally correct.
+    return ODID_NAN_SERVICE_ID in body[:64]
 
 
 # -- Monitor Mode --------------------------------------------------------------
