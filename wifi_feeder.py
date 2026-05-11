@@ -53,7 +53,7 @@ def _read_fw_version(fallback: str) -> str:
     except Exception:
         return fallback
 
-FW_VERSION = _read_fw_version("1.1.2")
+FW_VERSION = _read_fw_version("1.1.3")
 
 # -- GPS State -----------------------------------------------------------------
 
@@ -355,8 +355,106 @@ def _is_nan_action(body: bytes) -> bool:
 
 # -- Monitor Mode --------------------------------------------------------------
 
+_NM_CONF       = "/etc/NetworkManager/conf.d/droneaware.conf"
+_MONITOR_MACS  = "/opt/droneaware/monitor_macs"
+
+
+def _get_backhaul_iface() -> str | None:
+    """Return the interface currently carrying the default route."""
+    try:
+        r = subprocess.run(
+            ["ip", "route", "get", "1.1.1.1"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        parts = r.stdout.split()
+        if "dev" in parts:
+            return parts[parts.index("dev") + 1]
+    except Exception:
+        pass
+    return None
+
+
+def _get_iface_mac(iface: str) -> str | None:
+    try:
+        with open(f"/sys/class/net/{iface}/address") as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def _persist_monitor_mac(mac: str):
+    """Add MAC to known monitor MACs file and update NM unmanaged config."""
+    known: set = set()
+    try:
+        with open(_MONITOR_MACS) as f:
+            known = {l.strip() for l in f if l.strip()}
+    except FileNotFoundError:
+        pass
+
+    if mac in known:
+        return
+
+    known.add(mac)
+    try:
+        with open(_MONITOR_MACS, "w") as f:
+            f.write("\n".join(sorted(known)) + "\n")
+    except Exception as e:
+        log.warning(f"[Monitor] Could not write monitor MACs file: {e}")
+        return
+
+    unmanaged = ",".join(f"mac:{m}" for m in sorted(known))
+    nm_body = (
+        "# DroneAware — prevent NetworkManager from managing the monitor adapter.\n"
+        "# If NM manages the monitor interface it fights the feeder's monitor mode\n"
+        "# setup, causing zero packet capture and intermittent SSH instability.\n"
+        "[keyfile]\n"
+        f"unmanaged-devices={unmanaged}\n"
+    )
+    try:
+        os.makedirs(os.path.dirname(_NM_CONF), exist_ok=True)
+        with open(_NM_CONF, "w") as f:
+            f.write(nm_body)
+        log.info(f"[Monitor] NM unmanaged config updated: {unmanaged}")
+    except Exception as e:
+        log.warning(f"[Monitor] Could not update NM config: {e}")
+
+
+def _ensure_monitor_safe(iface: str):
+    """
+    Refuse to monitor-mode the active backhaul interface (same check as installer).
+    If the interface is NM-managed but not the backhaul, auto-release and persist its MAC.
+    """
+    backhaul = _get_backhaul_iface()
+    if backhaul and iface == backhaul:
+        log.error(f"Refusing to monitor {iface} — it is your active management interface.")
+        log.error("Plug in ethernet or swap adapters and re-run the installer.")
+        sys.exit(1)
+
+    # Check if NM is currently managing this interface
+    try:
+        r = subprocess.run(
+            ["nmcli", "-g", "GENERAL.STATE", "device", "show", iface],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if "unmanaged" not in r.stdout.lower():
+            mac = _get_iface_mac(iface)
+            log.warning(
+                f"[Monitor] {iface} is managed by NetworkManager — "
+                "auto-releasing for monitor mode."
+            )
+            subprocess.run(
+                ["nmcli", "device", "set", iface, "managed", "no"],
+                capture_output=True, check=False,
+            )
+            if mac:
+                _persist_monitor_mac(mac)
+    except Exception:
+        pass
+
+
 def set_monitor_mode(iface: str):
     """Bring interface up in monitor mode."""
+    _ensure_monitor_safe(iface)
     log.info(f"Setting {iface} to monitor mode...")
     subprocess.run(["rfkill", "unblock", "all"], check=False, capture_output=True)
     subprocess.run(["ip", "link", "set", iface, "down"],  check=True)
@@ -501,16 +599,38 @@ def find_gps_device() -> str | None:
     return candidates[0] if candidates else None
 
 
+def _nmea_checksum_valid(sentence: str) -> bool:
+    """Validate NMEA sentence checksum (XOR of bytes between $ and *)."""
+    try:
+        if '*' not in sentence:
+            return False
+        content, checksum_str = sentence.rsplit('*', 1)
+        if content.startswith('$'):
+            content = content[1:]
+        expected = int(checksum_str[:2], 16)
+        actual = 0
+        for c in content:
+            actual ^= ord(c)
+        return actual == expected
+    except Exception:
+        return False
+
+
 def detect_baud_rate(device: str) -> int | None:
-    """Try common baud rates and return the first that produces valid NMEA."""
+    """Try common baud rates; require 2 consecutive valid NMEA sentences with correct checksum."""
     for baud in GPS_BAUD_RATES:
         try:
+            valid_count = 0
             with serial.Serial(device, baudrate=baud, timeout=2) as ser:
-                for _ in range(16):
+                for _ in range(24):
                     line = ser.readline().decode('ascii', errors='ignore').strip()
-                    if line.startswith(('$GP', '$GN')):
-                        log.info(f"[GPS] Detected baud rate {baud} on {device}")
-                        return baud
+                    if line.startswith(('$GP', '$GN')) and _nmea_checksum_valid(line):
+                        valid_count += 1
+                        if valid_count >= 2:
+                            log.info(f"[GPS] Detected baud rate {baud} on {device}")
+                            return baud
+                    else:
+                        valid_count = 0  # reset on any invalid line
         except serial.SerialException:
             pass
     return None
@@ -521,7 +641,18 @@ def gps_reader_thread(device: str):
     global _gps_lat, _gps_lon
     while True:
         try:
-            baud = detect_baud_rate(device)
+            # Use GPS_BAUD from config.env if set, otherwise auto-detect
+            configured_baud = os.environ.get("GPS_BAUD", "").strip()
+            if configured_baud:
+                try:
+                    baud = int(configured_baud)
+                    log.info(f"[GPS] Using configured baud rate {baud}")
+                except ValueError:
+                    log.warning(f"[GPS] Invalid GPS_BAUD value '{configured_baud}' — falling back to auto-detect")
+                    baud = detect_baud_rate(device)
+            else:
+                baud = detect_baud_rate(device)
+
             if baud is None:
                 log.warning(f"[GPS] Could not detect baud rate on {device} — retrying in 10s")
                 time.sleep(10)
