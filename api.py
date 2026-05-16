@@ -3,13 +3,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 import psycopg2
+from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 from datetime import datetime, timedelta
+import logging
+import math
 import struct
 import json
 import os
 
 app = FastAPI()
+log = logging.getLogger("droneaware.api")
 
 # CORS CONFIG
 origins = [
@@ -30,6 +34,103 @@ app.add_middleware(
 
 # DATABASE CONFIG — set DATABASE_URL in the server environment, never in source
 DB_CONN = os.environ["DATABASE_URL"]
+RID_MAX_FEEDER_DISTANCE_M = float(os.environ.get("RID_MAX_FEEDER_DISTANCE_M", "64373"))
+NODE_LOCATION_TABLE = os.environ.get("RID_NODE_LOCATION_TABLE", "nodes")
+NODE_LOCATION_ID_COLUMN = os.environ.get("RID_NODE_LOCATION_ID_COLUMN", "node_id")
+NODE_LOCATION_LAT_COLUMN = os.environ.get("RID_NODE_LOCATION_LAT_COLUMN", "lat")
+NODE_LOCATION_LON_COLUMN = os.environ.get("RID_NODE_LOCATION_LON_COLUMN", "lon")
+
+
+def _valid_lat_lon(lat, lon) -> bool:
+    try:
+        lat = float(lat)
+        lon = float(lon)
+    except (TypeError, ValueError):
+        return False
+    return -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Distance between two WGS84 coordinates in meters."""
+    radius_m = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
+
+    a = (
+        math.sin(d_phi / 2.0) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2.0) ** 2
+    )
+    return radius_m * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+
+
+def _lookup_node_location(cur, node_id: str) -> tuple[float, float] | None:
+    """Return the trusted server-side feeder location for a node."""
+    query = sql.SQL("SELECT {lat}, {lon} FROM {table} WHERE {node_id} = %s LIMIT 1").format(
+        lat=sql.Identifier(NODE_LOCATION_LAT_COLUMN),
+        lon=sql.Identifier(NODE_LOCATION_LON_COLUMN),
+        table=sql.Identifier(NODE_LOCATION_TABLE),
+        node_id=sql.Identifier(NODE_LOCATION_ID_COLUMN),
+    )
+    cur.execute(query, (node_id,))
+    row = cur.fetchone()
+    if not row:
+        return None
+
+    lat, lon = row[0], row[1]
+    if not _valid_lat_lon(lat, lon):
+        return None
+    return float(lat), float(lon)
+
+
+def _decoded_locations(decoded: dict | None) -> list[tuple[object, object]]:
+    """Extract all Location/Vector coordinates from a decoded message or pack."""
+    if not decoded:
+        return []
+
+    if decoded.get("message_type") == "Message Pack":
+        locations = []
+        for sub in decoded.get("messages", []):
+            locations.extend(_decoded_locations(sub))
+        return locations
+
+    if decoded.get("message_type") != "Location/Vector":
+        return []
+
+    return [(decoded.get("latitude"), decoded.get("longitude"))]
+
+
+def _proximity_anomaly(
+    decoded: dict | None,
+    feeder_location: tuple[float, float],
+) -> dict | None:
+    """Return anomaly details when decoded drone coordinates are implausible."""
+    feeder_lat, feeder_lon = feeder_location
+
+    for lat, lon in _decoded_locations(decoded):
+        if not _valid_lat_lon(lat, lon):
+            return {
+                "reason": "invalid_drone_location",
+                "message": f"invalid drone coordinates lat={lat} lon={lon}",
+                "drone_lat": lat,
+                "drone_lon": lon,
+            }
+
+        distance_m = _haversine_m(feeder_lat, feeder_lon, float(lat), float(lon))
+        if distance_m > RID_MAX_FEEDER_DISTANCE_M:
+            return {
+                "reason": "drone_location_too_far",
+                "message": (
+                    f"drone location {distance_m:.0f}m from feeder "
+                    f"(limit {RID_MAX_FEEDER_DISTANCE_M:.0f}m)"
+                ),
+                "distance_m": distance_m,
+                "drone_lat": float(lat),
+                "drone_lon": float(lon),
+            }
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -307,30 +408,165 @@ def _insert_rid_row(cur, event: RIDEvent, decoded: dict, batch_received_at: str)
     )
 
 
+def _insert_suspicious_rid_event(
+    cur,
+    event: RIDEvent,
+    batch_received_at: str,
+    batch_node_id: str,
+    reason: str,
+    message: str,
+    decoded: dict | None = None,
+    feeder_location: tuple[float, float] | None = None,
+    drone_lat=None,
+    drone_lon=None,
+    distance_m: float | None = None,
+):
+    """Track quarantined RID events for spoofing/anomaly review."""
+    feeder_lat = feeder_location[0] if feeder_location else None
+    feeder_lon = feeder_location[1] if feeder_location else None
+    cur.execute(
+        """
+        INSERT INTO rid_suspicious_observations
+            (received_at, node_id, event_node_id, radio, mac, rssi, obs_time,
+             reason, message, distance_m, max_distance_m,
+             feeder_lat, feeder_lon, drone_lat, drone_lon,
+             payload_hex, decoded, event)
+        VALUES
+            (%s::timestamptz, %s, %s, %s, %s, %s, %s::timestamptz,
+             %s, %s, %s, %s,
+             %s, %s, %s, %s,
+             %s, %s, %s)
+        """,
+        (
+            batch_received_at,
+            batch_node_id,
+            event.node_id,
+            event.radio,
+            event.source_mac,
+            event.rssi,
+            event.observed_at,
+            reason,
+            message,
+            distance_m,
+            RID_MAX_FEEDER_DISTANCE_M,
+            feeder_lat,
+            feeder_lon,
+            drone_lat,
+            drone_lon,
+            event.rid_payload_hex,
+            json.dumps(decoded) if decoded is not None else None,
+            json.dumps(event.dict()),
+        ),
+    )
+
+
 @app.post("/api/ingest")
 def ingest_rid(batch: RIDBatch):
     """
     Accept a batch of raw Remote ID observations from a feeder node.
     Decodes each rid_payload_hex server-side and stores the results.
-    Message Packs are unpacked so each sub-message is its own row.
+    Message Packs are unpacked so each sub-message is its own row. Implausible
+    detections are quarantined for spoofing analysis instead of being mapped.
     """
     if not batch.events:
-        return {"accepted": 0}
+        return {"accepted": 0, "suspicious": 0}
 
+    conn = None
+    cur = None
     try:
         conn = psycopg2.connect(DB_CONN)
         cur  = conn.cursor()
         accepted = 0
+        suspicious = 0
+
+        feeder_location = _lookup_node_location(cur, batch.node_id)
+        if feeder_location is None:
+            for event in batch.events:
+                _insert_suspicious_rid_event(
+                    cur,
+                    event,
+                    batch.received_at,
+                    batch.node_id,
+                    "node_location_unavailable",
+                    "trusted feeder location unavailable for proximity validation",
+                )
+                suspicious += 1
+            conn.commit()
+            print(f"Ingest: 0 rows from node {batch.node_id} "
+                  f"({batch.count} events in batch, {suspicious} suspicious)")
+            return {"accepted": 0, "suspicious": suspicious}
 
         for event in batch.events:
+            if event.node_id != batch.node_id:
+                _insert_suspicious_rid_event(
+                    cur,
+                    event,
+                    batch.received_at,
+                    batch.node_id,
+                    "node_id_mismatch",
+                    f"batch node_id {batch.node_id} differs from event node_id {event.node_id}",
+                    feeder_location=feeder_location,
+                )
+                suspicious += 1
+                log.warning(
+                    "Quarantined RID event with mismatched node_id: batch=%s event=%s",
+                    batch.node_id,
+                    event.node_id,
+                )
+                continue
+
             try:
                 raw = bytes.fromhex(event.rid_payload_hex)
             except ValueError:
-                log.warning(f"Bad hex from {event.source_mac}: {event.rid_payload_hex}")
+                _insert_suspicious_rid_event(
+                    cur,
+                    event,
+                    batch.received_at,
+                    batch.node_id,
+                    "bad_payload_hex",
+                    "rid_payload_hex is not valid hex",
+                    feeder_location=feeder_location,
+                )
+                suspicious += 1
+                log.warning("Bad RID hex from %s: %s", event.source_mac, event.rid_payload_hex)
                 continue
 
             decoded = decode_rid_message(raw)
             if decoded is None:
+                _insert_suspicious_rid_event(
+                    cur,
+                    event,
+                    batch.received_at,
+                    batch.node_id,
+                    "undecodable_payload",
+                    "RID payload could not be decoded",
+                    feeder_location=feeder_location,
+                )
+                suspicious += 1
+                continue
+
+            anomaly = _proximity_anomaly(decoded, feeder_location)
+            if anomaly:
+                _insert_suspicious_rid_event(
+                    cur,
+                    event,
+                    batch.received_at,
+                    batch.node_id,
+                    anomaly["reason"],
+                    anomaly["message"],
+                    decoded=decoded,
+                    feeder_location=feeder_location,
+                    drone_lat=anomaly.get("drone_lat"),
+                    drone_lon=anomaly.get("drone_lon"),
+                    distance_m=anomaly.get("distance_m"),
+                )
+                suspicious += 1
+                log.warning(
+                    "Quarantined RID event from node %s mac %s: %s",
+                    batch.node_id,
+                    event.source_mac,
+                    anomaly["message"],
+                )
                 continue
 
             if decoded.get("message_type") == "Message Pack":
@@ -342,16 +578,21 @@ def ingest_rid(batch: RIDBatch):
                 accepted += 1
 
         conn.commit()
-        cur.close()
-        conn.close()
 
         print(f"Ingest: {accepted} rows from node {batch.node_id} "
-              f"({batch.count} events in batch)")
-        return {"accepted": accepted}
+              f"({batch.count} events in batch, {suspicious} suspicious)")
+        return {"accepted": accepted, "suspicious": suspicious}
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Ingest error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
