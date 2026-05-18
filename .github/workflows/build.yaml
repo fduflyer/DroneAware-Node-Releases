@@ -1,0 +1,52 @@
+name: Reusable Build and Release
+on:
+  workflow_call:
+    inputs:
+      version:
+        default: dev
+        type: string
+      publish:
+        default: false
+        type: boolean
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pguyot/arm-runner-action@29ff97a269fc6ef3e98f17583af01253896c5601
+        with:
+          base_image: "raspios_lite_arm64:latest"
+          cpu: cortex-a7
+          copy_artifact_path: dist/
+          commands: |
+            bash ./build.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/
+          overwrite: true
+  release:
+    needs: build
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v7
+        id: download
+      - uses: actions/attest@v4
+        with:
+          subject-path: |
+            ${{ steps.download.outputs.download-path }}/ble_feeder
+            ${{ steps.download.outputs.download-path }}/wifi_feeder
+            install.sh
+            droneaware
+      - name: Create Release
+        run: |
+          gh release create "v${VERSION}" "${DL_PATH}/ble_feeder" \
+            "${DL_PATH}/wifi_feeder" \
+            install.sh \
+            droneaware \
+            --generate-notes
+        env:
+          VERSION: ${{ inputs.version }}
+          DL_PATH: ${{ steps.download.outputs.download-path }}
+          GH_TOKEN: ${{ github.token }}

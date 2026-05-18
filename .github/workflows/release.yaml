@@ -1,0 +1,23 @@
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        required: true
+        type: string
+        description: The version number for the release (e.g., 1.0.0)
+      publish:
+        default: true
+        type: boolean
+        description: Whether to publish the release on GitHub (defaults to true)
+jobs:
+  build-and-publish:
+    uses: ./.github/workflows/build.yaml
+    permissions:
+      # Contents write is required to create a release
+      contents: write
+      id-token: write
+      attestations: write
+    with:
+      version: ${{ inputs.version }}
+      publish: ${{ inputs.publish }}
