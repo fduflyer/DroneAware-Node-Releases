@@ -41,7 +41,8 @@ jobs:
             droneaware
       - name: Create Release
         run: |
-          gh release create "v${VERSION}" "${DL_PATH}/ble_feeder" \
+          [[ "$VERSION" =~ ^v ]] || VERSION="v$VERSION"
+          gh release create "${VERSION}" "${DL_PATH}/ble_feeder" \
             "${DL_PATH}/wifi_feeder" \
             install.sh \
             droneaware \
