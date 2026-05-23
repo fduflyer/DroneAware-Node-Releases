@@ -259,9 +259,19 @@ detect_wifi_adapter() {
     done < <(iw dev 2>/dev/null | awk '$1=="Interface"{print $2}')
 
     if [[ -z "$WIFI_ADAPTER" ]]; then
+        echo ""
         warn "No USB WiFi adapter detected."
-        warn "Connect your Alfa AWUS036N (or compatible adapter) and re-run this installer."
-        fatal "USB WiFi adapter required."
+        warn "Continuing in BLE-only mode — WiFi detection will be disabled."
+        warn "The wifi feeder will start, report FAULT status, and produce no detections."
+        warn "To enable WiFi later: connect a USB monitor-mode adapter (e.g. Alfa AWUS036N)"
+        warn "and re-run this installer."
+        echo ""
+        read -rp "  Continue without a WiFi adapter? [y/N]: " WIFI_SKIP </dev/tty
+        if [[ ! "${WIFI_SKIP,,}" =~ ^y(es)?$ ]]; then
+            fatal "Installation cancelled. Connect a WiFi adapter and re-run."
+        fi
+        WIFI_ADAPTER=""
+        WIFI_ADAPTER_MAC=""
     fi
 }
 
@@ -269,6 +279,10 @@ detect_wifi_adapter() {
 # 4. Persist any netplan-backed WiFi profiles to disk before touching NM
 # ---------------------------------------------------------------------------
 persist_wifi_profiles() {
+    if [[ -z "$WIFI_ADAPTER" ]]; then
+        info "Skipping WiFi profile persistence — no WiFi adapter present."
+        return
+    fi
     heading "Securing WiFi Profiles"
     local count=0
 
@@ -321,6 +335,10 @@ persist_wifi_profiles() {
 # 5. Pin WiFi monitor adapter as unmanaged in NetworkManager
 # ---------------------------------------------------------------------------
 pin_wifi_unmanaged() {
+    if [[ -z "$WIFI_ADAPTER" ]]; then
+        info "Skipping NetworkManager configuration — no WiFi adapter to manage."
+        return
+    fi
     heading "Configuring NetworkManager"
 
     # Safety check: if the USB adapter is currently the active network interface,
@@ -494,16 +512,41 @@ write_config() {
     [[ -z "$BLE_ADAPTER_MAC" ]] && BLE_ADAPTER_MAC="00:00:00:00:00:00"
 
     cat > "${INSTALL_DIR}/config.env" <<EOF
-NODE_ID=${NODE_ID}
-SERVER_URL=${SERVER_URL}
+# ─── Hardware adapters ────────────────────────────────────────────────────
 BLE_ADAPTER=${BLE_ADAPTER}
 BLE_ADAPTER_MAC=${BLE_ADAPTER_MAC}
 WIFI_ADAPTER=${WIFI_ADAPTER}
+
+# ─── Location & GPS ───────────────────────────────────────────────────────
 NODE_MOBILE=${NODE_MOBILE}
 NODE_LAT=${NODE_LAT:-}
 NODE_LON=${NODE_LON:-}
 GPS_DEVICE=${GPS_DEVICE:-}
 GPS_BAUD=
+
+# ─── Channel hopper ───────────────────────────────────────────────────────
+# "true" = adaptive (channel-6 biased, sweep+sticky — recommended).
+# "false" = legacy flat hop across channels 1-11.
+ADAPTIVE_DWELL=true
+# Optional adaptive-hopper tuning (uncomment to override defaults):
+# FIXED_CHANNEL=6           # Lock 100% to this channel — overrides adaptive logic
+#                           # (useful for DFR monitoring of a known-channel drone)
+# ACTIVE_WINDOW_SEC=3       # Sticky-mode reset threshold in seconds (default 3.0)
+# DWELL_CH6_MS=800          # Primary channel dwell in sweep mode (default 800ms)
+# DWELL_PEEK_MS=50          # Peek dwell on channels 1 and 11 (default 50ms)
+
+# ─── Advanced — do not edit unless directed by DroneAware support ─────────
+# NODE_ID and SERVER_URL are set automatically at install and bind this node
+# to your DroneAware account. Changing them will break the server connection —
+# the node will appear offline and detections will stop flowing. Contact
+# support@droneaware.io if you need to migrate or rename a node.
+NODE_ID=${NODE_ID}
+SERVER_URL=${SERVER_URL}
+
+# BATCH_SIZE and FLUSH_INTERVAL control how often detections are forwarded to
+# the server. Increasing them holds events on the node longer, which can delay
+# real-time map updates and email alerts — and a crash before the next flush
+# will lose buffered detections. Leave at defaults unless directed by support.
 BATCH_SIZE=200
 FLUSH_INTERVAL=5.0
 EOF
