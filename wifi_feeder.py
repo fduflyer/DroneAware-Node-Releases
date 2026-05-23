@@ -1202,8 +1202,8 @@ def main():
         description="DroneAware WiFi Remote ID Feeder (Raspberry Pi + Alfa AWUS036N)"
     )
     parser.add_argument(
-        "--iface", default="wlan1",
-        help="Monitor-mode interface (default: wlan1)"
+        "--iface", default=os.environ.get("WIFI_ADAPTER", "") or "wlan1",
+        help="Monitor-mode interface (default: $WIFI_ADAPTER from config.env, or wlan1)"
     )
     parser.add_argument(
         "--node-id", default=socket.gethostname(),

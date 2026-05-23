@@ -26,10 +26,8 @@ _rollback_nm() {
 trap '_rollback_nm' ERR
 
 INSTALLER_VERSION="v1.1.3"
-BINARY_VERSION="v1.1.3"  # last release containing updated binaries
-
-SERVICE_VERSION="v1.0.21"  # last release containing service files and bt-select script
-GITHUB_REPO="fduflyer/DroneAware-Node-Releases"
+BINARY_VERSION="v1.1.3"  # CI stamps this with the actual release version
+GITHUB_REPO="fduflyer/DroneAware-Node-Releases"  # CI stamps this with the building repo
 INSTALL_DIR="/opt/droneaware"
 CLI_DIR="/usr/local/bin"
 SERVER_URL="https://api.droneaware.io/api"
@@ -476,20 +474,30 @@ download_binaries() {
 # ---------------------------------------------------------------------------
 install_services() {
     heading "Installing Services"
-    local base_url="https://github.com/${GITHUB_REPO}/releases/download/${SERVICE_VERSION}"
+    # As of v1.2.0, service files ship with the same release as the binaries.
+    local base_url="https://github.com/${GITHUB_REPO}/releases/download/${BINARY_VERSION}"
+    local local_root="$(dirname "${LOCAL_DIST}")"
 
     # bt-select helper
-    curl -fsSL --retry 3 \
-        "${base_url}/droneaware-bt-select" \
-        -o "${CLI_DIR}/droneaware-bt-select"
+    if [[ "$LOCAL_INSTALL" == "1" ]]; then
+        cp "${local_root}/droneaware-bt-select" "${CLI_DIR}/droneaware-bt-select"
+    else
+        curl -fsSL --retry 3 \
+            "${base_url}/droneaware-bt-select" \
+            -o "${CLI_DIR}/droneaware-bt-select"
+    fi
     chmod +x "${CLI_DIR}/droneaware-bt-select"
     info "droneaware-bt-select installed."
 
     # Systemd service files
     for svc in droneaware-bt-select.service droneaware-ble.service droneaware-wifi.service; do
-        curl -fsSL --retry 3 \
-            "${base_url}/${svc}" \
-            -o "/etc/systemd/system/${svc}"
+        if [[ "$LOCAL_INSTALL" == "1" ]]; then
+            cp "${local_root}/${svc}" "/etc/systemd/system/${svc}"
+        else
+            curl -fsSL --retry 3 \
+                "${base_url}/${svc}" \
+                -o "/etc/systemd/system/${svc}"
+        fi
         info "$svc installed."
     done
 
