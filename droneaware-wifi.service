@@ -10,7 +10,6 @@ EnvironmentFile=/opt/droneaware/config.env
 ExecStart=/opt/droneaware/wifi_feeder \
     --node-id ${NODE_ID} \
     --server ${SERVER_URL} \
-    --iface ${WIFI_ADAPTER} \
     --batch-size ${BATCH_SIZE} \
     --flush-interval ${FLUSH_INTERVAL}
 Restart=always

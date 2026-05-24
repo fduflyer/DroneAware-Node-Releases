@@ -308,17 +308,18 @@ class LocalPublisher:
             return
 
         record = {
-            "t":     event.get("timestamp") or event.get("observed_at"),
-            "mac":   event.get("source_mac") or event.get("mac"),
-            "radio": event.get("radio"),
-            "rssi":  event.get("rssi"),
-            "type":  decoded.get("message_type"),
-            "lat":   decoded.get("latitude"),
-            "lon":   decoded.get("longitude"),
-            "alt":   decoded.get("altitude_geo"),
-            "speed": decoded.get("ground_speed"),
-            "hdg":   decoded.get("heading"),
-            "id":    decoded.get("uas_id"),
+            "t":       event.get("timestamp") or event.get("observed_at"),
+            "mac":     event.get("source_mac") or event.get("mac"),
+            "radio":   event.get("radio"),
+            "rssi":    event.get("rssi"),
+            "channel": event.get("channel"),
+            "type":    decoded.get("message_type"),
+            "lat":     decoded.get("latitude"),
+            "lon":     decoded.get("longitude"),
+            "alt":     decoded.get("altitude_geo"),
+            "speed":   decoded.get("ground_speed"),
+            "hdg":     decoded.get("heading"),
+            "id":      decoded.get("uas_id"),
         }
         line = json.dumps(record, separators=(',', ':'))
 
@@ -466,6 +467,7 @@ class BLEFeeder:
             "source_mac":           device.address,
             "source_name":          device.name or None,
             "rssi":                 adv.rssi,
+            "channel":              None,  # BLE adv channel (37/38/39) not exposed by bleak
             "tx_power":             getattr(adv, "tx_power", None),
             "service_uuid":         svc_uuid,
             "service_data_hex":     svc_data.hex(),
@@ -495,8 +497,57 @@ class BLEFeeder:
                 pub_event["decoded"] = msg
                 self.publisher.publish(pub_event)
 
+    async def _fault_loop(self, reason: str):
+        """
+        Degraded loop entered when the BLE adapter is unhealthy or absent.
+        Emits heartbeats with ble_ok=False so the server marks the radio as FAULT.
+        Performs no BLE scanning. WiFi status (if measurable) is still reported.
+        """
+        log.warning(f"[FAULT] ble feeder running in degraded mode: {reason}")
+        while True:
+            try:
+                await asyncio.sleep(60)
+                cpu_temp = get_cpu_temp()
+                log.info(
+                    f"[Heartbeat] FAULT — ble_ok=False  reason={reason}  "
+                    f"temp={cpu_temp}°C"
+                )
+                if not self.token:
+                    continue
+                requests.post(
+                    "https://api.droneaware.io/api/node/heartbeat",
+                    json={
+                        # Per-feeder heartbeat: ble_* fields only (see note above)
+                        "node_id":      self.node_id,
+                        "uptime_s":     int(time.monotonic() - self.start_time),
+                        "fw_version":   FW_VERSION,
+                        "cpu_temp_c":   cpu_temp,
+                        "ble_ok":       False,
+                        "ble_adapter":  self.adapter,
+                        "ble_fault":    reason,
+                    },
+                    headers={"X-Node-Token": self.token},
+                    timeout=5,
+                )
+            except requests.RequestException as e:
+                log.warning(f"FAULT heartbeat failed: {e}")
+            except Exception as e:
+                log.warning(f"FAULT loop error: {e}")
+
     async def run(self):
         log.info(f"DroneAware BLE Feeder - Node: {self.node_id}  Adapter: {self.adapter}")
+
+        # FAULT mode — BLE adapter not healthy at startup
+        ble_ok, _ = get_ble_health(self.adapter)
+        if not ble_ok:
+            log.error(
+                f"BLE adapter '{self.adapter}' not healthy — entering FAULT mode."
+            )
+            log.error("WiFi detection (if available) is unaffected and continues independently.")
+            log.error("To restore BLE: connect a working Bluetooth adapter and restart this service.")
+            await self._fault_loop("adapter not present")
+            return
+
         log.info(f"Scanning for Remote ID broadcasts (UUID 0xFFFA)...")
 
         # No service_uuids filter here — the CSR adapter doesn't reliably
@@ -514,30 +565,33 @@ class BLEFeeder:
                 ticker += 1
 
                 if ticker % 60 == 0:
-                    cpu_temp          = get_cpu_temp()
-                    ble_ok, ble_adp   = get_ble_health(self.adapter)
-                    wifi_ok, wifi_adp = get_wifi_health(self.wifi_adapter)
+                    cpu_temp        = get_cpu_temp()
+                    ble_ok, ble_adp = get_ble_health(self.adapter)
 
                     log.info(
                         f"[Heartbeat] seen={self.count}  "
                         f"sent={self.forwarder.sent_total}  "
                         f"dropped={self.forwarder.dropped_total}  "
                         f"buffered={len(self.forwarder.buffer)}  "
-                        f"temp={cpu_temp}°C  ble={ble_ok}  wifi={wifi_ok}"
+                        f"temp={cpu_temp}°C  ble={ble_ok}"
                     )
                     if self.token:
                         try:
                             requests.post(
                                 "https://api.droneaware.io/api/node/heartbeat",
                                 json={
+                                    # Per-feeder heartbeat: ble_* fields only.
+                                    # Do NOT include wifi_ok or wifi_fault — the
+                                    # server uses presence of an ok-field to
+                                    # route the heartbeat to that feeder's
+                                    # status row. WiFi status comes from
+                                    # wifi_feeder's own heartbeat.
                                     "node_id":      self.node_id,
                                     "uptime_s":     int(time.monotonic() - self.start_time),
                                     "fw_version":   FW_VERSION,
                                     "cpu_temp_c":   cpu_temp,
                                     "ble_ok":       ble_ok,
-                                    "wifi_ok":      wifi_ok,
                                     "ble_adapter":  ble_adp,
-                                    "wifi_adapter": wifi_adp,
                                 },
                                 headers={"X-Node-Token": self.token},
                                 timeout=5,

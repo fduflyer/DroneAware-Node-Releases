@@ -26,10 +26,8 @@ _rollback_nm() {
 trap '_rollback_nm' ERR
 
 INSTALLER_VERSION="v1.1.3"
-BINARY_VERSION="v1.1.3"  # last release containing updated binaries
-
-SERVICE_VERSION="v1.0.21"  # last release containing service files and bt-select script
-GITHUB_REPO="fduflyer/DroneAware-Node-Releases"
+BINARY_VERSION="v1.1.3"  # CI stamps this with the actual release version
+GITHUB_REPO="fduflyer/DroneAware-Node-Releases"  # CI stamps this with the building repo
 INSTALL_DIR="/opt/droneaware"
 CLI_DIR="/usr/local/bin"
 SERVER_URL="https://api.droneaware.io/api"
@@ -54,42 +52,158 @@ show_terms() {
     clear
     echo -e "${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════════════╗"
-    echo "║            DroneAware Feeder Node — Installer v1.1.3               ║"
+    echo "║         DroneAware Feeder Node — Installer ${INSTALLER_VERSION}                 ║"
     echo "╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
-    echo -e "${BOLD}ACCEPTANCE UPON NODE REGISTRATION${NC}"
-    echo ""
-    echo "  BINDING ACCEPTANCE"
-    echo "  You are entering into and agreeing to be legally bound by the"
-    echo "  DroneAware Feeder Node Contributor Agreement at the time you claim"
-    echo "  or activate a Node."
-    echo ""
-    echo "  CONDITION OF PARTICIPATION"
-    echo "  Acceptance of this Agreement is a mandatory condition of registering"
-    echo "  or operating any Node on the DroneAware network. You may not transmit"
-    echo "  data to DroneAware systems without accepting this Agreement."
-    echo ""
-    echo "  DATA OWNERSHIP ASSIGNMENT"
-    echo "  As a condition of Node registration and operation, you agree that all"
-    echo "  data transmitted from your Node is subject to the Data Ownership"
-    echo "  Assignment provisions of this Agreement, including the irrevocable"
-    echo "  assignment of all rights, title, and interest to DroneAware, LLC."
-    echo ""
-    echo "  AFFIRMATIVE ACTION REQUIRED"
-    echo "  Acceptance requires an affirmative action during Node registration."
-    echo ""
-    echo "  RECORD OF ACCEPTANCE"
-    echo "  DroneAware may record and retain evidence of your acceptance,"
-    echo "  including: timestamp, IP address, account identity, and agreement"
-    echo "  version. Such records shall constitute proof of your agreement."
-    echo ""
-    echo "  NO OPERATION WITHOUT ACCEPTANCE"
-    echo "  If you do not accept this Agreement, you are not authorized to"
-    echo "  register a Node, connect a Node to the network, or transmit any"
-    echo "  data to DroneAware."
-    echo ""
-    echo "──────────────────────────────────────────────────────────────────────"
+    cat <<'EOF'
+DroneAware Feeder Node Contributor Agreement
+Last Updated: May 2026
+
+This Feeder Node Contributor Agreement ("Agreement") governs participation
+in the DroneAware Network.
+
+By installing or operating a DroneAware feeder node you agree to these
+terms.
+
+1. PARTICIPATION IN THE NETWORK
+   Participants may operate hardware devices ("Feeder Nodes") that
+   collect and transmit radio signals and telemetry data to DroneAware
+   servers. Participation is voluntary. DroneAware may approve or reject
+   nodes at its discretion.
+
+2. HARDWARE RESPONSIBILITY
+   Participants are responsible for: acquiring hardware, maintaining
+   equipment, complying with local laws, and ensuring safe installation.
+   DroneAware is not responsible for hardware damage or operating costs.
+
+3. DATA CONTRIBUTION
+   Feeder nodes transmit captured ASTM F3411 Remote Identification
+   broadcasts to DroneAware servers. This data may include:
+   - Remote ID Basic ID, Location/Vector, System, Operator ID, Self ID,
+     and Authentication messages
+   - Signal strength (RSSI) and capture timestamps
+   - Detecting node identifier and radio band (BLE 4 Legacy, BLE 5 Long
+     Range, Wi-Fi NAN, Wi-Fi Beacon)
+
+3.1 SCOPE OF DATA COLLECTION
+    DroneAware feeder software runs Wi-Fi adapters in monitor mode,
+    which is technically capable of capturing many kinds of radio
+    traffic. By design, the feeder collects and forwards only ASTM
+    F3411 Remote ID broadcasts. Specifically, the feeder will not:
+    - Capture, store, or transmit non-Remote-ID Bluetooth advertisements
+      (including Apple Continuity, AirDrop, AirTag, fitness trackers, or
+      other proximity beacon transmissions)
+    - Capture, store, or transmit non-Remote-ID Wi-Fi traffic (including
+      probe requests, encrypted client frames, hidden-SSID enumeration,
+      or device-fingerprinting metadata)
+    - Correlate observed MAC addresses or hardware identifiers with
+      personal identities outside of what the Remote ID specification
+      itself discloses
+    - Build movement profiles, location histories, or behavioral
+      analytics from non-Remote-ID radio observations
+    These commitments are enforced in the feeder software itself. The
+    node release binaries are published in DroneAware's public GitHub
+    repository so that operators may independently verify the scope of
+    collection.
+
+4. LICENSE TO SUBMITTED DATA
+   By operating a feeder node, the participant grants DroneAware, LLC a
+   worldwide, royalty-free, perpetual, irrevocable, sublicensable
+   license to use, reproduce, modify, distribute, and create derivative
+   works from the data transmitted through the feeder node ("Submitted
+   Data"), for any purpose consistent with this Agreement and the
+   Privacy Policy. The participant retains whatever underlying ownership
+   rights they may have in such data; this license does not transfer
+   ownership.
+
+   The scope of Submitted Data is limited as described in Section 3.1.
+
+5. DATA USAGE
+   DroneAware may use Submitted Data to:
+   - Display real-time and historical drone activity on droneaware.io
+   - Generate aggregate airspace statistics and analytics
+   - Power detection-alert features for node operators and subscribers
+   - Improve detection algorithms and platform reliability
+   - Provide controlled API access to approved third-party users under
+     separate written agreement, subject to this Agreement and the
+     Privacy Policy
+
+   Participants acknowledge that DroneAware may generate revenue from
+   the Service. Participants are not entitled to compensation unless
+   otherwise agreed in writing.
+
+   DroneAware will not sell Node Owner Personal Information for
+   advertising, identity resolution, law-enforcement targeting, or
+   unrelated third-party profiling purposes. DroneAware is a public
+   airspace-awareness and data platform and is not provided as a
+   certified, safety-critical, law-enforcement, counter-UAS, or
+   operational security system; it should not be used as the sole
+   basis for enforcement, interdiction, navigation, or safety-of-life
+   decisions.
+
+6. NODE MONITORING
+   DroneAware may monitor feeder nodes for uptime, data integrity,
+   software version, and network health. DroneAware may collect system
+   metrics from nodes.
+
+7. SOFTWARE UPDATES
+   Feeder software updates are not pushed automatically. Updates are
+   pulled by the operator running 'sudo droneaware update' on the node.
+   DroneAware does not have unattended administrative access to
+   participant hardware.
+
+   A future version of the installer may offer an opt-in daily
+   auto-update mechanism for operators who prefer it. If introduced,
+   auto-update will be off by default and require explicit consent at
+   install time or via Settings.
+
+8. NODE REVOCATION
+   DroneAware may suspend or disable feeder nodes if data appears
+   manipulated, the node violates network policies, the node threatens
+   network integrity, or legal issues arise. DroneAware may revoke
+   participation at any time.
+
+9. NETWORK INTEGRITY
+   Participants agree not to: inject false data, modify detection
+   outputs, reverse engineer proprietary software, or interfere with
+   network operation. Violations may result in permanent removal from
+   the network.
+
+10. NO WARRANTY
+    Participation is provided "as-is." DroneAware does not guarantee
+    network uptime, data access, or availability of dashboards or APIs.
+
+11. LIMITATION OF LIABILITY
+    DroneAware shall not be liable for equipment damage, electricity
+    costs, network usage charges, or indirect damages arising from
+    participation in the feeder network.
+
+12. GOVERNING LAW
+    This Agreement is governed by the laws of the State of New Jersey,
+    without regard to conflict-of-law principles.
+
+13. CHANGES TO THIS AGREEMENT
+    DroneAware is committed to changing this Agreement only through a
+    deliberate, transparent process. Material changes to the scope of
+    data collection (Section 3 and 3.1), the license grant (Section 4),
+    or the data usage (Section 5) will:
+    - Be announced publicly at least 30 days before taking effect,
+      posted on droneaware.io and sent by email to affected participants
+    - Require explicit re-consent from existing participants before
+      applying retroactively
+    - Be tied to a versioned revision with a public changelog
+    - Not apply retroactively to Submitted Data collected under prior
+      versions without re-consent
+
+    Tightening commitments (additional restrictions on collection,
+    additional protections for participants) may be applied immediately
+    without re-consent.
+
+──────────────────────────────────────────────────────────────────────
+Full agreement and revision history: https://droneaware.io/legal.html
+──────────────────────────────────────────────────────────────────────
+EOF
     echo ""
 }
 
@@ -259,9 +373,19 @@ detect_wifi_adapter() {
     done < <(iw dev 2>/dev/null | awk '$1=="Interface"{print $2}')
 
     if [[ -z "$WIFI_ADAPTER" ]]; then
+        echo ""
         warn "No USB WiFi adapter detected."
-        warn "Connect your Alfa AWUS036N (or compatible adapter) and re-run this installer."
-        fatal "USB WiFi adapter required."
+        warn "Continuing in BLE-only mode — WiFi detection will be disabled."
+        warn "The wifi feeder will start, report FAULT status, and produce no detections."
+        warn "To enable WiFi later: connect a USB monitor-mode adapter (e.g. Alfa AWUS036N)"
+        warn "and re-run this installer."
+        echo ""
+        read -rp "  Continue without a WiFi adapter? [y/N]: " WIFI_SKIP </dev/tty
+        if [[ ! "${WIFI_SKIP,,}" =~ ^y(es)?$ ]]; then
+            fatal "Installation cancelled. Connect a WiFi adapter and re-run."
+        fi
+        WIFI_ADAPTER=""
+        WIFI_ADAPTER_MAC=""
     fi
 }
 
@@ -269,6 +393,10 @@ detect_wifi_adapter() {
 # 4. Persist any netplan-backed WiFi profiles to disk before touching NM
 # ---------------------------------------------------------------------------
 persist_wifi_profiles() {
+    if [[ -z "$WIFI_ADAPTER" ]]; then
+        info "Skipping WiFi profile persistence — no WiFi adapter present."
+        return
+    fi
     heading "Securing WiFi Profiles"
     local count=0
 
@@ -321,6 +449,10 @@ persist_wifi_profiles() {
 # 5. Pin WiFi monitor adapter as unmanaged in NetworkManager
 # ---------------------------------------------------------------------------
 pin_wifi_unmanaged() {
+    if [[ -z "$WIFI_ADAPTER" ]]; then
+        info "Skipping NetworkManager configuration — no WiFi adapter to manage."
+        return
+    fi
     heading "Configuring NetworkManager"
 
     # Safety check: if the USB adapter is currently the active network interface,
@@ -458,20 +590,30 @@ download_binaries() {
 # ---------------------------------------------------------------------------
 install_services() {
     heading "Installing Services"
-    local base_url="https://github.com/${GITHUB_REPO}/releases/download/${SERVICE_VERSION}"
+    # As of v1.2.0, service files ship with the same release as the binaries.
+    local base_url="https://github.com/${GITHUB_REPO}/releases/download/${BINARY_VERSION}"
+    local local_root="$(dirname "${LOCAL_DIST}")"
 
     # bt-select helper
-    curl -fsSL --retry 3 \
-        "${base_url}/droneaware-bt-select" \
-        -o "${CLI_DIR}/droneaware-bt-select"
+    if [[ "$LOCAL_INSTALL" == "1" ]]; then
+        cp "${local_root}/droneaware-bt-select" "${CLI_DIR}/droneaware-bt-select"
+    else
+        curl -fsSL --retry 3 \
+            "${base_url}/droneaware-bt-select" \
+            -o "${CLI_DIR}/droneaware-bt-select"
+    fi
     chmod +x "${CLI_DIR}/droneaware-bt-select"
     info "droneaware-bt-select installed."
 
     # Systemd service files
     for svc in droneaware-bt-select.service droneaware-ble.service droneaware-wifi.service; do
-        curl -fsSL --retry 3 \
-            "${base_url}/${svc}" \
-            -o "/etc/systemd/system/${svc}"
+        if [[ "$LOCAL_INSTALL" == "1" ]]; then
+            cp "${local_root}/${svc}" "/etc/systemd/system/${svc}"
+        else
+            curl -fsSL --retry 3 \
+                "${base_url}/${svc}" \
+                -o "/etc/systemd/system/${svc}"
+        fi
         info "$svc installed."
     done
 
@@ -494,16 +636,41 @@ write_config() {
     [[ -z "$BLE_ADAPTER_MAC" ]] && BLE_ADAPTER_MAC="00:00:00:00:00:00"
 
     cat > "${INSTALL_DIR}/config.env" <<EOF
-NODE_ID=${NODE_ID}
-SERVER_URL=${SERVER_URL}
+# ─── Hardware adapters ────────────────────────────────────────────────────
 BLE_ADAPTER=${BLE_ADAPTER}
 BLE_ADAPTER_MAC=${BLE_ADAPTER_MAC}
 WIFI_ADAPTER=${WIFI_ADAPTER}
+
+# ─── Location & GPS ───────────────────────────────────────────────────────
 NODE_MOBILE=${NODE_MOBILE}
 NODE_LAT=${NODE_LAT:-}
 NODE_LON=${NODE_LON:-}
 GPS_DEVICE=${GPS_DEVICE:-}
 GPS_BAUD=
+
+# ─── Channel hopper ───────────────────────────────────────────────────────
+# "true" = adaptive (channel-6 biased, sweep+sticky — recommended).
+# "false" = legacy flat hop across channels 1-11.
+ADAPTIVE_DWELL=true
+# Optional adaptive-hopper tuning (uncomment to override defaults):
+# FIXED_CHANNEL=6           # Lock 100% to this channel — overrides adaptive logic
+#                           # (useful for DFR monitoring of a known-channel drone)
+# ACTIVE_WINDOW_SEC=3       # Sticky-mode reset threshold in seconds (default 3.0)
+# DWELL_CH6_MS=800          # Primary channel dwell in sweep mode (default 800ms)
+# DWELL_PEEK_MS=50          # Peek dwell on channels 1 and 11 (default 50ms)
+
+# ─── Advanced — do not edit unless directed by DroneAware support ─────────
+# NODE_ID and SERVER_URL are set automatically at install and bind this node
+# to your DroneAware account. Changing them will break the server connection —
+# the node will appear offline and detections will stop flowing. Contact
+# support@droneaware.io if you need to migrate or rename a node.
+NODE_ID=${NODE_ID}
+SERVER_URL=${SERVER_URL}
+
+# BATCH_SIZE and FLUSH_INTERVAL control how often detections are forwarded to
+# the server. Increasing them holds events on the node longer, which can delay
+# real-time map updates and email alerts — and a crash before the next flush
+# will lose buffered detections. Leave at defaults unless directed by support.
 BATCH_SIZE=200
 FLUSH_INTERVAL=5.0
 EOF

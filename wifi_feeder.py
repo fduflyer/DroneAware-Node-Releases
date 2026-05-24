@@ -227,23 +227,35 @@ def decode_rid_message(raw_bytes: bytes) -> dict | None:
 # -- Raw 802.11 Frame Parsers --------------------------------------------------
 # Replaces scapy — uses stdlib socket + struct only.
 
-def _parse_radiotap(data: bytes) -> tuple[int, int | None]:
+def _freq_to_channel(freq_mhz: int) -> int | None:
+    """Convert WiFi center frequency (MHz) to channel number. None if unknown."""
+    if 2412 <= freq_mhz <= 2472:
+        return (freq_mhz - 2412) // 5 + 1
+    if freq_mhz == 2484:
+        return 14
+    if 5180 <= freq_mhz <= 5825:
+        return (freq_mhz - 5000) // 5
+    return None
+
+
+def _parse_radiotap(data: bytes) -> tuple[int, int | None, int | None]:
     """
     Parse RadioTap header (IEEE 802.11-2020 Annex I).
-    Returns (header_length, rssi_dbm_or_None).
+    Returns (header_length, rssi_dbm_or_None, channel_or_None).
 
     Fields are walked in present-bitmap order with natural alignment relative
     to the start of the header. Only fields needed to reach dBm Signal (bit 5)
     are decoded; the rest are skipped by size.
     """
     if len(data) < 8:
-        return len(data), None
+        return len(data), None, None
 
     rt_len  = struct.unpack_from('<H', data, 2)[0]
     present = struct.unpack_from('<I', data, 4)[0]
 
-    rssi   = None
-    offset = 8  # first field starts after the fixed 8-byte header
+    rssi    = None
+    channel = None
+    offset  = 8  # first field starts after the fixed 8-byte header
 
     # Bit 31 (EXT): chipsets like Atheros AR9271 chain additional present words
     # before field data begins. Read each word and check its own bit 31 — do not
@@ -252,7 +264,7 @@ def _parse_radiotap(data: bytes) -> tuple[int, int | None]:
     ext_word = present
     while ext_word & (1 << 31):
         if offset + 4 > len(data):
-            return rt_len, None
+            return rt_len, None, None
         ext_word = struct.unpack_from('<I', data, offset)[0]
         offset += 4
 
@@ -269,6 +281,9 @@ def _parse_radiotap(data: bytes) -> tuple[int, int | None]:
     # Bit 3: Channel — uint16 freq + uint16 flags, align 2
     if present & (1 << 3):
         offset = (offset + 1) & ~1
+        if offset + 2 <= len(data):
+            freq_mhz = struct.unpack_from('<H', data, offset)[0]
+            channel = _freq_to_channel(freq_mhz)
         offset += 4
     # Bit 4: FHSS — uint8 hop_set + uint8 hop_pattern
     if present & (1 << 4):
@@ -279,7 +294,7 @@ def _parse_radiotap(data: bytes) -> tuple[int, int | None]:
             rssi = struct.unpack_from('b', data, offset)[0]
         offset += 1
 
-    return rt_len, rssi
+    return rt_len, rssi, channel
 
 
 def _mac_str(b: bytes) -> str:
@@ -485,23 +500,170 @@ def set_channel(iface: str, channel: int):
 # -- Channel Hopper ------------------------------------------------------------
 
 class ChannelHopper(threading.Thread):
-    """Cycles through 2.4 GHz channels at a fixed dwell time."""
+    """Cycles through 2.4 GHz channels at a fixed dwell time (legacy flat hop)."""
 
     def __init__(self, iface: str, channels: list, dwell: float):
         super().__init__(daemon=True)
-        self.iface    = iface
-        self.channels = channels
-        self.dwell    = dwell
-        self._stop    = threading.Event()
+        self.iface           = iface
+        self.channels        = channels
+        self.dwell           = dwell
+        self.current_channel = channels[0] if channels else None
+        self._stop           = threading.Event()
 
     def run(self):
-        log.info(f"Channel hopper started: {self.channels} @ {self.dwell}s dwell")
+        log.info(f"Flat channel hopper started: {self.channels} @ {self.dwell}s dwell")
         while not self._stop.is_set():
             for ch in self.channels:
                 if self._stop.is_set():
                     break
                 set_channel(self.iface, ch)
+                self.current_channel = ch
                 time.sleep(self.dwell)
+
+    def notify_detection(self, channel: int | None):
+        """No-op — flat hop ignores detection feedback. Present for API parity."""
+        pass
+
+    def stop(self):
+        self._stop.set()
+
+
+class AdaptiveChannelHopper(threading.Thread):
+    """
+    Two-mode channel hopper biased to ASTM F3411-mandated channels.
+
+    Spec basis: F3411 + opendroneid-core-c require 1 Hz Wi-Fi Beacon RID
+    broadcasts on channel 6 (2.4 GHz) or 149 (5 GHz). Off-channel broadcasts
+    must be at 5 Hz, which no manufacturer accepts. Even-hop scanning across
+    1–11 spends ~91% of time on channels where compliant 1 Hz RID cannot
+    exist.
+
+    Sweep mode (idle, no detection within ACTIVE_WINDOW):
+      ~80% on channel 6, brief peeks at 1 and 11.
+
+    Sticky mode (active detection within ACTIVE_WINDOW):
+      Hold on the channel that produced the detection. Forced peek every
+      STICKY_PEEK_INTERVAL cycles to avoid lockout of other airspace.
+    """
+
+    # Defaults — overridable via config.env (v1.2.0+)
+    PRIMARY_CHANNEL       = 6
+    PEEK_CHANNELS         = [1, 11]
+    ACTIVE_WINDOW         = 3.0     # seconds — sticky-mode reset threshold
+
+    SWEEP_PRIMARY_MS      = 800
+    SWEEP_PEEK_MS         = 50
+    SWEEP_PRIMARY_TAIL_MS = 100     # → total sweep cycle ≈ 1000ms
+
+    STICKY_DWELL_MS       = 950
+    STICKY_PEEK_INTERVAL  = 10
+    STICKY_PEEK_MS        = 25
+
+    def __init__(self, iface: str):
+        super().__init__(daemon=True)
+        self.iface                  = iface
+        self.current_channel        = self.PRIMARY_CHANNEL
+        self.last_detection_time    = 0.0
+        self.last_detection_channel = self.PRIMARY_CHANNEL
+        self.sticky_cycle_count     = 0
+        self._stop                  = threading.Event()
+
+        # config.env overrides — log invalid values as warnings and fall back
+        def _parse_int(name: str, default):
+            raw = os.environ.get(name, "").strip()
+            if not raw:
+                return default
+            try:
+                return int(raw)
+            except ValueError:
+                log.warning(f"{name}={raw!r} is not an integer — using default {default}")
+                return default
+
+        def _parse_float(name: str, default):
+            raw = os.environ.get(name, "").strip()
+            if not raw:
+                return default
+            try:
+                return float(raw)
+            except ValueError:
+                log.warning(f"{name}={raw!r} is not a number — using default {default}")
+                return default
+
+        self.fixed_channel    = _parse_int("FIXED_CHANNEL", None)
+        self.active_window    = _parse_float("ACTIVE_WINDOW_SEC", self.ACTIVE_WINDOW)
+        self.sweep_primary_ms = _parse_int("DWELL_CH6_MS",  self.SWEEP_PRIMARY_MS)
+        self.sweep_peek_ms    = _parse_int("DWELL_PEEK_MS", self.SWEEP_PEEK_MS)
+
+        # Guard against zero/negative dwells that would spin the loop
+        if self.sweep_primary_ms <= 0:
+            log.warning(f"DWELL_CH6_MS={self.sweep_primary_ms} invalid — using {self.SWEEP_PRIMARY_MS}")
+            self.sweep_primary_ms = self.SWEEP_PRIMARY_MS
+        if self.sweep_peek_ms < 0:
+            log.warning(f"DWELL_PEEK_MS={self.sweep_peek_ms} invalid — using {self.SWEEP_PEEK_MS}")
+            self.sweep_peek_ms = self.SWEEP_PEEK_MS
+
+    def notify_detection(self, channel: int | None):
+        """Called by the feeder when an RID packet is received."""
+        self.last_detection_time = time.time()
+        if channel is not None:
+            self.last_detection_channel = channel
+
+    def _set(self, ch: int):
+        set_channel(self.iface, ch)
+        self.current_channel = ch
+
+    def _sleep_ms(self, ms: int) -> bool:
+        """Sleep for ms milliseconds, returning True if stop was signaled."""
+        return self._stop.wait(timeout=ms / 1000.0)
+
+    def run(self):
+        # FIXED_CHANNEL: lock to one channel forever (DFR / single-drone monitoring)
+        if self.fixed_channel is not None:
+            log.info(f"Adaptive hopper: FIXED_CHANNEL={self.fixed_channel} — locking, no hop")
+            self._set(self.fixed_channel)
+            self._stop.wait()
+            return
+
+        log.info(
+            f"Adaptive hopper started: primary=ch{self.PRIMARY_CHANNEL}, "
+            f"peek={self.PEEK_CHANNELS}, ACTIVE_WINDOW={self.active_window}s, "
+            f"DWELL_CH6_MS={self.sweep_primary_ms}, DWELL_PEEK_MS={self.sweep_peek_ms}"
+        )
+        prev_mode = "sweep"
+
+        while not self._stop.is_set():
+            in_active = (time.time() - self.last_detection_time) < self.active_window
+            mode      = "sticky" if in_active else "sweep"
+
+            if mode != prev_mode:
+                log.debug(f"Hopper: {prev_mode}→{mode}")
+                if mode == "sweep":
+                    self.sticky_cycle_count = 0
+                prev_mode = mode
+
+            if mode == "sticky":
+                self._set(self.last_detection_channel)
+                if self._sleep_ms(self.STICKY_DWELL_MS):
+                    break
+                self.sticky_cycle_count += 1
+
+                if self.sticky_cycle_count % self.STICKY_PEEK_INTERVAL == 0:
+                    for ch in self.PEEK_CHANNELS:
+                        self._set(ch)
+                        if self._sleep_ms(self.STICKY_PEEK_MS):
+                            return
+            else:
+                # Sweep cycle: primary → peek1 → peek2 → primary_tail
+                self._set(self.PRIMARY_CHANNEL)
+                if self._sleep_ms(self.sweep_primary_ms):
+                    break
+                for ch in self.PEEK_CHANNELS:
+                    self._set(ch)
+                    if self._sleep_ms(self.sweep_peek_ms):
+                        return
+                self._set(self.PRIMARY_CHANNEL)
+                if self._sleep_ms(self.SWEEP_PRIMARY_TAIL_MS):
+                    break
 
     def stop(self):
         self._stop.set()
@@ -708,17 +870,18 @@ class LocalPublisher:
             return
 
         record = {
-            "t":     event.get("timestamp") or event.get("observed_at"),
-            "mac":   event.get("source_mac") or event.get("mac"),
-            "radio": event.get("radio"),
-            "rssi":  event.get("rssi"),
-            "type":  decoded.get("message_type"),
-            "lat":   decoded.get("latitude"),
-            "lon":   decoded.get("longitude"),
-            "alt":   decoded.get("altitude_geo"),
-            "speed": decoded.get("ground_speed"),
-            "hdg":   decoded.get("heading"),
-            "id":    decoded.get("uas_id"),
+            "t":       event.get("timestamp") or event.get("observed_at"),
+            "mac":     event.get("source_mac") or event.get("mac"),
+            "radio":   event.get("radio"),
+            "rssi":    event.get("rssi"),
+            "channel": event.get("channel"),
+            "type":    decoded.get("message_type"),
+            "lat":     decoded.get("latitude"),
+            "lon":     decoded.get("longitude"),
+            "alt":     decoded.get("altitude_geo"),
+            "speed":   decoded.get("ground_speed"),
+            "hdg":     decoded.get("heading"),
+            "id":      decoded.get("uas_id"),
         }
         line = json.dumps(record, separators=(',', ':'))
 
@@ -762,16 +925,28 @@ class WiFiFeeder:
         self.start_time  = time.time()
         self.forwarder   = Forwarder(server_url, node_id, batch_size, flush_interval, token)
         self.publisher   = LocalPublisher()
-        self.hopper      = ChannelHopper(iface, CHANNELS_24, channel_dwell)
+        # ADAPTIVE_DWELL=false reverts to legacy flat 1–11 hop (A/B testing)
+        adaptive_dwell = os.environ.get("ADAPTIVE_DWELL", "true").strip().lower() \
+                            in ("true", "1", "yes", "on")
+        if adaptive_dwell:
+            log.info("Hopper mode: adaptive (sweep + sticky, channel-6 biased)")
+            self.hopper = AdaptiveChannelHopper(iface)
+        else:
+            log.info("Hopper mode: flat (legacy even hop across 1–11)")
+            self.hopper = ChannelHopper(iface, CHANNELS_24, channel_dwell)
         self.count       = 0
         self.nan_count   = 0
         self._scanning   = False
 
     def _on_packet(self, data: bytes):
-        # Parse RadioTap header to get RSSI and skip to 802.11 MAC header
-        rt_len, rssi = _parse_radiotap(data)
+        # Parse RadioTap header to get RSSI, channel, and skip to 802.11 MAC header
+        rt_len, rssi, channel = _parse_radiotap(data)
         if rt_len >= len(data):
             return
+
+        # Radiotap Channel field is optional; fall back to hopper state
+        if channel is None:
+            channel = self.hopper.current_channel
 
         mac_data = data[rt_len:]
         header = _parse_dot11_mgmt(mac_data)
@@ -812,6 +987,7 @@ class WiFiFeeder:
                     "radio":     "wifi_beacon",
                     "mac":       addr2,
                     "rssi":      rssi,
+                    "channel":   channel,
                     "payload":   raw_hex,
                     "decoded":   msg,
                 }
@@ -827,6 +1003,7 @@ class WiFiFeeder:
                     )
                 self.forwarder.add(event)
                 self.publisher.publish(event)
+            self.hopper.notify_detection(channel)
             return
 
         # ---- Wi-Fi NAN Remote ID (subtype 13 — action frame) ----
@@ -843,16 +1020,35 @@ class WiFiFeeder:
                 "radio":     "wifi_nan",
                 "mac":       addr2,
                 "rssi":      rssi,
+                "channel":   channel,
                 "payload":   raw,
                 "decoded":   None,  # NAN full parsing is a future enhancement
             }
             self.forwarder.add(event)
+            self.hopper.notify_detection(channel)
 
     def run(self):
         log.info(f"DroneAware WiFi Feeder - Node: {self.node_id}")
-        log.info(f"Interface: {self.iface}  |  Channels: {CHANNELS_24}")
+        log.info(f"Interface: {self.iface or '<not configured>'}  |  Channels: {CHANNELS_24}")
 
-        set_monitor_mode(self.iface)
+        # FAULT mode — missing or invalid WiFi adapter
+        if not self.iface or not os.path.exists(f"/sys/class/net/{self.iface}"):
+            log.error(
+                f"WiFi adapter '{self.iface or 'none'}' not present — entering FAULT mode."
+            )
+            log.error("BLE detection (if available) is unaffected and continues independently.")
+            log.error("To restore WiFi: connect a USB monitor-mode adapter and re-run the installer.")
+            self._fault_loop("adapter not present")
+            return
+
+        try:
+            set_monitor_mode(self.iface)
+        except Exception as e:
+            log.error(f"Could not put {self.iface} into monitor mode: {e}")
+            log.error("Entering FAULT mode — adapter likely does not support monitor mode.")
+            self._fault_loop("monitor mode unsupported")
+            return
+
         self.hopper.start()
 
         log.info("Scanning for Remote ID beacon frames (ASTM F3411)...")
@@ -883,6 +1079,52 @@ class WiFiFeeder:
                 f"sent={self.forwarder.sent_total}  failed={self.forwarder.failed_total}"
             )
 
+    def _fault_loop(self, reason: str):
+        """
+        Degraded loop entered when no usable WiFi adapter is present.
+        Emits heartbeats with wifi_ok=False so the server marks the radio as FAULT.
+        Performs no monitor-mode setup, no packet capture, no event forwarding.
+        """
+        log.warning(f"[FAULT] wifi feeder running in degraded mode: {reason}")
+        while True:
+            try:
+                time.sleep(60)
+                log.info(
+                    f"[Heartbeat] FAULT — wifi_ok=False  reason={reason}  "
+                    f"uptime={int(time.time() - self.start_time)}s"
+                )
+                if not self.token:
+                    continue
+                with _gps_lock:
+                    lat, lon = _gps_lat, _gps_lon
+                cpu_temp = get_cpu_temp()
+                has_gps  = os.path.exists(os.environ.get("GPS_DEVICE", "/dev/ttyUSB0"))
+                mobile   = os.environ.get("NODE_MOBILE", "false").lower() == "true"
+                requests.post(
+                    "https://api.droneaware.io/api/node/heartbeat",
+                    json={
+                        # Per-feeder heartbeat: wifi_* fields only (see note above)
+                        "node_id":      self.node_id,
+                        "uptime_s":     int(time.time() - self.start_time),
+                        "fw_version":   FW_VERSION,
+                        "cpu_temp_c":   cpu_temp,
+                        "wifi_ok":      False,
+                        "wifi_adapter": self.iface or None,
+                        "wifi_fault":   reason,
+                        "scanning":     False,
+                        "mobile":       mobile,
+                        "has_gps":      has_gps,
+                        "lat":          lat,
+                        "lon":          lon,
+                    },
+                    headers={"X-Node-Token": self.token},
+                    timeout=5,
+                )
+            except requests.RequestException as e:
+                log.warning(f"FAULT heartbeat failed: {e}")
+            except Exception as e:
+                log.warning(f"FAULT loop error: {e}")
+
     def _flush_loop(self):
         """Periodically flush the forwarder buffer (runs in background thread)."""
         last_heartbeat = time.time()
@@ -906,14 +1148,16 @@ class WiFiFeeder:
                         requests.post(
                             "https://api.droneaware.io/api/node/heartbeat",
                             json={
+                                # Per-feeder heartbeat: wifi_* fields only.
+                                # Do NOT include ble_ok or ble_fault — the server
+                                # uses presence of an ok-field to route the
+                                # heartbeat to that feeder's status row.
                                 "node_id":      self.node_id,
                                 "uptime_s":     int(time.time() - self.start_time),
                                 "fw_version":   FW_VERSION,
                                 "cpu_temp_c":   cpu_temp,
                                 "wifi_ok":      wifi_ok,
                                 "wifi_adapter": wifi_adp,
-                                "ble_ok":       None,
-                                "ble_adapter":  None,
                                 "scanning":     self._scanning,
                                 "mobile":       mobile,
                                 "has_gps":      has_gps,
@@ -958,8 +1202,8 @@ def main():
         description="DroneAware WiFi Remote ID Feeder (Raspberry Pi + Alfa AWUS036N)"
     )
     parser.add_argument(
-        "--iface", default="wlan1",
-        help="Monitor-mode interface (default: wlan1)"
+        "--iface", default=os.environ.get("WIFI_ADAPTER", "") or "wlan1",
+        help="Monitor-mode interface (default: $WIFI_ADAPTER from config.env, or wlan1)"
     )
     parser.add_argument(
         "--node-id", default=socket.gethostname(),
