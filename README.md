@@ -15,7 +15,7 @@ DroneAware Network is a community-built, open Remote ID detection network. The g
 Run one command and start detecting drones around you, from a few hundred yards to miles away depending on your setup::
 
 ```bash
-curl -fsSL https://github.com/fduflyer/DroneAware-Node-Releases/releases/download/v1.1.3/install.sh | sudo bash
+curl -fsSL https://github.com/fduflyer/DroneAware-Node-Releases/releases/latest/download/install.sh | sudo bash
 ```
 _No Linux experience needed — if you can plug in a USB device, you can run this._
 
@@ -130,7 +130,7 @@ DroneAware server to correctly place detections on the map.
 Run this single command:
 
 ```bash
-curl -fsSL https://github.com/fduflyer/DroneAware-Node-Releases/releases/download/v1.1.3/install.sh | sudo bash
+curl -fsSL https://github.com/fduflyer/DroneAware-Node-Releases/releases/latest/download/install.sh | sudo bash
 ```
 
 The installer will:
@@ -147,7 +147,7 @@ The installer will:
    adapter automatically. If none is found, it will exit with instructions.
 
 4. **Install system packages and download binaries** from the
-   [v1.1.3 release](https://github.com/fduflyer/DroneAware-Node/releases/tag/v1.1.3).
+   [latest release](https://github.com/fduflyer/DroneAware-Node-Releases/releases/latest).
 
 5. **Enroll the node** — you will be prompted to open
    [droneaware.io/nodes](https://droneaware.io/nodes), log in,
@@ -345,6 +345,26 @@ The real power of this project is the shared detection network. If you're runnin
 Already a FlightAware or ADS-B feeder? [See the upgrade guide →](https://github.com/fduflyer/DroneAware-Node-Releases/blob/main/docs/hardware/flightaware-upgrade.md)
 
 Have an idea or improvement? Open an issue or start a discussion — we're actively building.
+
+---
+
+## Verifying Binary Attestation
+
+Every DroneAware Node binary is built in GitHub Actions and cryptographically signed via Sigstore. You can independently verify that any release binary was built from the published source code in a known, controlled environment — not on someone's laptop.
+
+This matters because the Contributor Agreement commits the feeder software to a specific scope of data collection (Section 3.1). Attestation lets you confirm that the binary running on your node actually implements those guarantees.
+
+To verify a binary you downloaded from a release:
+
+
+`gh attestation verify ble_feeder --owner fduflyer`
+`gh attestation verify wifi_feeder --owner fduflyer`
+A successful verification confirms the binary was built by GitHub Actions from a specific source commit in this repository.
+
+Requires the GitHub CLI and a free GitHub account:
+
+macOS: `brew install gh && gh auth login`
+Debian / Ubuntu / Pi OS: `sudo apt install gh && gh auth login`
 
 ---
 
