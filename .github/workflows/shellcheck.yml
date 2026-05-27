@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+# Least-privilege GITHUB_TOKEN — this workflow only reads the repo to scan it.
+permissions:
+  contents: read
+
 # Scans every *.sh file and any file with a shell shebang. Surfaces findings in
 # the workflow run logs. Set to "warning" severity to focus on real bugs and
 # skip pure-style nits (SC2086 double-quote suggestions etc.) — can tighten to
