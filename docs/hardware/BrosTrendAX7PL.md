@@ -9,7 +9,7 @@
 ---
 
 This guide was contributed by community member **Jeroen Goudeseune**, who successfully 
-got the BrosTrend AX7PL running with DroneAware on a Proxmox Host with Debian Trixie. This adapter 
+got the BrosTrend AX7PL running with DroneAware on a Proxmox/Vmware Workstation Pro Host with Debian Trixie. This adapter 
 is not part of the standard supported hardware and operating system list, but with the steps below it 
 works reliably for Wi-Fi Remote ID detection. Packet Injection doesnt work. Manufacturer declares support for Raspbery Pi.0 13-8.
 
