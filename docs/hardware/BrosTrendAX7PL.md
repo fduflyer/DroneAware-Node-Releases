@@ -1,9 +1,9 @@
 # BrosTrend AX900 Linux WiFi 6 USB Adapter — Community Setup Guide
 
 > **Guide by:** Jeroen Goudeseune (DroneAware Discord community)  
-> **Tested on:** Promox 9.x, Vmware Workstation Pro, Virtual Machine Debian Trixie / > 6.86 & 7.x Kernel 
-> **Adapter:** BrosTrend AX7PL (AIC8800D80 chipset, USB-A)
-> **Website:** https://www.brostrend.com/products/ax7pl
+> **Tested on:** Promox 9.x, Vmware Workstation Pro, Virtual Machine Debian Trixie / > 6.86 & 7.x Kernel  
+> **Adapter:** BrosTrend AX7PL (AIC8800D80 chipset, USB-A)  
+> **Website:** https://www.brostrend.com/products/ax7pl  
 > **Status:** ✅ Confirmed working
 
 ---
