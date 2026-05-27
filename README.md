@@ -194,6 +194,9 @@ sudo systemctl restart droneaware-ble droneaware-wifi
 
 # Start feeders manually (they start automatically on next reboot)
 sudo systemctl start droneaware-ble droneaware-wifi
+
+# To upgrade an existing node
+sudo droneaware update
 ```
 
 ---
