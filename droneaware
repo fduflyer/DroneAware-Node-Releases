@@ -13,6 +13,55 @@ fatal() { echo -e "\n  ${RED}✗  ERROR: $*${NC}\n"; exit 1; }
 
 require_root() { [[ $EUID -eq 0 ]] || fatal "Run with sudo: sudo droneaware $1"; }
 
+# ---------------------------------------------------------------------------
+# Config.env additive merge — adds new fields introduced by recent releases
+# to an existing config.env, without touching user-customized values.
+#
+# Pattern for adding a new release's fields:
+#   if ! grep -q '^FIELD_NAME=' "$cfg"; then
+#       cat >> "$cfg" <<'EOF'
+#       ... new fields ...
+#       EOF
+#       info "..."
+#   fi
+#
+# Each block is idempotent (running update twice is a no-op the second time)
+# and cumulative (skipping a version still picks up its additions later).
+# A timestamped backup is written before any changes so users can restore.
+# ---------------------------------------------------------------------------
+migrate_config_env() {
+    local cfg="${INSTALL_DIR}/config.env"
+    [[ -f "$cfg" ]] || return  # nothing to migrate
+
+    local backed_up=0
+
+    # v1.2.0 additions — channel hopper config
+    if ! grep -q '^ADAPTIVE_DWELL=' "$cfg"; then
+        [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+        cat >> "$cfg" <<'EOF'
+
+# ─── Channel hopper (added by droneaware update for v1.2.0+) ───
+ADAPTIVE_DWELL=true
+# Optional adaptive-hopper tuning (uncomment to override defaults):
+# FIXED_CHANNEL=6           # Lock 100% to this channel — overrides adaptive logic
+# ACTIVE_WINDOW_SEC=3       # Sticky-mode reset threshold in seconds (default 3.0)
+# DWELL_CH6_MS=800          # Primary channel dwell in sweep mode (default 800ms)
+# DWELL_PEEK_MS=50          # Peek dwell on channels 1 and 11 (default 50ms)
+EOF
+        info "Added v1.2.0 channel hopper options to config.env"
+    fi
+
+    # Future release migration blocks go here.
+    # Pattern:
+    #   if ! grep -q '^NEW_FIELD=' "$cfg"; then
+    #       [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+    #       cat >> "$cfg" <<'EOF'
+    # ... new fields ...
+    # EOF
+    #       info "Added vX.Y.Z options to config.env"
+    #   fi
+}
+
 cmd_update() {
     require_root "update"
     echo ""
@@ -66,7 +115,17 @@ cmd_update() {
 
     cp /tmp/da_ble_feeder  "${INSTALL_DIR}/ble_feeder"
     cp /tmp/da_wifi_feeder "${INSTALL_DIR}/wifi_feeder"
-    [[ -s /tmp/da_cli ]] && cp /tmp/da_cli /usr/local/bin/droneaware
+    # Update the droneaware CLI itself. Must use atomic rename (mv) instead
+    # of in-place cp, because bash is currently READING from this same
+    # script file. In-place overwrite would shift bash's file pointer to
+    # bytes in the new (different-sized) file → garbage parsing at script
+    # end (the v1.2.0 "line 426: syntax error" bug). Atomic rename keeps
+    # the open file descriptor pointed at the old inode until bash exits.
+    if [[ -s /tmp/da_cli ]]; then
+        cp /tmp/da_cli /usr/local/bin/droneaware.new
+        chmod +x /usr/local/bin/droneaware.new
+        mv /usr/local/bin/droneaware.new /usr/local/bin/droneaware
+    fi
     rm -f /tmp/da_ble_feeder /tmp/da_wifi_feeder /tmp/da_cli
     echo "$LATEST" > "$VERSION_FILE"
 
@@ -76,6 +135,10 @@ cmd_update() {
     ln -sf "${INSTALL_DIR}/ble_feeder"  /usr/local/bin/ble_feeder  2>/dev/null || true
     ln -sf "${INSTALL_DIR}/wifi_feeder" /usr/local/bin/wifi_feeder 2>/dev/null || true
     info "Binaries installed."
+
+    # Add any new config.env fields introduced by this release before services
+    # restart (so they see the new EnvironmentFile values on the next read).
+    migrate_config_env
 
     systemctl daemon-reload
     systemctl start droneaware-wifi

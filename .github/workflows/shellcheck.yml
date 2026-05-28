@@ -1,0 +1,33 @@
+name: ShellCheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least-privilege GITHUB_TOKEN — this workflow only reads the repo to scan it.
+permissions:
+  contents: read
+
+# Scans every *.sh file and any file with a shell shebang. Surfaces findings in
+# the workflow run logs. Set to "warning" severity to focus on real bugs and
+# skip pure-style nits (SC2086 double-quote suggestions etc.) — can tighten to
+# "style" later once the codebase is fully clean.
+#
+# To suppress a specific finding inline:
+#     # shellcheck disable=SC2086
+#     command "$with" $intentional_splitting
+#
+# Project-wide suppressions go in a .shellcheckrc file at the repo root.
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          severity: warning
+          scandir: '.'

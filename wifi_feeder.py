@@ -135,49 +135,87 @@ def parse_basic_id(data: bytes) -> dict:
 
 
 def parse_location(data: bytes) -> dict:
+    """
+    Decode ASTM F3411-22a Location/Vector message (25 bytes).
+    Byte layout (matches server-side canonical decoder):
+      0     header (msg_type/version)
+      1     status flags (speed_mult bit 0, EW bit 1, height_type bit 2)
+      2     track direction (raw 0-179, +180 if EW bit set)
+      3     speed (encoding depends on speed_mult)
+      4     vertical speed (raw * 0.5 - 62.0)
+      5-8   latitude  (int32 LE, * 1e-7)
+      9-12  longitude (int32 LE, * 1e-7)
+     13-14  pressure altitude (uint16 LE, * 0.5 - 1000.0)
+     15-16  geometric altitude (uint16 LE, * 0.5 - 1000.0)
+     17-18  height AGL/above-takeoff (uint16 LE, * 0.5 - 1000.0)
+    """
     if len(data) < 25:
         return {}
-    speed_mult  = data[1] & 0x01
-    height_type = (data[1] >> 2) & 0x01
-    lat = struct.unpack_from('<i', data, 2)[0] * 1e-7
-    lon = struct.unpack_from('<i', data, 6)[0] * 1e-7
+
+    status      = data[1]
+    speed_mult  = (status >> 0) & 0x01
+    ew_bit      = (status >> 1) & 0x01
+    height_type = (status >> 2) & 0x01
+
+    direction   = data[2] + (180 if ew_bit else 0)
+    speed       = data[3] * 0.75 + 63.75 if speed_mult else data[3] * 0.25
+    vspeed      = data[4] * 0.5 - 62.0
+
+    lat = struct.unpack_from('<i', data, 5)[0] * 1e-7
+    lon = struct.unpack_from('<i', data, 9)[0] * 1e-7
 
     # Reject null/placeholder GPS values broadcast before lock (e.g. DJI firmware
     # transmits lat>90 or lon>180 as a sentinel until GPS acquires).
     if abs(lat) > 90.0 or abs(lon) > 180.0:
         return {}
 
-    alt_geodetic = struct.unpack_from('<H', data, 12)[0] * 0.5 - 1000.0
-    height       = struct.unpack_from('<H', data, 14)[0] * 0.5 - 1000.0
-    speed        = data[16] * (0.75 if speed_mult else 0.25)
-    vspeed       = data[17] * 0.5 - 62.0
-    heading      = struct.unpack_from('<H', data, 18)[0] * 0.01
+    geo_alt = struct.unpack_from('<H', data, 15)[0] * 0.5 - 1000.0
+    height  = struct.unpack_from('<H', data, 17)[0] * 0.5 - 1000.0
+
     return {
         "latitude":       round(lat, 7),
         "longitude":      round(lon, 7),
-        "altitude_geo":   round(alt_geodetic, 1),
+        "altitude_geo":   round(geo_alt, 1),
         "height_agl":     round(height, 1),
         "ground_speed":   round(speed, 2),
         "vertical_speed": round(vspeed, 2),
-        "heading":        round(heading, 1),
+        "heading":        round(direction, 1),
         "height_type":    "AGL" if height_type == 0 else "Above Takeoff",
     }
 
 
 def parse_system_msg(data: bytes) -> dict:
+    """
+    Decode ASTM F3411-22a System Message (16+ bytes).
+    Byte layout (matches server-side canonical decoder):
+       1 (low nibble)  op_location_type  (d[1] & 0x0F)
+       2-5             operator latitude   (int32 LE, * 1e-7)
+       6-9             operator longitude  (int32 LE, * 1e-7)
+      10-11            area_count          (uint16 LE)
+      12               area_radius_m       (raw * 10)
+      13-14            alt_takeoff_geo     (uint16 LE, * 0.5 - 1000.0)
+    """
     if len(data) < 16:
         return {}
-    op_lat      = struct.unpack_from('<i', data, 4)[0] * 1e-7
-    op_lon      = struct.unpack_from('<i', data, 8)[0] * 1e-7
-    area_count  = data[12]
-    area_radius = data[13] * 10
-    alt_takeoff = struct.unpack_from('<H', data, 14)[0] * 0.5 - 1000.0
+    op_location_type = data[1] & 0x0F
+    op_lat = struct.unpack_from('<i', data, 2)[0] * 1e-7
+    op_lon = struct.unpack_from('<i', data, 6)[0] * 1e-7
+
+    # Reject placeholder/pre-lock values (same convention as parse_location)
+    if abs(op_lat) > 90.0 or abs(op_lon) > 180.0:
+        op_lat = op_lon = None
+
+    area_count    = struct.unpack_from('<H', data, 10)[0]
+    area_radius_m = data[12] * 10
+    alt_takeoff   = struct.unpack_from('<H', data, 13)[0] * 0.5 - 1000.0
+
     return {
-        "operator_lat":    round(op_lat, 7),
-        "operator_lon":    round(op_lon, 7),
-        "area_count":      area_count,
-        "area_radius_m":   area_radius,
-        "alt_takeoff_geo": round(alt_takeoff, 1),
+        "op_location_type": op_location_type,
+        "operator_lat":     round(op_lat, 7) if op_lat is not None else None,
+        "operator_lon":     round(op_lon, 7) if op_lon is not None else None,
+        "area_count":       area_count,
+        "area_radius_m":    area_radius_m,
+        "alt_takeoff_geo":  round(alt_takeoff, 1),
     }
 
 
@@ -846,6 +884,13 @@ def gps_reader_thread(device: str):
 
 # -- Local Publisher -----------------------------------------------------------
 
+# Decoded keys already exposed via short aliases in the local record, plus
+# raw_hex (noise). Everything else in the decoded dict is added verbatim so
+# LAN/offline consumers get the full ODID picture.
+_LOCAL_ALIASED = {"message_type", "raw_hex", "latitude", "longitude",
+                  "altitude_geo", "ground_speed", "heading", "uas_id"}
+
+
 class LocalPublisher:
     """
     Writes decoded detections to a tmpfs ring buffer and UDP LAN broadcast.
@@ -876,6 +921,7 @@ class LocalPublisher:
             "rssi":    event.get("rssi"),
             "channel": event.get("channel"),
             "type":    decoded.get("message_type"),
+            # Backward-compatible short aliases (original schema)
             "lat":     decoded.get("latitude"),
             "lon":     decoded.get("longitude"),
             "alt":     decoded.get("altitude_geo"),
@@ -883,6 +929,12 @@ class LocalPublisher:
             "hdg":     decoded.get("heading"),
             "id":      decoded.get("uas_id"),
         }
+        # Surface every remaining decoded field so offline/LAN consumers get the
+        # full ODID picture (operator location, area, id_type, height_agl, etc.).
+        # Skip raw_hex (noise) and keys already exposed via the short aliases.
+        for k, v in decoded.items():
+            if k not in _LOCAL_ALIASED:
+                record[k] = v
         line = json.dumps(record, separators=(',', ':'))
 
         try:

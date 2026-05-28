@@ -592,7 +592,8 @@ install_services() {
     heading "Installing Services"
     # As of v1.2.0, service files ship with the same release as the binaries.
     local base_url="https://github.com/${GITHUB_REPO}/releases/download/${BINARY_VERSION}"
-    local local_root="$(dirname "${LOCAL_DIST}")"
+    local local_root
+    local_root="$(dirname "${LOCAL_DIST}")"
 
     # bt-select helper
     if [[ "$LOCAL_INSTALL" == "1" ]]; then
