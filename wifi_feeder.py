@@ -884,6 +884,13 @@ def gps_reader_thread(device: str):
 
 # -- Local Publisher -----------------------------------------------------------
 
+# Decoded keys already exposed via short aliases in the local record, plus
+# raw_hex (noise). Everything else in the decoded dict is added verbatim so
+# LAN/offline consumers get the full ODID picture.
+_LOCAL_ALIASED = {"message_type", "raw_hex", "latitude", "longitude",
+                  "altitude_geo", "ground_speed", "heading", "uas_id"}
+
+
 class LocalPublisher:
     """
     Writes decoded detections to a tmpfs ring buffer and UDP LAN broadcast.
@@ -914,6 +921,7 @@ class LocalPublisher:
             "rssi":    event.get("rssi"),
             "channel": event.get("channel"),
             "type":    decoded.get("message_type"),
+            # Backward-compatible short aliases (original schema)
             "lat":     decoded.get("latitude"),
             "lon":     decoded.get("longitude"),
             "alt":     decoded.get("altitude_geo"),
@@ -921,6 +929,12 @@ class LocalPublisher:
             "hdg":     decoded.get("heading"),
             "id":      decoded.get("uas_id"),
         }
+        # Surface every remaining decoded field so offline/LAN consumers get the
+        # full ODID picture (operator location, area, id_type, height_agl, etc.).
+        # Skip raw_hex (noise) and keys already exposed via the short aliases.
+        for k, v in decoded.items():
+            if k not in _LOCAL_ALIASED:
+                record[k] = v
         line = json.dumps(record, separators=(',', ':'))
 
         try:
