@@ -14,8 +14,9 @@ firmware current.
 
 | Version           | Supported          | Notes                                                        |
 | ----------------- | ------------------ | ------------------------------------------------------------ |
-| v1.1.x (current)  | :white_check_mark: | Active development; all security patches land here           |
-| v1.0.x (legacy)   | :x:                | Run `sudo droneaware update` on your node to move to v1.1.x  |
+| v1.2.x (current)  | :white_check_mark: | Active development; all security patches land here           |
+| v1.1.x (legacy)   | :x:                | Run `sudo droneaware update` on your node to move to v1.2.x  |
+| v1.0.x (legacy)   | :x:                | Run `sudo droneaware update` on your node to move to v1.2.x  |
 | < v1.0            | :x:                | Re-run the installer from droneaware.io/enroll.html          |
 
 The server-side components (api.droneaware.io, droneaware.io) always run
