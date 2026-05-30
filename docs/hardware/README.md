@@ -11,9 +11,11 @@ with an **Alfa AWUS036N** or **AWUS036NHA**. Everything in this folder is beyond
 | Adapter / Setup | Chipset | Guide | Contributor |
 |---|---|---|---|
 | Alfa AWUS036ACH (USB-C) | RTL8812AU | [Setup Guide](AWUS036ACH.md) | AndyVickers |
+| Brostrend AX900 Linux (USB-A) | AIC8800D80  | [Setup Guide](BrosTrendAX7PL.md) | Jeroen Goudeseune |
 | Existing FlightAware / ADS-B Pi | Various | [Upgrade Guide](flightaware-upgrade.md) | DroneAware Community |
 
 ## Adding a Guide
 
-Open a [GitHub Discussion](https://github.com/fduflyer/DroneAware-Network/discussions) 
+- Open a [GitHub Discussion](https://github.com/fduflyer/DroneAware-Network/discussions) 
 in the Hardware category with your tested configuration and we'll format and add it here.
+- Fork the repository and create a pull request.
