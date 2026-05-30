@@ -1,7 +1,7 @@
 # BrosTrend AX900 Linux WiFi 6 USB Adapter — Community Setup Guide
 
 > **Guide by:** Jeroen Goudeseune (DroneAware Discord community)  
-> **Tested on:** Promox 9.x, Vmware Workstation Pro, Virtual Machine Debian Trixie / > 6.86 & 7.x Kernel  
+> **Tested on:** Proxmox 9.x, VMware Workstation Pro, Virtual Machine Debian Trixie / > 6.86 & 7.x Kernel  
 > **Adapter:** BrosTrend AX7PL (AIC8800D80 chipset, USB-A)  
 > **Website:** https://www.brostrend.com/products/ax7pl  
 > **Status:** ✅ Confirmed working
@@ -9,9 +9,9 @@
 ---
 
 This guide was contributed by community member **Jeroen Goudeseune**, who successfully 
-got the BrosTrend AX7PL running with DroneAware on a Proxmox/Vmware Workstation Pro Host with Debian Trixie. This adapter 
+got the BrosTrend AX7PL running with DroneAware on a Proxmox/VMware Workstation Pro Host with Debian Trixie. This adapter 
 is not part of the standard supported hardware and operating system list, but with the steps below it 
-works reliably for Wi-Fi Remote ID detection. Packet Injection doesnt work. Manufacturer declares support for Raspbery Pi.0 13-8.
+works reliably for Wi-Fi Remote ID detection. Manufacturer declares support for Raspbery Pi.0 13-8.
 
 If you run into issues or have improvements, drop a note in the 
 [DroneAware Discord](https://discord.gg/J4ZHpdgzeb) or open a GitHub Discussion.
@@ -20,14 +20,14 @@ If you run into issues or have improvements, drop a note in the
 
 ## Hardware Notes (Read First)
 
-- The adapter ships without an USB Cable
-- Plug the USB-A end into a regular USB port 2.0 or 3.0 port. 
+- The adapter ships without a USB extension Cable
+- Plug the USB into a regular USB port 2.0 or 3.0 port. 
 - In this case, we used USB Pass through from VM Host to Virtual Machine
 
 ---
 
-Installation manual provided by manufacturer: https://linux.brostrend.com/
-
+Installation manual and installer commands provided by manufacturer: https://linux.brostrend.com/
+## Step 1 — Configure BrosTrend AX7PL drivers
 ```bash
 sh -c 'wget linux.brostrend.com/install -O /tmp/install && sh /tmp/install'
 ```
@@ -47,7 +47,7 @@ iwconfig                 # Look for wlx... and  Nickname:"AIC@8800"
 
 You should see a wlx interface. If you don't, rerun installation command or pull/insert USB device in to the computer.
 
-## Step 5 — Configure DroneAware
+## Step 2 — Configure DroneAware
 
 Now that the adapter has a network interface, update the DroneAware config to use it:
 
@@ -65,8 +65,8 @@ the Wi-Fi indicator should go green within a minute or two.
 ## Notes
 
 - The Brostrend AX900 Linux (AX7PL) is dual-band (2.4 GHz + 5 GHz) and long-range.
-- There is a chance the interface wont appear as`wlan0` or `wlan1`, update `config.env` accordingly. Interface name should start with WLX.
-- Watch-out, this vendor also sells a Brostrend AX900 Non linux (Windows) device, which is cheaper. This hasnt been tested.
+- There is a chance the interface won't appear as`wlan0` or `wlan1`, update `config.env` accordingly. Interface name should start with WLX.
+- Watch-out, this vendor also sells a Brostrend AX900 Non linux (Windows) device, which is cheaper. This hasn't been tested.
 
 ---
 
