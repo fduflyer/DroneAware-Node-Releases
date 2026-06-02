@@ -51,6 +51,48 @@ EOF
         info "Added v1.2.0 channel hopper options to config.env"
     fi
 
+    # v1.1.3 catch-up — GPS_BAUD (missing from configs older than v1.1.3)
+    # Harmless when absent (auto-detect runs at startup), but added for
+    # config consistency so users can see/override the value.
+    if ! grep -q '^GPS_BAUD=' "$cfg"; then
+        [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+        cat >> "$cfg" <<'EOF'
+
+# ─── GPS baud rate (added by droneaware update for v1.1.3+) ───
+# Blank = auto-detect at startup (tries 9600 → 38400 → 115200 with NMEA
+# checksum validation). Set explicitly to skip detection: GPS_BAUD=9600
+GPS_BAUD=
+EOF
+        info "Added v1.1.3 GPS_BAUD option to config.env"
+    fi
+
+    # v1.2.2 additions — 5 GHz scanning (dual-band adapter support)
+    if ! grep -q '^WIFI_5G_ENABLED=' "$cfg"; then
+        [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+        cat >> "$cfg" <<'EOF'
+
+# ─── 5 GHz scanning (added by droneaware update for v1.2.2+) ───
+# Single dual-band adapter runs a 30s cycle (ASTM-compliant channels only):
+#   20s ch6 (2.4 GHz RID) → 10s ch149 (5 GHz RID).
+# Requires the adapter to expose channel 149 in monitor mode.
+#
+# auto  — detect dual-band capability at startup (recommended)
+# true  — force-enable (warns and falls back if adapter doesn't support 5 GHz)
+# false — force-disable (stay on 2.4 GHz only even if adapter is dual-band)
+WIFI_5G_ENABLED=auto
+
+# Off-channel sweep (advanced opt-in). When enabled, the hopper adds brief
+# peeks at ch1 and ch11 (1 sec each per cycle) to surface any non-standard
+# transmitters that might appear on those channels in the future.
+# Empirical fleet data shows ~0% real ch1/ch11 broadcasts today (all observed
+# off-band captures are ch6 drift), so the default is OFF — the platform spends
+# 100% of cycle time on the channels where compliant RID actually transmits.
+# Enable only if you specifically want to chase non-compliant transmitters.
+WIFI_OFF_CHANNEL_SWEEP=false
+EOF
+        info "Added v1.2.2 5 GHz scanning options to config.env"
+    fi
+
     # Future release migration blocks go here.
     # Pattern:
     #   if ! grep -q '^NEW_FIELD=' "$cfg"; then
@@ -154,6 +196,7 @@ cmd_update() {
 }
 
 cmd_status() {
+    require_root "status"
     echo ""
     echo -e "${BOLD}DroneAware Node Status${NC}"
     echo ""
@@ -468,15 +511,50 @@ sock.close()
 print("\n  Transmission complete.")
 PYEOF
 
-    # Check local detection ring buffer
+    # Check local detection ring buffer (per-channel breakdown so the
+    # operator can see whether 2.4 GHz and 5 GHz radio paths both received).
     echo ""
     echo "  Checking local detection buffer..."
     sleep 3
-    if grep -q "$test_id" /run/droneaware/detections.jsonl 2>/dev/null; then
-        info "Local detection confirmed — your node received the test signal."
-    else
+
+    local stats
+    stats=$(python3 - "$test_id" 2>/dev/null <<'PYJSON'
+import json, sys
+test_id = sys.argv[1]
+counts = {}
+total = 0
+try:
+    with open("/run/droneaware/detections.jsonl") as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            decoded = e.get("decoded") or {}
+            if decoded.get("uas_id") != test_id:
+                continue
+            total += 1
+            ch = e.get("channel")
+            counts[ch] = counts.get(ch, 0) + 1
+except FileNotFoundError:
+    pass
+print(total, counts.get(6, 0), counts.get(149, 0))
+PYJSON
+)
+
+    local total ch6 ch149
+    read -r total ch6 ch149 <<< "${stats:-0 0 0}"
+
+    if [[ "$total" -eq 0 ]]; then
         warn "No local detection found yet — the server may still be processing."
         warn "Check your My Nodes page in 30 seconds."
+    else
+        info "Local detection confirmed — ${total} events captured"
+        echo "       2.4 GHz (ch  6) : ${ch6}"
+        echo "       5 GHz  (ch 149) : ${ch149}"
+        if [[ "$ch6" -gt 0 && "$ch149" -gt 0 ]]; then
+            info "Both bands receiving — radio fully functional."
+        fi
     fi
     echo ""
 }
