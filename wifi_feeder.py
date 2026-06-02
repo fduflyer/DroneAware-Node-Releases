@@ -528,11 +528,56 @@ def restore_managed_mode(iface: str):
 
 
 def set_channel(iface: str, channel: int):
-    """Set the monitor interface to a specific 2.4 GHz channel."""
+    """Set the monitor interface to a specific channel (2.4 or 5 GHz)."""
     subprocess.run(
         ["iw", "dev", iface, "set", "channel", str(channel)],
         check=False, capture_output=True,
     )
+
+
+def _supported_channels(iface: str) -> set:
+    """Channel numbers the iface's PHY can tune to (not disabled, regulatory-allowed).
+    Parses `iw phy phyN info` and extracts bracketed channel numbers from lines
+    like "* 5745 MHz [149] (10.0 dBm)". Newer iw prints "5745.0 MHz" — the
+    bracketed channel is consistent across versions.
+    """
+    try:
+        info = subprocess.run(
+            ["iw", "dev", iface, "info"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        phy = None
+        for line in info.stdout.splitlines():
+            s = line.strip()
+            if s.startswith("wiphy "):
+                phy = s.split()[-1]
+                break
+        if phy is None:
+            return set()
+
+        phyinfo = subprocess.run(
+            ["iw", "phy", f"phy{phy}", "info"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        chans = set()
+        for line in phyinfo.stdout.splitlines():
+            if "MHz" not in line or "[" not in line or "disabled" in line:
+                continue
+            start = line.find("[")
+            end   = line.find("]", start)
+            if start != -1 and end != -1:
+                try:
+                    chans.add(int(line[start + 1:end]))
+                except ValueError:
+                    pass
+        return chans
+    except Exception:
+        return set()
+
+
+def _adapter_supports_5g(iface: str) -> bool:
+    """True if iface's PHY exposes channel 149 (5 GHz ASTM RID channel)."""
+    return 149 in _supported_channels(iface)
 
 
 # -- Channel Hopper ------------------------------------------------------------
@@ -562,6 +607,10 @@ class ChannelHopper(threading.Thread):
         """No-op — flat hop ignores detection feedback. Present for API parity."""
         pass
 
+    @property
+    def target_channels(self) -> list:
+        return list(self.channels)
+
     def stop(self):
         self._stop.set()
 
@@ -572,12 +621,17 @@ class AdaptiveChannelHopper(threading.Thread):
 
     Spec basis: F3411 + opendroneid-core-c require 1 Hz Wi-Fi Beacon RID
     broadcasts on channel 6 (2.4 GHz) or 149 (5 GHz). Off-channel broadcasts
-    must be at 5 Hz, which no manufacturer accepts. Even-hop scanning across
-    1–11 spends ~91% of time on channels where compliant 1 Hz RID cannot
-    exist.
+    must be at 5 Hz, which no manufacturer accepts.
 
-    Sweep mode (idle, no detection within ACTIVE_WINDOW):
-      ~80% on channel 6, brief peeks at 1 and 11.
+    Sweep mode (default — WIFI_OFF_CHANNEL_SWEEP=false):
+      100% dwell on channel 6. This is a compliant-operator detection platform;
+      fleet data shows ch1/ch11 carry zero unique drones (all off-band captures
+      are ch6 drift), so spending no time there is the empirically correct
+      default.
+
+    Sweep mode with off-channel canary (WIFI_OFF_CHANNEL_SWEEP=true, advanced):
+      ~80% on channel 6, brief peeks at 1 and 11 to surface any non-standard
+      transmitters that emerge in the future.
 
     Sticky mode (active detection within ACTIVE_WINDOW):
       Hold on the channel that produced the detection. Forced peek every
@@ -632,6 +686,9 @@ class AdaptiveChannelHopper(threading.Thread):
         self.sweep_primary_ms = _parse_int("DWELL_CH6_MS",  self.SWEEP_PRIMARY_MS)
         self.sweep_peek_ms    = _parse_int("DWELL_PEEK_MS", self.SWEEP_PEEK_MS)
 
+        sweep_raw = os.environ.get("WIFI_OFF_CHANNEL_SWEEP", "false").strip().lower()
+        self.off_channel_sweep = sweep_raw in ("true", "1", "yes", "on")
+
         # Guard against zero/negative dwells that would spin the loop
         if self.sweep_primary_ms <= 0:
             log.warning(f"DWELL_CH6_MS={self.sweep_primary_ms} invalid — using {self.SWEEP_PRIMARY_MS}")
@@ -645,6 +702,15 @@ class AdaptiveChannelHopper(threading.Thread):
         self.last_detection_time = time.time()
         if channel is not None:
             self.last_detection_channel = channel
+
+    @property
+    def target_channels(self) -> list:
+        if self.fixed_channel is not None:
+            return [self.fixed_channel]
+        chans = [self.PRIMARY_CHANNEL]
+        if self.off_channel_sweep:
+            chans.extend(self.PEEK_CHANNELS)
+        return chans
 
     def _set(self, ch: int):
         set_channel(self.iface, ch)
@@ -664,7 +730,8 @@ class AdaptiveChannelHopper(threading.Thread):
 
         log.info(
             f"Adaptive hopper started: primary=ch{self.PRIMARY_CHANNEL}, "
-            f"peek={self.PEEK_CHANNELS}, ACTIVE_WINDOW={self.active_window}s, "
+            f"peek={self.PEEK_CHANNELS if self.off_channel_sweep else '[]'}, "
+            f"ACTIVE_WINDOW={self.active_window}s, "
             f"DWELL_CH6_MS={self.sweep_primary_ms}, DWELL_PEEK_MS={self.sweep_peek_ms}"
         )
         prev_mode = "sweep"
@@ -691,16 +758,152 @@ class AdaptiveChannelHopper(threading.Thread):
                         if self._sleep_ms(self.STICKY_PEEK_MS):
                             return
             else:
-                # Sweep cycle: primary → peek1 → peek2 → primary_tail
+                # Sweep cycle: primary → (optional peek1 → peek2 → primary_tail).
+                # Default is compliant-only (no peeks) — set WIFI_OFF_CHANNEL_SWEEP=true
+                # to surface non-standard transmitters on ch1/ch11.
                 self._set(self.PRIMARY_CHANNEL)
                 if self._sleep_ms(self.sweep_primary_ms):
                     break
-                for ch in self.PEEK_CHANNELS:
-                    self._set(ch)
-                    if self._sleep_ms(self.sweep_peek_ms):
+                if self.off_channel_sweep:
+                    for ch in self.PEEK_CHANNELS:
+                        self._set(ch)
+                        if self._sleep_ms(self.sweep_peek_ms):
+                            return
+                    self._set(self.PRIMARY_CHANNEL)
+                    if self._sleep_ms(self.SWEEP_PRIMARY_TAIL_MS):
+                        break
+
+    def stop(self):
+        self._stop.set()
+
+
+class DualBandHopper(threading.Thread):
+    """
+    30s cycle hopper for dual-band adapters (2.4 GHz + 5 GHz).
+
+    Sweep mode default (WIFI_OFF_CHANNEL_SWEEP=false):
+        20s ch6 → 10s ch149  (1 band switch per cycle, ASTM-compliant channels only)
+
+    Sweep mode with off-channel canary (WIFI_OFF_CHANNEL_SWEEP=true, advanced):
+        18s ch6 → 1s ch1 → 1s ch11 → 10s ch149
+
+    Sticky mode (detection within ACTIVE_WINDOW): hold on the detected channel.
+    Periodic peek at the other band's primary every STICKY_PEEK_INTERVAL cycles.
+
+    Empirical data (project_detection_data memory): ch1/ch11 carry zero unique
+    drones — all off-band captures are ch6 drift. Default is compliant-only;
+    advanced users can enable peeks via WIFI_OFF_CHANNEL_SWEEP=true to surface
+    any future non-standard transmitters.
+    """
+
+    PRIMARY_CHANNEL_2G    = 6
+    PRIMARY_CHANNEL_5G    = 149
+    PEEK_CHANNELS_2G      = [1, 11]
+    ACTIVE_WINDOW         = 3.0
+
+    DWELL_CH6_S           = 18.0
+    DWELL_CH6_FULL_S      = 20.0
+    DWELL_CH149_S         = 10.0
+    PEEK_S                = 1.0
+
+    STICKY_DWELL_MS       = 950
+    STICKY_PEEK_INTERVAL  = 10
+    STICKY_PEEK_MS        = 25
+
+    def __init__(self, iface: str):
+        super().__init__(daemon=True)
+        self.iface                  = iface
+        self.current_channel        = self.PRIMARY_CHANNEL_2G
+        self.last_detection_time    = 0.0
+        self.last_detection_channel = self.PRIMARY_CHANNEL_2G
+        self.sticky_cycle_count     = 0
+        self._stop                  = threading.Event()
+
+        sweep_raw = os.environ.get("WIFI_OFF_CHANNEL_SWEEP", "false").strip().lower()
+        self.off_channel_sweep = sweep_raw in ("true", "1", "yes", "on")
+
+        raw = os.environ.get("FIXED_CHANNEL", "").strip()
+        try:
+            self.fixed_channel = int(raw) if raw else None
+        except ValueError:
+            log.warning(f"FIXED_CHANNEL={raw!r} is not an integer — ignoring")
+            self.fixed_channel = None
+
+    def notify_detection(self, channel: int | None):
+        self.last_detection_time = time.time()
+        if channel is not None:
+            self.last_detection_channel = channel
+
+    @property
+    def target_channels(self) -> list:
+        if self.fixed_channel is not None:
+            return [self.fixed_channel]
+        chans = [self.PRIMARY_CHANNEL_2G, self.PRIMARY_CHANNEL_5G]
+        if self.off_channel_sweep:
+            chans.extend(self.PEEK_CHANNELS_2G)
+        return chans
+
+    def _set(self, ch: int):
+        set_channel(self.iface, ch)
+        self.current_channel = ch
+
+    def _sleep_s(self, seconds: float) -> bool:
+        return self._stop.wait(timeout=seconds)
+
+    def run(self):
+        if self.fixed_channel is not None:
+            log.info(f"Dual-band hopper: FIXED_CHANNEL={self.fixed_channel} — locking, no hop")
+            self._set(self.fixed_channel)
+            self._stop.wait()
+            return
+
+        canary = "enabled" if self.off_channel_sweep else "disabled"
+        log.info(
+            f"Dual-band hopper started: 30s cycle "
+            f"(ch{self.PRIMARY_CHANNEL_2G} + ch{self.PRIMARY_CHANNEL_5G}), "
+            f"off-channel canary {canary}"
+        )
+        prev_mode = "sweep"
+
+        while not self._stop.is_set():
+            in_active = (time.time() - self.last_detection_time) < self.ACTIVE_WINDOW
+            mode      = "sticky" if in_active else "sweep"
+
+            if mode != prev_mode:
+                log.debug(f"DualBand hopper: {prev_mode}→{mode}")
+                if mode == "sweep":
+                    self.sticky_cycle_count = 0
+                prev_mode = mode
+
+            if mode == "sticky":
+                self._set(self.last_detection_channel)
+                if self._sleep_s(self.STICKY_DWELL_MS / 1000.0):
+                    break
+                self.sticky_cycle_count += 1
+
+                if self.sticky_cycle_count % self.STICKY_PEEK_INTERVAL == 0:
+                    other = (self.PRIMARY_CHANNEL_5G
+                             if self.last_detection_channel in (1, 6, 11)
+                             else self.PRIMARY_CHANNEL_2G)
+                    self._set(other)
+                    if self._sleep_s(self.STICKY_PEEK_MS / 1000.0):
                         return
-                self._set(self.PRIMARY_CHANNEL)
-                if self._sleep_ms(self.SWEEP_PRIMARY_TAIL_MS):
+            else:
+                if self.off_channel_sweep:
+                    self._set(self.PRIMARY_CHANNEL_2G)
+                    if self._sleep_s(self.DWELL_CH6_S):
+                        break
+                    for ch in self.PEEK_CHANNELS_2G:
+                        self._set(ch)
+                        if self._sleep_s(self.PEEK_S):
+                            return
+                else:
+                    self._set(self.PRIMARY_CHANNEL_2G)
+                    if self._sleep_s(self.DWELL_CH6_FULL_S):
+                        break
+
+                self._set(self.PRIMARY_CHANNEL_5G)
+                if self._sleep_s(self.DWELL_CH149_S):
                     break
 
     def stop(self):
@@ -980,12 +1183,34 @@ class WiFiFeeder:
         # ADAPTIVE_DWELL=false reverts to legacy flat 1–11 hop (A/B testing)
         adaptive_dwell = os.environ.get("ADAPTIVE_DWELL", "true").strip().lower() \
                             in ("true", "1", "yes", "on")
-        if adaptive_dwell:
-            log.info("Hopper mode: adaptive (sweep + sticky, channel-6 biased)")
-            self.hopper = AdaptiveChannelHopper(iface)
-        else:
+        if not adaptive_dwell:
             log.info("Hopper mode: flat (legacy even hop across 1–11)")
             self.hopper = ChannelHopper(iface, CHANNELS_24, channel_dwell)
+        else:
+            wifi_5g = os.environ.get("WIFI_5G_ENABLED", "auto").strip().lower()
+            if wifi_5g in ("true", "1", "yes", "on"):
+                supports_5g = _adapter_supports_5g(iface) if iface else False
+                if not supports_5g:
+                    log.warning(
+                        f"WIFI_5G_ENABLED=true but {iface or '<none>'} does not "
+                        "expose channel 149 — falling back to 2.4 GHz only"
+                    )
+                enable_5g = supports_5g
+            elif wifi_5g in ("false", "0", "no", "off"):
+                enable_5g = False
+            else:  # "auto" (default) — detect at startup
+                enable_5g = _adapter_supports_5g(iface) if iface else False
+                if iface and enable_5g:
+                    log.info(f"Dual-band adapter detected on {iface} — enabling 5 GHz scanning")
+                elif iface:
+                    log.info(f"Single-band adapter on {iface} — 2.4 GHz only")
+
+            if enable_5g:
+                log.info("Hopper mode: dual-band (ch6 + ch149, 30s cycle)")
+                self.hopper = DualBandHopper(iface)
+            else:
+                log.info("Hopper mode: adaptive (sweep + sticky, channel-6 biased)")
+                self.hopper = AdaptiveChannelHopper(iface)
         self.count       = 0
         self.nan_count   = 0
         self._scanning   = False
@@ -1081,7 +1306,18 @@ class WiFiFeeder:
 
     def run(self):
         log.info(f"DroneAware WiFi Feeder - Node: {self.node_id}")
-        log.info(f"Interface: {self.iface or '<not configured>'}  |  Channels: {CHANNELS_24}")
+        target = self.hopper.target_channels
+        log.info(f"Interface: {self.iface or '<not configured>'}  |  Hopper channels: {target}")
+
+        if self.iface and os.path.exists(f"/sys/class/net/{self.iface}"):
+            supported = _supported_channels(self.iface)
+            if supported:
+                missing = [c for c in target if c not in supported]
+                if missing:
+                    log.warning(
+                        f"PHY does not advertise channels {missing} — "
+                        "hopper will retune but the radio may not actually be there."
+                    )
 
         # FAULT mode — missing or invalid WiFi adapter
         if not self.iface or not os.path.exists(f"/sys/class/net/{self.iface}"):

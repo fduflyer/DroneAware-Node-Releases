@@ -21,7 +21,7 @@ jobs:
           # "GLIBC_2.38 not found." Pin keeps binaries forward-compatible:
           # build on the oldest supported OS so binaries run everywhere newer.
           base_image: "raspi_3_bookworm:20231109"
-          cpu: cortex-a7
+          cpu: cortex-a72
           copy_artifact_path: dist/
           commands: |
             apt-get update
@@ -75,6 +75,36 @@ jobs:
             droneaware-ble.service \
             droneaware-wifi.service \
             --generate-notes
+        env:
+          VERSION: ${{ inputs.version }}
+          DL_PATH: ${{ steps.download.outputs.download-path }}
+          GH_TOKEN: ${{ github.token }}
+      - name: Append SHA256 checksums to release notes
+        # Lower-barrier verification path than `gh attestation verify` (which
+        # needs the GitHub CLI + auth). Users can copy the block below into a
+        # file and run `sha256sum -c <file>` to verify integrity.
+        run: |
+          [[ "$VERSION" =~ ^v ]] || VERSION="v$VERSION"
+          existing=$(gh release view "$VERSION" --json body -q .body)
+          {
+            echo "$existing"
+            echo ""
+            echo "## SHA256 Checksums"
+            echo ""
+            echo 'Verify downloaded files with `sha256sum -c` against this list:'
+            echo ""
+            echo '```'
+            for f in ble_feeder wifi_feeder install.sh droneaware \
+                     droneaware-bt-select droneaware-bt-select.service \
+                     droneaware-ble.service droneaware-wifi.service; do
+              src="${DL_PATH}/${f}"
+              [[ -f "$src" ]] || src="${f}"
+              sha=$(sha256sum "$src" | awk '{print $1}')
+              printf '%s  %s\n' "$sha" "$f"
+            done
+            echo '```'
+          } > /tmp/notes.md
+          gh release edit "$VERSION" --notes-file /tmp/notes.md
         env:
           VERSION: ${{ inputs.version }}
           DL_PATH: ${{ steps.download.outputs.download-path }}
