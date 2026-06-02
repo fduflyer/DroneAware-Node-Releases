@@ -530,8 +530,9 @@ try:
                 e = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            decoded = e.get("decoded") or {}
-            if decoded.get("uas_id") != test_id:
+            # LocalPublisher flattens the decoded sub-message into top-level
+            # keys: 'id' holds uas_id (only present for Basic ID events).
+            if e.get("id") != test_id:
                 continue
             total += 1
             ch = e.get("channel")

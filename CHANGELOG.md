@@ -10,7 +10,22 @@ Full release artifacts and discussion notes live at the
 
 ---
 
-## [1.2.2] — Unreleased
+## [1.2.2.1] — 2026-06-01
+
+### Fixed
+- **`droneaware test` per-channel detection breakdown** — the local check
+  introduced in v1.2.2 read the wrong fields when parsing
+  `/run/droneaware/detections.jsonl`. It expected a nested
+  `decoded.uas_id`, but `LocalPublisher` writes a flat `id` field at the
+  top level of each event. Result: tests were always reported as "No
+  local detection found yet" even when 78+ events were sitting in the
+  ring buffer. Fixed to read `e.get("id")` directly. End-to-end
+  validation on a PAU0B AC600 with v1.2.2.1 shows the breakdown now
+  correctly counts ch 6 and ch 149 captures.
+
+---
+
+## [1.2.2] — 2026-06-01
 
 ### Added
 - **5 GHz Wi-Fi RID scanning for dual-band adapters.** New `DualBandHopper` runs a
