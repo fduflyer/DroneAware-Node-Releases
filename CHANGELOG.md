@@ -10,6 +10,46 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.2.2.2] — 2026-06-02
+
+### Fixed
+- **WiFi Beacon local decoder — Message Counter byte was being misread
+  as the message type.** ASTM F3411-22a §5.4.2 places a Message Counter
+  byte between the Vendor Type and the ODID message in Wi-Fi Beacon and
+  NAN transports. The node's local decoder was reading `raw_bytes[0]`
+  directly as the message-type header, which means for any real-world
+  Wi-Fi Beacon broadcast that included a counter, the counter byte's
+  high nibble was being labeled as the message type (e.g., counter
+  `0xB7` → "Unknown(0xB)"; `0x27` → "Authentication"). All position /
+  ID fields came back null because the field parsers were reading from
+  the wrong byte offsets.
+- The fix mirrors the server's defensive shim in `api.py`: when the
+  payload's byte 0 is non-Fx AND byte 1 is Fx (Message Pack header),
+  strip the counter for local field extraction. `raw_hex` preserves the
+  original wire bytes, so the payload forwarded to the server is
+  unchanged. Server has its own identical shim and was always decoding
+  correctly — this was strictly a local-decoder bug invisible from
+  server-side data.
+- Surfaced by `@iaincaradoc` on 2026-06-02 when his `nc -luk 9999`
+  capture of a Mavic 4 Pro showed only `Authentication` and
+  `Unknown(0x6)` / `Unknown(0xB)` events with null fields, while the
+  server had the same drone's standard ASTM messages fully decoded.
+
+### Notes on scope
+- **BLE local decoder is unaffected.** `extract_rid_payload` in
+  `ble_feeder.py` already strips the BLE counter (App Code + counter
+  byte) at extraction time, so the BLE decoder operates on clean ODID
+  bytes and never had this bug.
+- **WiFi-NAN frames are forwarded to the server without local decoding**
+  (`decoded=None`). That's a pre-existing feature gap, not a regression
+  — NAN never produced local UDP/ring-buffer output. Local NAN
+  decoding is tracked separately for v1.3.0.
+- **No wire-format change.** The `payload_hex` sent to `/api/ingest` is
+  byte-identical to v1.2.2.1. Existing server data and `gh attestation
+  verify` workflows are unaffected.
+
+---
+
 ## [1.2.2.1] — 2026-06-01
 
 ### Fixed
