@@ -242,22 +242,42 @@ def parse_message_pack(data: bytes) -> list:
     return messages
 
 
-def decode_rid_message(raw_bytes: bytes) -> dict | None:
+def decode_rid_message(raw_bytes: bytes, radio: str | None = None) -> dict | None:
     if len(raw_bytes) < 2:
         return None
-    msg_type  = (raw_bytes[0] >> 4) & 0x0F
+
+    # WiFi-specific Message Counter shim — mirrors the server's defensive
+    # decoder in api.py. ASTM F3411-22a §5.4.2 places a Message Counter byte
+    # between the Vendor Type and the ODID message in Wi-Fi Beacon and NAN
+    # transports. When a Message Pack is preceded by a counter, byte 0 is
+    # the counter (high-nibble != 0xF) and byte 1 is the pack header
+    # (high-nibble == 0xF). Strip the counter for local field extraction
+    # only — `raw_hex` preserves the original wire bytes so the payload
+    # forwarded to the server is unchanged (server has its own identical
+    # shim, will strip on its end).
+    #
+    # Limitation (same as server): a single message preceded by a counter
+    # is ambiguous from bytes alone and is not detected.
+    decode_bytes = raw_bytes
+    if (radio in ("wifi_beacon", "wifi_nan") and len(raw_bytes) > 1
+            and (raw_bytes[0] >> 4) & 0xF != 0xF
+            and (raw_bytes[1] >> 4) & 0xF == 0xF):
+        decode_bytes = raw_bytes[1:]
+
+    msg_type  = (decode_bytes[0] >> 4) & 0x0F
     type_name = MSG_TYPE.get(msg_type, f"Unknown(0x{msg_type:X})")
     result    = {"message_type": type_name, "raw_hex": raw_bytes.hex().upper()}
     if msg_type == 0x0:
-        result.update(parse_basic_id(raw_bytes))
+        result.update(parse_basic_id(decode_bytes))
     elif msg_type == 0x1:
-        result.update(parse_location(raw_bytes))
+        result.update(parse_location(decode_bytes))
     elif msg_type == 0x4:
-        result.update(parse_system_msg(raw_bytes))
+        result.update(parse_system_msg(decode_bytes))
     elif msg_type == 0x5:
-        result.update(parse_operator_id(raw_bytes))
+        result.update(parse_operator_id(decode_bytes))
     elif msg_type == 0xF:
-        sub_msgs = parse_message_pack(raw_bytes)
+        sub_msgs = parse_message_pack(decode_bytes)
+        # Sub-messages never carry their own counter — pass no radio.
         result["messages"] = [m for m in (decode_rid_message(s) for s in sub_msgs) if m]
     return result
 
@@ -1239,7 +1259,7 @@ class WiFiFeeder:
             if rid_payload is None:
                 return
 
-            decoded = decode_rid_message(rid_payload)
+            decoded = decode_rid_message(rid_payload, radio="wifi_beacon")
             if decoded is None:
                 return
 
