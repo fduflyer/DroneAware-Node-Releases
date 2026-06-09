@@ -132,6 +132,17 @@ def get_cpu_temp() -> float | None:
         return None
 
 
+def get_cpu_load() -> tuple[float | None, float | None, float | None]:
+    """Read /proc/loadavg and return (1-min, 5-min, 15-min) load averages.
+    Returns (None, None, None) if /proc/loadavg is unavailable."""
+    try:
+        with open("/proc/loadavg") as f:
+            parts = f.read().split()
+        return float(parts[0]), float(parts[1]), float(parts[2])
+    except Exception:
+        return None, None, None
+
+
 def get_ble_health(adapter: str = "hci0") -> tuple[bool, str]:
     try:
         result = subprocess.run(
@@ -543,9 +554,10 @@ class BLEFeeder:
             try:
                 await asyncio.sleep(60)
                 cpu_temp = get_cpu_temp()
+                load_1m, load_5m, load_15m = get_cpu_load()
                 log.info(
                     f"[Heartbeat] FAULT — ble_ok=False  reason={reason}  "
-                    f"temp={cpu_temp}°C"
+                    f"temp={cpu_temp}°C  load={load_1m}"
                 )
                 if not self.token:
                     continue
@@ -557,6 +569,9 @@ class BLEFeeder:
                         "uptime_s":     int(time.monotonic() - self.start_time),
                         "fw_version":   FW_VERSION,
                         "cpu_temp_c":   cpu_temp,
+                        "load_1m":      load_1m,
+                        "load_5m":      load_5m,
+                        "load_15m":     load_15m,
                         "ble_ok":       False,
                         "ble_adapter":  self.adapter,
                         "ble_fault":    reason,
@@ -601,6 +616,7 @@ class BLEFeeder:
 
                 if ticker % 60 == 0:
                     cpu_temp        = get_cpu_temp()
+                    load_1m, load_5m, load_15m = get_cpu_load()
                     ble_ok, ble_adp = get_ble_health(self.adapter)
 
                     log.info(
@@ -608,7 +624,7 @@ class BLEFeeder:
                         f"sent={self.forwarder.sent_total}  "
                         f"dropped={self.forwarder.dropped_total}  "
                         f"buffered={len(self.forwarder.buffer)}  "
-                        f"temp={cpu_temp}°C  ble={ble_ok}"
+                        f"temp={cpu_temp}°C  load={load_1m}  ble={ble_ok}"
                     )
                     if self.token:
                         try:
@@ -625,6 +641,9 @@ class BLEFeeder:
                                     "uptime_s":     int(time.monotonic() - self.start_time),
                                     "fw_version":   FW_VERSION,
                                     "cpu_temp_c":   cpu_temp,
+                                    "load_1m":      load_1m,
+                                    "load_5m":      load_5m,
+                                    "load_15m":     load_15m,
                                     "ble_ok":       ble_ok,
                                     "ble_adapter":  ble_adp,
                                 },

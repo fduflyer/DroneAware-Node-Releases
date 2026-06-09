@@ -10,6 +10,23 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.3.0] — Unreleased
+
+Reliability + Observability milestone. Scope intentionally narrowed from the
+original "multi-radio" plan (which moved to v1.5.0) to focus on improvements
+that emerged from real operator incidents during the v1.2.x cycle.
+
+### Added
+- **CPU load average reported in heartbeats** — `load_1m`, `load_5m`,
+  `load_15m` fields appended to both wifi_feeder and ble_feeder heartbeat
+  payloads, alongside the existing `cpu_temp_c`. Sourced from `/proc/loadavg`
+  via a new `get_cpu_load()` helper in each feeder (mirrors the existing
+  `get_cpu_temp()` pattern). Heartbeat log lines also surface the 1-min load
+  for at-a-glance journal reading: `load=0.42`. Server-side accommodation
+  required (Pydantic model + dashboard surface) — node-side is wire-ready.
+
+---
+
 ## [1.2.2.2] — 2026-06-02
 
 ### Fixed

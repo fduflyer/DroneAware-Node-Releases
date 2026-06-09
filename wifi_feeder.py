@@ -940,6 +940,17 @@ def get_cpu_temp() -> float | None:
         return None
 
 
+def get_cpu_load() -> tuple[float | None, float | None, float | None]:
+    """Read /proc/loadavg and return (1-min, 5-min, 15-min) load averages.
+    Returns (None, None, None) if /proc/loadavg is unavailable."""
+    try:
+        with open("/proc/loadavg") as f:
+            parts = f.read().split()
+        return float(parts[0]), float(parts[1]), float(parts[2])
+    except Exception:
+        return None, None, None
+
+
 def get_wifi_health(adapter: str | None) -> tuple[bool | None, str | None]:
     if not adapter:
         return None, None
@@ -1406,6 +1417,7 @@ class WiFiFeeder:
                 with _gps_lock:
                     lat, lon = _gps_lat, _gps_lon
                 cpu_temp = get_cpu_temp()
+                load_1m, load_5m, load_15m = get_cpu_load()
                 has_gps  = os.path.exists(os.environ.get("GPS_DEVICE", "/dev/ttyUSB0"))
                 mobile   = os.environ.get("NODE_MOBILE", "false").lower() == "true"
                 requests.post(
@@ -1416,6 +1428,9 @@ class WiFiFeeder:
                         "uptime_s":     int(time.time() - self.start_time),
                         "fw_version":   FW_VERSION,
                         "cpu_temp_c":   cpu_temp,
+                        "load_1m":      load_1m,
+                        "load_5m":      load_5m,
+                        "load_15m":     load_15m,
                         "wifi_ok":      False,
                         "wifi_adapter": self.iface or None,
                         "wifi_fault":   reason,
@@ -1441,9 +1456,11 @@ class WiFiFeeder:
             self.forwarder.tick()
             if time.time() - last_heartbeat >= 60:
                 last_heartbeat = time.time()
+                load_1m, load_5m, load_15m = get_cpu_load()
                 log.info(
                     f"[Heartbeat] Beacon RID={self.count}  NAN={self.nan_count}  "
-                    f"sent={self.forwarder.sent_total}  failed={self.forwarder.failed_total}"
+                    f"sent={self.forwarder.sent_total}  failed={self.forwarder.failed_total}  "
+                    f"load={load_1m}"
                 )
                 if self.token:
                     try:
@@ -1464,6 +1481,9 @@ class WiFiFeeder:
                                 "uptime_s":     int(time.time() - self.start_time),
                                 "fw_version":   FW_VERSION,
                                 "cpu_temp_c":   cpu_temp,
+                                "load_1m":      load_1m,
+                                "load_5m":      load_5m,
+                                "load_15m":     load_15m,
                                 "wifi_ok":      wifi_ok,
                                 "wifi_adapter": wifi_adp,
                                 "scanning":     self._scanning,
