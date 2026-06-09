@@ -555,9 +555,11 @@ class BLEFeeder:
                 await asyncio.sleep(60)
                 cpu_temp = get_cpu_temp()
                 load_1m, load_5m, load_15m = get_cpu_load()
+                temp_str = f"{cpu_temp}°C" if cpu_temp is not None else "n/a"
+                load_str = f"{load_1m:.2f}" if load_1m is not None else "n/a"
                 log.info(
                     f"[Heartbeat] FAULT — ble_ok=False  reason={reason}  "
-                    f"temp={cpu_temp}°C  load={load_1m}"
+                    f"temp={temp_str}  load={load_str}"
                 )
                 if not self.token:
                     continue
@@ -618,13 +620,15 @@ class BLEFeeder:
                     cpu_temp        = get_cpu_temp()
                     load_1m, load_5m, load_15m = get_cpu_load()
                     ble_ok, ble_adp = get_ble_health(self.adapter)
+                    temp_str = f"{cpu_temp}°C" if cpu_temp is not None else "n/a"
+                    load_str = f"{load_1m:.2f}" if load_1m is not None else "n/a"
 
                     log.info(
                         f"[Heartbeat] seen={self.count}  "
                         f"sent={self.forwarder.sent_total}  "
                         f"dropped={self.forwarder.dropped_total}  "
                         f"buffered={len(self.forwarder.buffer)}  "
-                        f"temp={cpu_temp}°C  load={load_1m}  ble={ble_ok}"
+                        f"temp={temp_str}  load={load_str}  ble={ble_ok}"
                     )
                     if self.token:
                         try:

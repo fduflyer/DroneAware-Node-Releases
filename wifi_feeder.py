@@ -1457,10 +1457,11 @@ class WiFiFeeder:
             if time.time() - last_heartbeat >= 60:
                 last_heartbeat = time.time()
                 load_1m, load_5m, load_15m = get_cpu_load()
+                load_str = f"{load_1m:.2f}" if load_1m is not None else "n/a"
                 log.info(
                     f"[Heartbeat] Beacon RID={self.count}  NAN={self.nan_count}  "
                     f"sent={self.forwarder.sent_total}  failed={self.forwarder.failed_total}  "
-                    f"load={load_1m}"
+                    f"load={load_str}"
                 )
                 if self.token:
                     try:
