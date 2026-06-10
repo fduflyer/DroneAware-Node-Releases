@@ -674,6 +674,24 @@ SERVER_URL=${SERVER_URL}
 # will lose buffered detections. Leave at defaults unless directed by support.
 BATCH_SIZE=200
 FLUSH_INTERVAL=5.0
+
+# Forwarder buffer cap. Bytes-based RAM cap for unsent observations during
+# upstream outages. FIFO drop-oldest on overflow preserves recent forensic
+# context during sustained spoof floods near offline nodes. 50 MB is safe
+# on every supported Pi tier (including Pi Zero 2 W). Log warning fires
+# at DRONEAWARE_BUFFER_WARN_PCT (default 75%) and one info-line when the
+# buffer drains back below 10% after a reconnect.
+DRONEAWARE_BUFFER_MAX_BYTES=50000000
+DRONEAWARE_BUFFER_WARN_PCT=75
+
+# LocalPublisher buffer cap. Bytes-based cap for the tmpfs ring buffer
+# that surfaces detections to LAN consumers (operators tailing
+# 'nc -luk 9999', droneaware test, future local web UI). Distinct from
+# the upstream forwarder cap — local history is sized for "a few hours
+# of recent activity," not "weeks of outage forensics." 10 MB covers
+# ~2-3 hours even at peak burst rates (~50 events/sec) and days of
+# quieter traffic.
+DRONEAWARE_LOCAL_BUFFER_MAX_BYTES=10000000
 EOF
     chmod 600 "${INSTALL_DIR}/config.env"
     info "Configuration written to ${INSTALL_DIR}/config.env"

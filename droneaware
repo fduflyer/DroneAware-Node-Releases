@@ -93,6 +93,38 @@ EOF
         info "Added v1.2.2 5 GHz scanning options to config.env"
     fi
 
+    # v1.3.0 — byte-bounded forwarder buffer
+    if ! grep -q '^DRONEAWARE_BUFFER_MAX_BYTES=' "$cfg"; then
+        [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+        cat >> "$cfg" <<'EOF'
+
+# ─── Forwarder buffer cap (added by droneaware update for v1.3.0+) ───
+# Bytes-based RAM cap for unsent observations during upstream outages.
+# Replaces the pre-v1.3.0 implicit 1000-event cap. FIFO drop-oldest on
+# overflow preserves recent forensic context during sustained spoof
+# floods near offline nodes. 50 MB is safe on every supported Pi tier
+# (including Pi Zero 2 W) and well under the OOM-killer threshold.
+# Tune lower for memory-constrained hardware or higher for nodes that
+# expect extended outages with high traffic.
+DRONEAWARE_BUFFER_MAX_BYTES=50000000
+
+# Log a warning when the forwarder buffer reaches this fill percentage.
+# Threshold-crossing only — one warning per fill, one info-line when the
+# buffer drains back below 10% after a reconnect.
+DRONEAWARE_BUFFER_WARN_PCT=75
+
+# ─── LocalPublisher buffer cap (added by droneaware update for v1.3.0+) ───
+# Bytes-based cap for the tmpfs ring buffer that surfaces detections to
+# LAN consumers (operators tailing `nc -luk 9999`, droneaware test, future
+# local web UI). Distinct from DRONEAWARE_BUFFER_MAX_BYTES (the upstream
+# forwarder cap) — local history is sized for "a few hours of recent
+# activity," not "weeks of outage forensics." 10 MB covers ~2-3 hours
+# even at peak burst rates (~50 events/sec) and days of quieter traffic.
+DRONEAWARE_LOCAL_BUFFER_MAX_BYTES=10000000
+EOF
+        info "Added v1.3.0 forwarder buffer options to config.env"
+    fi
+
     # Future release migration blocks go here.
     # Pattern:
     #   if ! grep -q '^NEW_FIELD=' "$cfg"; then
@@ -180,7 +212,31 @@ cmd_update() {
 
     # Add any new config.env fields introduced by this release before services
     # restart (so they see the new EnvironmentFile values on the next read).
-    migrate_config_env
+    #
+    # Subtle but load-bearing: bash is still executing from the OLD CLI's
+    # open file descriptor at this point (per the atomic-mv pattern from
+    # v1.2.1), so calling migrate_config_env directly here runs the OLD
+    # CLI's migration code — meaning any migration block we add in THIS
+    # release wouldn't actually run until the NEXT update.
+    #
+    # Fix (v1.3.0): re-exec the newly-installed CLI via a hidden
+    # __migrate subcommand, so the NEW CLI's migration code runs now. If
+    # that fails for any reason (CLI missing, syntax error, migrate
+    # throws), fall back to the in-process call — that's the worst case
+    # and matches the pre-v1.3.0 behavior, so we never regress.
+    #
+    # All migration blocks are idempotent (each `if ! grep -q`-gated), so
+    # if both paths somehow run, no harm done.
+    migrated_via_new_cli=0
+    if [[ -x /usr/local/bin/droneaware ]]; then
+        if /usr/local/bin/droneaware __migrate; then
+            migrated_via_new_cli=1
+        fi
+    fi
+    if [[ "$migrated_via_new_cli" == "0" ]]; then
+        warn "Re-exec of new CLI for migration failed — falling back to in-process migration"
+        migrate_config_env
+    fi
 
     systemctl daemon-reload
     systemctl start droneaware-wifi
@@ -214,6 +270,53 @@ cmd_status() {
             echo -e "  ${RED}●${NC}  ${svc}  (${state})"
         fi
     done
+
+    echo ""
+    # GPS state — read tmpfs state file written by wifi_feeder. Soft-fails
+    # if file missing (feeder not yet started, or pre-v1.3.0 binary).
+    python3 - <<'PYEOF'
+import json, time, sys
+try:
+    with open("/run/droneaware/gps_state.json") as f:
+        s = json.load(f)
+except FileNotFoundError:
+    print("  GPS      : state unknown (wifi_feeder not running, or pre-v1.3.0 binary)")
+    sys.exit(0)
+except Exception as e:
+    print(f"  GPS      : state file unreadable ({e})")
+    sys.exit(0)
+
+status     = s.get("status", "unknown")
+device     = s.get("device")
+baud       = s.get("baud")
+lat        = s.get("lat")
+lon        = s.get("lon")
+updated_at = s.get("updated_at") or 0
+age        = time.time() - updated_at
+
+if age > 120:
+    print(f"  GPS      : state stale ({int(age)}s old — wifi_feeder may have stopped)")
+elif status == "not_configured":
+    print("  GPS      : not configured")
+elif status == "device_missing":
+    print(f"  GPS      : {device} — configured but device not present")
+elif status == "detecting_baud":
+    print(f"  GPS      : {device} — detecting baud rate...")
+elif status == "no_nmea":
+    print(f"  GPS      : {device} — device exists but no valid NMEA detected")
+elif status == "reading":
+    if baud is not None:
+        print(f"  GPS      : {device} @ {baud} baud — reading NMEA, no fix yet")
+    else:
+        print(f"  GPS      : {device} — reading NMEA, no fix yet")
+elif status == "fix":
+    if baud is not None:
+        print(f"  GPS      : {device} @ {baud} baud — fix acquired (lat={lat}, lon={lon})")
+    else:
+        print(f"  GPS      : {device} — fix acquired (lat={lat}, lon={lon})")
+else:
+    print(f"  GPS      : {status}")
+PYEOF
     echo ""
 }
 
@@ -565,6 +668,18 @@ case "$1" in
     status)  cmd_status ;;
     logs)    cmd_logs "$@" ;;
     test)    cmd_test "$@" ;;
+    __migrate)
+        # Internal subcommand used by cmd_update for post-install config
+        # migration. The double-underscore prefix is a convention signaling
+        # "private — operators shouldn't need to call this." Intentionally
+        # NOT mentioned in the help text below.
+        #
+        # Safe to call manually for testing — it's just migrate_config_env,
+        # which is idempotent and writes a timestamped backup of config.env
+        # before any modification.
+        require_root "__migrate"
+        migrate_config_env
+        ;;
     *)
         echo ""
         echo -e "${BOLD}DroneAware Node CLI${NC}"

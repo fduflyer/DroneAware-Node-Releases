@@ -56,7 +56,17 @@ FW_VERSION = _read_fw_version("1.1.3")
 
 # -- Constants -----------------------------------------------------------------
 REMOTE_ID_SERVICE_UUID = "0000fffa-0000-1000-8000-00805f9b34fb"
-MAX_BUFFER = 1000  # ring buffer capacity (events); oldest dropped when full
+
+# v1.3.0 byte-bounded forwarder buffer defaults — replaces the pre-v1.3.0
+# event-count cap (MAX_BUFFER=1000). Bytes are the right unit: a 100/sec
+# spoof flood filled the old 1000-event cap in 10 seconds; the new 50 MB
+# cap preserves ~33 minutes of spoof evidence in the same scenario, and
+# weeks of normal-traffic outage on the heaviest known node (dfw-drones).
+# Tunable via env vars at startup (config.env):
+#   DRONEAWARE_BUFFER_MAX_BYTES  — hard cap on buffer size
+#   DRONEAWARE_BUFFER_WARN_PCT   — log a warning at this fill %
+DEFAULT_BUFFER_MAX_BYTES = 50_000_000
+DEFAULT_BUFFER_WARN_PCT  = 75
 
 MSG_TYPE = {
     0x0: "Basic ID",
@@ -132,6 +142,62 @@ def get_cpu_temp() -> float | None:
         return None
 
 
+def get_cpu_load() -> tuple[float | None, float | None, float | None]:
+    """Read /proc/loadavg and return (1-min, 5-min, 15-min) load averages.
+    Returns (None, None, None) if /proc/loadavg is unavailable."""
+    try:
+        with open("/proc/loadavg") as f:
+            parts = f.read().split()
+        return float(parts[0]), float(parts[1]), float(parts[2])
+    except Exception:
+        return None, None, None
+
+
+# /proc/stat baseline for cpu_percent delta calculation.
+# Stored across heartbeat calls so we never block (the standard psutil-style
+# `cpu_percent(interval=1.0)` would sleep 1s every minute, which is wasteful
+# in the asyncio loop).
+_cpu_stat_prev: tuple[int, int] | None = None
+
+
+def get_cpu_percent() -> float | None:
+    """Instantaneous CPU utilization since the previous call, computed from
+    /proc/stat deltas (same metric htop / top / psutil report — fraction of
+    time the CPU was NOT idle).
+
+    Returns None on the first call (no baseline yet), if /proc/stat is
+    unavailable, or on counter wraparound. Otherwise a float in [0.0, 100.0]
+    rounded to one decimal place.
+
+    Distinct from load average: high load with low cpu_percent indicates
+    I/O wait (slow SD card, network); high cpu_percent indicates CPU bound.
+    For DroneAware's "is this Pi about to thermal throttle?" question,
+    cpu_percent is the more direct signal."""
+    global _cpu_stat_prev
+    try:
+        with open("/proc/stat") as f:
+            fields = f.readline().split()[1:]  # skip the "cpu" label
+        nums = [int(x) for x in fields]
+        total = sum(nums)
+        # Kernel fields order: user, nice, system, idle, iowait, irq, softirq, ...
+        # Count idle + iowait as "not doing useful work."
+        idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
+    except Exception:
+        return None
+
+    prev = _cpu_stat_prev
+    _cpu_stat_prev = (total, idle)
+
+    if prev is None:
+        return None  # first call — establish baseline, return None
+    prev_total, prev_idle = prev
+    total_delta = total - prev_total
+    idle_delta  = idle  - prev_idle
+    if total_delta <= 0:
+        return None  # no time passed, or counter wraparound
+    return round((1 - idle_delta / total_delta) * 100, 1)
+
+
 def get_ble_health(adapter: str = "hci0") -> tuple[bool, str]:
     try:
         result = subprocess.run(
@@ -141,6 +207,71 @@ def get_ble_health(adapter: str = "hci0") -> tuple[bool, str]:
         return "UP RUNNING" in result.stdout, adapter
     except Exception:
         return False, adapter
+
+
+async def _attempt_ble_recovery(adapter: str) -> bool:
+    """Run the standard adapter-recovery sequence before tripping FAULT mode.
+    Returns True if the adapter is healthy after recovery, False otherwise.
+
+    Steps (progressive escalation, stops as soon as the adapter comes up):
+
+      1. `rfkill unblock bluetooth` — clears any soft block. Cheap, idempotent,
+         no side effects if no block was set.
+      2. `hciconfig <adapter> up` — brings the interface up if it was DOWN
+         (the common case for the Pi onboard BT after a boot where the UART
+         link to the BT firmware didn't sync correctly — "Can't init device
+         hciN: Connection timed out").
+      3. `systemctl restart hciuart` — last resort. Cycles the UART driver
+         service that owns the link to the Pi's onboard BT chip. Harmless on
+         USB BT dongles (hciuart isn't involved) and on systems without that
+         service. Followed by another `hciconfig up` and re-check.
+
+    All subprocess calls are best-effort (`check=False`) — recovery is an
+    optimistic side path, not load-bearing. If any step fails the next one
+    still runs."""
+
+    log.info(f"[Recovery] Attempting standard recovery on {adapter}")
+
+    # Step 1: clear soft rfkill blocks
+    log.info(f"[Recovery] (1/3) rfkill unblock bluetooth")
+    subprocess.run(
+        ["rfkill", "unblock", "bluetooth"],
+        capture_output=True, check=False, timeout=5,
+    )
+
+    # Step 2: bring the interface up
+    log.info(f"[Recovery] (2/3) hciconfig {adapter} up")
+    subprocess.run(
+        ["hciconfig", adapter, "up"],
+        capture_output=True, check=False, timeout=5,
+    )
+    await asyncio.sleep(2)
+
+    ble_ok, _ = get_ble_health(adapter)
+    if ble_ok:
+        log.info(f"[Recovery] Adapter {adapter} healthy after rfkill + hciconfig up")
+        return True
+
+    # Step 3: cycle the hciuart driver (Pi onboard BT only — no-op for USB)
+    log.info(f"[Recovery] (3/3) systemctl restart hciuart && hciconfig {adapter} up")
+    subprocess.run(
+        ["systemctl", "restart", "hciuart"],
+        capture_output=True, check=False, timeout=10,
+    )
+    await asyncio.sleep(3)
+    subprocess.run(
+        ["hciconfig", adapter, "up"],
+        capture_output=True, check=False, timeout=5,
+    )
+    await asyncio.sleep(2)
+
+    ble_ok, _ = get_ble_health(adapter)
+    if ble_ok:
+        log.info(f"[Recovery] Adapter {adapter} healthy after hciuart restart")
+        return True
+
+    log.warning(f"[Recovery] All recovery attempts failed for {adapter}")
+    return False
 
 
 def get_wifi_health(adapter: str | None) -> tuple[bool | None, str | None]:
@@ -313,23 +444,40 @@ _LOCAL_ALIASED = {"message_type", "raw_hex", "latitude", "longitude",
                   "altitude_geo", "ground_speed", "heading", "uas_id"}
 
 
+# v1.3.0 byte-bounded LocalPublisher cap. Same pattern as the Forwarder
+# byte cap (C.7) but sized differently — LocalPublisher is for LAN
+# consumers reading a recent-history window (operators tailing `nc -luk
+# 9999`, droneaware test verifying detections, future local web UI), not
+# for multi-day outage forensics. 10 MB covers 2-3 hours even at the
+# heaviest known node's peak burst rate, and days of quieter traffic.
+# Tunable independently of the Forwarder cap via DRONEAWARE_LOCAL_BUFFER_MAX_BYTES.
+DEFAULT_LOCAL_BUFFER_MAX_BYTES = 10_000_000
+
+
 class LocalPublisher:
     """
     Writes decoded detections to a tmpfs ring buffer and UDP LAN broadcast.
 
     Buffer: /run/droneaware/detections.jsonl  (RAM only — gone on reboot,
-            zero SD card wear). Bounded to MAX_LINES entries.
+            zero SD card wear). Bounded by DRONEAWARE_LOCAL_BUFFER_MAX_BYTES
+            (default 10 MB), FIFO drop-oldest on overflow.
     UDP:    255.255.255.255:9999 — any device on the LAN can listen.
     """
     BUFFER_PATH = "/run/droneaware/detections.jsonl"
     UDP_PORT    = 9999
-    MAX_LINES   = 3600  # ~60 min at 1 event/sec
 
     def __init__(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         os.makedirs(os.path.dirname(self.BUFFER_PATH), exist_ok=True)
-        self._line_count = 0
+        self.max_buffer_bytes = int(os.environ.get(
+            "DRONEAWARE_LOCAL_BUFFER_MAX_BYTES",
+            str(DEFAULT_LOCAL_BUFFER_MAX_BYTES)
+        ))
+        try:
+            self._buffer_bytes = os.path.getsize(self.BUFFER_PATH)
+        except OSError:
+            self._buffer_bytes = 0
 
     def publish(self, event: dict):
         decoded = event.get("decoded") or {}
@@ -357,59 +505,96 @@ class LocalPublisher:
             if k not in _LOCAL_ALIASED:
                 record[k] = v
         line = json.dumps(record, separators=(',', ':'))
+        line_with_nl = line + '\n'
 
         try:
-            self._sock.sendto((line + '\n').encode(), ('255.255.255.255', self.UDP_PORT))
+            self._sock.sendto(line_with_nl.encode(), ('255.255.255.255', self.UDP_PORT))
         except Exception:
             pass
 
         try:
             with open(self.BUFFER_PATH, 'a') as f:
-                f.write(line + '\n')
-            self._line_count += 1
-            if self._line_count > self.MAX_LINES:
+                f.write(line_with_nl)
+            self._buffer_bytes += len(line_with_nl.encode())
+            if self._buffer_bytes > self.max_buffer_bytes:
                 self._trim()
         except Exception:
             pass
 
     def _trim(self):
+        """Drop oldest lines until file size <= max_buffer_bytes. Reads the
+        whole file, keeps lines from the end inward until under cap, rewrites.
+        Expensive (O(N)) but rare — at 10 MB cap, fires every few thousand
+        events at most."""
         try:
-            with open(self.BUFFER_PATH, 'r') as f:
-                lines = f.readlines()
-            if len(lines) > self.MAX_LINES:
-                with open(self.BUFFER_PATH, 'w') as f:
-                    f.writelines(lines[-self.MAX_LINES:])
-            self._line_count = min(len(lines), self.MAX_LINES)
+            with open(self.BUFFER_PATH, 'rb') as f:
+                raw = f.read()
+            lines = raw.splitlines(keepends=True)
+            kept_reversed = []
+            total = 0
+            for line_bytes in reversed(lines):
+                size = len(line_bytes)
+                if total + size > self.max_buffer_bytes:
+                    break
+                kept_reversed.append(line_bytes)
+                total += size
+            with open(self.BUFFER_PATH, 'wb') as f:
+                for line_bytes in reversed(kept_reversed):
+                    f.write(line_bytes)
+            self._buffer_bytes = total
         except Exception:
             pass
 
 
 # -- HTTP Forwarder ------------------------------------------------------------
 
+def _event_size(event: dict) -> int:
+    """JSON-encoded byte size of a single event — used for cap accounting.
+    Computed once at add-time and stored alongside the event in the buffer
+    so we don't re-serialize on every eviction check."""
+    return len(json.dumps(event, separators=(',', ':')))
+
+
 class Forwarder:
     """
     Buffers raw BLE events and POSTs 5-second batches to the DroneAware server.
 
-    Uses a ring buffer (deque with maxlen) so that if the uplink is down for an
-    extended period, oldest events are dropped rather than consuming unbounded
-    memory. Failed batches are re-queued at the front of the buffer.
+    Uses a byte-bounded ring buffer so that if the uplink is down for an
+    extended period, oldest events are dropped rather than consuming
+    unbounded memory. Failed batches are re-queued at the front of the
+    buffer (drop-oldest on overflow preserves recency for forensics).
+
+    Tunable via env vars at startup:
+        DRONEAWARE_BUFFER_MAX_BYTES — hard cap on buffer size (default 50 MB)
+        DRONEAWARE_BUFFER_WARN_PCT  — log a warning at this fill % (default 75)
     """
 
     def __init__(self, server_url: str, node_id: str,
                  batch_size: int = 200, flush_interval: float = 5.0,
                  token: str = ""):
-        self.url            = server_url.rstrip("/") + "/ingest"
-        self.node_id        = node_id
-        self.batch_size     = batch_size
-        self.flush_interval = flush_interval
-        self.token          = token
-        self.buffer         = collections.deque(maxlen=MAX_BUFFER)
-        self.last_flush     = time.monotonic()
-        self.sent_total     = 0
-        self.dropped_total  = 0
+        self.url               = server_url.rstrip("/") + "/ingest"
+        self.node_id           = node_id
+        self.batch_size        = batch_size
+        self.flush_interval    = flush_interval
+        self.token             = token
+        # buffer holds (event_dict, size_bytes) tuples — single json.dumps
+        # per event, reused on eviction without re-serializing.
+        self.buffer            = collections.deque()
+        self.buffer_bytes      = 0
+        self.max_buffer_bytes  = int(os.environ.get("DRONEAWARE_BUFFER_MAX_BYTES",
+                                                    str(DEFAULT_BUFFER_MAX_BYTES)))
+        self.warn_pct          = int(os.environ.get("DRONEAWARE_BUFFER_WARN_PCT",
+                                                    str(DEFAULT_BUFFER_WARN_PCT)))
+        self.last_flush        = time.monotonic()
+        self.sent_total        = 0
+        self.dropped_total     = 0
+        self._warned_high      = False  # one-shot, resets when buffer drains
 
     def add(self, event: dict):
-        self.buffer.append(event)
+        size = _event_size(event)
+        self.buffer.append((event, size))
+        self.buffer_bytes += size
+        self._evict_to_cap()
         if len(self.buffer) >= self.batch_size:
             self._flush()
 
@@ -419,37 +604,58 @@ class Forwarder:
             self._flush()
             self.last_flush = time.monotonic()
 
+    def _evict_to_cap(self):
+        """Drop oldest events until buffer_bytes <= max_buffer_bytes. Logs
+        threshold crossings (one warning per fill, one info on drain)."""
+        while self.buffer_bytes > self.max_buffer_bytes and len(self.buffer) > 1:
+            _, size = self.buffer.popleft()
+            self.buffer_bytes -= size
+            self.dropped_total += 1
+        pct = (self.buffer_bytes * 100) // self.max_buffer_bytes if self.max_buffer_bytes else 0
+        if pct >= self.warn_pct and not self._warned_high:
+            log.warning(
+                f"Forwarder buffer at {pct}% of {self.max_buffer_bytes // 1_000_000} MB cap "
+                f"({len(self.buffer)} events, dropped_total={self.dropped_total})"
+            )
+            self._warned_high = True
+        elif pct < 10 and self._warned_high:
+            log.info(f"Forwarder buffer drained to {pct}% — caught up")
+            self._warned_high = False
+
     def _flush(self):
         if not self.buffer:
             return
 
         batch = list(self.buffer)
         self.buffer.clear()
+        self.buffer_bytes = 0
+        events = [e for e, _ in batch]
 
         payload = {
             "node_id":     self.node_id,
             "received_at": datetime.now(timezone.utc).isoformat(),
-            "count":       len(batch),
-            "events":      batch,
+            "count":       len(events),
+            "events":      events,
         }
 
         try:
             headers = {"X-Node-Token": self.token} if self.token else {}
             r = requests.post(self.url, json=payload, headers=headers, timeout=5)
             r.raise_for_status()
-            self.sent_total += len(batch)
-            log.debug(f"Sent {len(batch)} events ({self.sent_total} total)")
+            self.sent_total += len(events)
+            log.debug(f"Sent {len(events)} events ({self.sent_total} total)")
         except requests.RequestException as e:
-            # Re-queue failed events at the front of the ring buffer.
-            # deque(maxlen) auto-drops the oldest if we exceed capacity.
-            space_before = MAX_BUFFER - len(self.buffer)
-            for event in reversed(batch):
-                self.buffer.appendleft(event)
-            newly_dropped = max(0, len(batch) - space_before)
-            self.dropped_total += newly_dropped
+            # Re-queue failed events at the front. _evict_to_cap drops the
+            # oldest from the front if we now exceed the byte cap.
+            for event, size in reversed(batch):
+                self.buffer.appendleft((event, size))
+                self.buffer_bytes += size
+            self._evict_to_cap()
             log.warning(
                 f"Flush failed: {e}  "
-                f"(buffered={len(self.buffer)}, dropped_total={self.dropped_total})"
+                f"(buffered={len(self.buffer)}, "
+                f"buffer_bytes={self.buffer_bytes}, "
+                f"dropped_total={self.dropped_total})"
             )
 
 
@@ -543,9 +749,14 @@ class BLEFeeder:
             try:
                 await asyncio.sleep(60)
                 cpu_temp = get_cpu_temp()
+                cpu_pct  = get_cpu_percent()
+                load_1m, load_5m, load_15m = get_cpu_load()
+                temp_str    = f"{cpu_temp}°C" if cpu_temp is not None else "n/a"
+                cpu_pct_str = f"{cpu_pct:.1f}%" if cpu_pct is not None else "n/a"
+                load_str    = f"{load_1m:.2f}" if load_1m is not None else "n/a"
                 log.info(
                     f"[Heartbeat] FAULT — ble_ok=False  reason={reason}  "
-                    f"temp={cpu_temp}°C"
+                    f"temp={temp_str}  cpu={cpu_pct_str}  load={load_str}"
                 )
                 if not self.token:
                     continue
@@ -556,7 +767,12 @@ class BLEFeeder:
                         "node_id":      self.node_id,
                         "uptime_s":     int(time.monotonic() - self.start_time),
                         "fw_version":   FW_VERSION,
+                        "cpu_count":    os.cpu_count(),
                         "cpu_temp_c":   cpu_temp,
+                        "cpu_percent":  cpu_pct,
+                        "load_1m":      load_1m,
+                        "load_5m":      load_5m,
+                        "load_15m":     load_15m,
                         "ble_ok":       False,
                         "ble_adapter":  self.adapter,
                         "ble_fault":    reason,
@@ -572,15 +788,24 @@ class BLEFeeder:
     async def run(self):
         log.info(f"DroneAware BLE Feeder - Node: {self.node_id}  Adapter: {self.adapter}")
 
-        # FAULT mode — BLE adapter not healthy at startup
+        # Adapter not healthy at startup — try the standard recovery sequence
+        # before declaring FAULT. Auto-heals the Pi onboard BT UART sync issue
+        # that intermittently leaves hci0 DOWN at boot, without requiring
+        # operator intervention.
         ble_ok, _ = get_ble_health(self.adapter)
         if not ble_ok:
+            log.warning(
+                f"BLE adapter '{self.adapter}' not healthy at startup — attempting recovery..."
+            )
+            ble_ok = await _attempt_ble_recovery(self.adapter)
+
+        if not ble_ok:
             log.error(
-                f"BLE adapter '{self.adapter}' not healthy — entering FAULT mode."
+                f"BLE adapter '{self.adapter}' not healthy after recovery attempts — entering FAULT mode."
             )
             log.error("WiFi detection (if available) is unaffected and continues independently.")
             log.error("To restore BLE: connect a working Bluetooth adapter and restart this service.")
-            await self._fault_loop("adapter not present")
+            await self._fault_loop("adapter not present (recovery attempted)")
             return
 
         log.info(f"Scanning for Remote ID broadcasts (UUID 0xFFFA)...")
@@ -601,14 +826,19 @@ class BLEFeeder:
 
                 if ticker % 60 == 0:
                     cpu_temp        = get_cpu_temp()
+                    cpu_pct         = get_cpu_percent()
+                    load_1m, load_5m, load_15m = get_cpu_load()
                     ble_ok, ble_adp = get_ble_health(self.adapter)
+                    temp_str    = f"{cpu_temp}°C" if cpu_temp is not None else "n/a"
+                    cpu_pct_str = f"{cpu_pct:.1f}%" if cpu_pct is not None else "n/a"
+                    load_str    = f"{load_1m:.2f}" if load_1m is not None else "n/a"
 
                     log.info(
                         f"[Heartbeat] seen={self.count}  "
                         f"sent={self.forwarder.sent_total}  "
                         f"dropped={self.forwarder.dropped_total}  "
                         f"buffered={len(self.forwarder.buffer)}  "
-                        f"temp={cpu_temp}°C  ble={ble_ok}"
+                        f"temp={temp_str}  cpu={cpu_pct_str}  load={load_str}  ble={ble_ok}"
                     )
                     if self.token:
                         try:
@@ -624,7 +854,12 @@ class BLEFeeder:
                                     "node_id":      self.node_id,
                                     "uptime_s":     int(time.monotonic() - self.start_time),
                                     "fw_version":   FW_VERSION,
+                                    "cpu_count":    os.cpu_count(),
                                     "cpu_temp_c":   cpu_temp,
+                                    "cpu_percent":  cpu_pct,
+                                    "load_1m":      load_1m,
+                                    "load_5m":      load_5m,
+                                    "load_15m":     load_15m,
                                     "ble_ok":       ble_ok,
                                     "ble_adapter":  ble_adp,
                                 },
