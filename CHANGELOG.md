@@ -17,6 +17,23 @@ original "multi-radio" plan (which moved to v1.5.0) to focus on improvements
 that emerged from real operator incidents during the v1.2.x cycle.
 
 ### Added
+- **GPS auto-discovery now checks GPIO / on-board UART paths.** Previously
+  `find_gps_device()` only looked at USB paths (`/dev/ttyUSB*` and
+  `/dev/ttyACM*`), so operators wiring a GPS module to the Pi's GPIO header
+  (e.g. NEO-6M / GY-NEO6MV2 on `/dev/serial0`) had to manually set
+  `GPS_DEVICE` in `config.env` to be detected. The candidate list now
+  extends to `/dev/serial0` (Pi 3+/4/5 default mini UART), `/dev/ttyAMA0`
+  (PL011, used on Pi 1/2/Zero or `dtoverlay=miniuart-bt` configs), and
+  `/dev/ttyS0` (mini UART direct fallback), checked in that order after
+  USB candidates. USB-first priority is preserved — nodes with a USB
+  dongle plugged in behave identically. The `GPS_DEVICE` env var still
+  wins over both. Triggered by Kbrooks's mobile-unit build with the
+  NEO-6M on GPIO instead of USB.
+
+  Installer-side enhancement (asking "USB or GPIO?" at install time) is
+  scoped to v1.5.0 with the rest of pre-flight detection. v1.3.0 just gets
+  the runtime auto-discovery, which closes 80% of the operator pain.
+
 - **`droneaware status` now includes a GPS state line.** Operators can run
   `sudo droneaware status` and see — in one line — which device the feeder
   is using, the detected baud rate, and whether a satellite fix has been

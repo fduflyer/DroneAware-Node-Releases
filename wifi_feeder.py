@@ -1113,10 +1113,29 @@ def _write_gps_state(*, device: str | None = None, baud: int | None = None,
 
 
 def find_gps_device() -> str | None:
+    """Locate a GPS serial device, in priority order:
+      1. GPS_DEVICE env var if set (always wins, even if path doesn't exist —
+         the reader thread surfaces "device_missing" via the state file in
+         that case)
+      2. USB serial dongles: /dev/ttyUSB* (FTDI etc.) and /dev/ttyACM* (CDC)
+      3. GPIO / on-board UART paths: /dev/serial0 (Pi 3+/4/5 default mini
+         UART), /dev/ttyAMA0 (PL011 — Pi 1/2/Zero or swapped-bt configs),
+         /dev/ttyS0 (mini UART direct fallback)
+
+    USB-first preserves the existing behavior for nodes with a USB GPS dongle
+    present. GPIO fallbacks only get picked up when no USB GPS is found —
+    handles the Kbrooks-style mobile-unit build with NEO-6M wired to the Pi's
+    GPIO header instead of USB.
+    """
     env_device = os.environ.get("GPS_DEVICE", "").strip()
     if env_device:
         return env_device
-    candidates = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
+    candidates = (
+        glob.glob('/dev/ttyUSB*') +
+        glob.glob('/dev/ttyACM*') +
+        ['/dev/serial0', '/dev/ttyAMA0', '/dev/ttyS0']
+    )
+    candidates = [c for c in candidates if os.path.exists(c)]
     return candidates[0] if candidates else None
 
 
