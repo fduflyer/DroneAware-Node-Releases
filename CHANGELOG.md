@@ -17,13 +17,25 @@ original "multi-radio" plan (which moved to v1.5.0) to focus on improvements
 that emerged from real operator incidents during the v1.2.x cycle.
 
 ### Added
-- **CPU load average reported in heartbeats** — `load_1m`, `load_5m`,
-  `load_15m` fields appended to both wifi_feeder and ble_feeder heartbeat
-  payloads, alongside the existing `cpu_temp_c`. Sourced from `/proc/loadavg`
-  via a new `get_cpu_load()` helper in each feeder (mirrors the existing
-  `get_cpu_temp()` pattern). Heartbeat log lines also surface the 1-min load
-  for at-a-glance journal reading: `load=0.42`. Server-side accommodation
-  required (Pydantic model + dashboard surface) — node-side is wire-ready.
+- **CPU observability — `cpu_percent`, `load_1m`, `load_5m`, `load_15m`
+  reported in heartbeats.** Both wifi_feeder and ble_feeder now report a
+  full CPU picture alongside the existing `cpu_temp_c`:
+  - `cpu_percent` — instantaneous utilization computed from `/proc/stat`
+    deltas across heartbeat cycles (same metric htop / top / psutil report,
+    and what PiAware's dashboard surfaces). Distinct from load average:
+    high cpu_percent directly predicts thermal throttle; high load with
+    low cpu_percent indicates I/O wait (slow SD card, network).
+  - `load_1m`, `load_5m`, `load_15m` — standard Linux load averages from
+    `/proc/loadavg`. Trend indicator (1-min ≈ now, 15-min ≈ historical).
+  - All metrics soft-fail to `null` on non-Linux / missing `/proc` paths;
+    heartbeat payload stays well-formed. Helpers (`get_cpu_percent()`,
+    `get_cpu_load()`) mirror the existing `get_cpu_temp()` defensive
+    pattern.
+  - Heartbeat log lines now show all three for at-a-glance journal
+    reading: `temp=45.2°C  cpu=12.5%  load=0.42`, with `n/a` fallback
+    when a metric is unavailable.
+  - Server-side accommodation required (Pydantic model + dashboard
+    surface) — node-side is wire-ready.
 
 ---
 
