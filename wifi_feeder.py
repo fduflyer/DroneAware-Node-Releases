@@ -1707,7 +1707,6 @@ class WiFiFeeder:
                                 "load_1m":      load_1m,
                                 "load_5m":      load_5m,
                                 "load_15m":     load_15m,
-                                "dropped_total": self.forwarder.dropped_total,
                                 "wifi_ok":      wifi_ok,
                                 "wifi_adapter": wifi_adp,
                                 "scanning":     self._scanning,

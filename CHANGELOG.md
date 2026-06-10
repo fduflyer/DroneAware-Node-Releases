@@ -50,16 +50,19 @@ that emerged from real operator incidents during the v1.2.x cycle.
   Operators can tune lower on memory-constrained hardware (`20000000` ≈
   20 MB) or higher on Pi 5 deployments that expect extended outages.
 
-  Heartbeat surface: `dropped_total` (cumulative count of events
-  permanently lost to buffer overflow) added to both feeders' heartbeat
-  JSON and log line. Persistent forensic record — meaningful even after
-  the buffer drains, because heartbeats themselves stall during outages.
+  Buffer state is surfaced via journalctl, not heartbeats. The buffer
+  only fills when upstream is unreachable — which is precisely when
+  heartbeats can't get through either. A `dropped_total` field in the
+  heartbeat JSON would be invisible during the loss event itself and
+  only historical after reconnect, so it was deliberately kept out of
+  the wire format. Instead:
 
-  Threshold-crossing logs (one WARNING when buffer first crosses
-  `DRONEAWARE_BUFFER_WARN_PCT`, one INFO when it drains back below 10%
-  after a reconnect). Operators can `journalctl -u droneaware-wifi`
-  during an outage to see buffer state without relying on heartbeats
-  reaching the server.
+  - Heartbeat log line shows `dropped=N` (per-feeder, journalctl-readable)
+  - Threshold-crossing WARNING when buffer first crosses
+    `DRONEAWARE_BUFFER_WARN_PCT` — actionable signal an operator can see
+    via `journalctl -u droneaware-wifi` during the outage itself
+  - INFO when the buffer drains back below 10% after a reconnect (the
+    "all caught up" signal)
 
 - **`droneaware update` now applies the newly-installed release's migration
   blocks immediately**, instead of one release late. Previously `cmd_update`

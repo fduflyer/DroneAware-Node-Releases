@@ -829,7 +829,6 @@ class BLEFeeder:
                                     "load_1m":      load_1m,
                                     "load_5m":      load_5m,
                                     "load_15m":     load_15m,
-                                    "dropped_total": self.forwarder.dropped_total,
                                     "ble_ok":       ble_ok,
                                     "ble_adapter":  ble_adp,
                                 },
