@@ -180,7 +180,31 @@ cmd_update() {
 
     # Add any new config.env fields introduced by this release before services
     # restart (so they see the new EnvironmentFile values on the next read).
-    migrate_config_env
+    #
+    # Subtle but load-bearing: bash is still executing from the OLD CLI's
+    # open file descriptor at this point (per the atomic-mv pattern from
+    # v1.2.1), so calling migrate_config_env directly here runs the OLD
+    # CLI's migration code — meaning any migration block we add in THIS
+    # release wouldn't actually run until the NEXT update.
+    #
+    # Fix (v1.3.0): re-exec the newly-installed CLI via a hidden
+    # __migrate subcommand, so the NEW CLI's migration code runs now. If
+    # that fails for any reason (CLI missing, syntax error, migrate
+    # throws), fall back to the in-process call — that's the worst case
+    # and matches the pre-v1.3.0 behavior, so we never regress.
+    #
+    # All migration blocks are idempotent (each `if ! grep -q`-gated), so
+    # if both paths somehow run, no harm done.
+    migrated_via_new_cli=0
+    if [[ -x /usr/local/bin/droneaware ]]; then
+        if /usr/local/bin/droneaware __migrate; then
+            migrated_via_new_cli=1
+        fi
+    fi
+    if [[ "$migrated_via_new_cli" == "0" ]]; then
+        warn "Re-exec of new CLI for migration failed — falling back to in-process migration"
+        migrate_config_env
+    fi
 
     systemctl daemon-reload
     systemctl start droneaware-wifi
@@ -612,6 +636,18 @@ case "$1" in
     status)  cmd_status ;;
     logs)    cmd_logs "$@" ;;
     test)    cmd_test "$@" ;;
+    __migrate)
+        # Internal subcommand used by cmd_update for post-install config
+        # migration. The double-underscore prefix is a convention signaling
+        # "private — operators shouldn't need to call this." Intentionally
+        # NOT mentioned in the help text below.
+        #
+        # Safe to call manually for testing — it's just migrate_config_env,
+        # which is idempotent and writes a timestamped backup of config.env
+        # before any modification.
+        require_root "__migrate"
+        migrate_config_env
+        ;;
     *)
         echo ""
         echo -e "${BOLD}DroneAware Node CLI${NC}"

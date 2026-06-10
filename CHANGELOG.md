@@ -17,6 +17,33 @@ original "multi-radio" plan (which moved to v1.5.0) to focus on improvements
 that emerged from real operator incidents during the v1.2.x cycle.
 
 ### Added
+- **`droneaware update` now applies the newly-installed release's migration
+  blocks immediately**, instead of one release late. Previously `cmd_update`
+  called `migrate_config_env` at the end of the update, but bash was still
+  executing from the OLD CLI's open file descriptor (per the v1.2.1
+  atomic-mv pattern), so the OLD migration code ran — meaning any new
+  config keys added in the release being installed wouldn't appear in
+  `config.env` until the NEXT update. The classic example: `WIFI_5G_ENABLED`
+  was added in v1.2.2 but didn't actually land in operators' config.env
+  files until v1.2.2.1.
+
+  Fix: `cmd_update` now re-execs the newly-installed CLI via a hidden
+  `__migrate` subcommand, so the new release's migration code runs right
+  away. Wrapped in a fallback — if the re-exec fails for any reason (CLI
+  missing, syntax error, migrate throws), the in-process call runs as
+  before. Worst case = pre-v1.3.0 behavior; we never regress.
+
+  All migration blocks are idempotent (each `if ! grep -q`-gated), so if
+  both the new-CLI re-exec AND the fallback fire on an edge-case partial
+  failure, no harm done — running migration twice produces the same
+  result as running it once.
+
+  Note (same limitation as v1.2.1's atomic-mv fix): this fix only takes
+  effect starting from updates SHIPPED FROM a release that includes it.
+  The v1.2.2.2 → v1.3.0 update will still have the original problem —
+  v1.2.2.2's CLI doesn't know to re-exec. Users updating to v1.3.0 won't
+  see new v1.3.0 config keys until their NEXT update.
+
 - **BLE adapter self-recovery before FAULT.** When `ble_feeder` starts and
   finds `hci0` (or whichever adapter is configured) is DOWN or unhealthy, it
   now runs a standard recovery sequence before declaring FAULT mode:
