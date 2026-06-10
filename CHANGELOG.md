@@ -17,6 +17,50 @@ original "multi-radio" plan (which moved to v1.5.0) to focus on improvements
 that emerged from real operator incidents during the v1.2.x cycle.
 
 ### Added
+- **Byte-bounded ring buffer in both feeders' Forwarders (WiFi parity catch-up
+  + capacity upgrade).** Two changes shipped together:
+
+  1. **WiFi feeder parity with BLE.** Pre-v1.3.0, `wifi_feeder.Forwarder`
+     cleared its buffer BEFORE the POST and only counted failures —
+     observations were lost on any HTTP failure, with zero outage
+     resilience. `ble_feeder.Forwarder` had the proper re-queue-on-failure
+     pattern. The WiFi side now mirrors BLE: failed batches are re-queued
+     at the front of the buffer so transient connectivity blips no longer
+     drop observations. WiFi-RID-heavy nodes (DJI-dense areas) were
+     silently losing more data than BLE-heavy nodes during network blips.
+
+  2. **Both feeders upgraded from event-count cap to byte cap.** The
+     pre-v1.3.0 BLE cap (`MAX_BUFFER=1000` events) filled in 10 seconds
+     under a 100/sec spoof flood. Bytes are the right unit: 50 MB
+     (default) preserves ~33 minutes of spoof evidence in that scenario,
+     and weeks of normal-traffic outage on the heaviest known node
+     (dfw-drones, Zipline corridor). FIFO drop-oldest on overflow
+     preserves recency for forensics — the server-side rate cap already
+     trims spoof amplification post-decode, so dropping older events when
+     a buffer fills is the operationally correct choice.
+
+  New env vars (added to `config.env` via migrate, also written by fresh
+  installs):
+
+  - `DRONEAWARE_BUFFER_MAX_BYTES=50000000` — hard cap (default 50 MB)
+  - `DRONEAWARE_BUFFER_WARN_PCT=75` — log threshold (default 75%)
+
+  Safe on every supported Pi tier including Pi Zero 2 W (512 MB total)
+  and well under the per-process OOM-killer threshold on default Pi OS.
+  Operators can tune lower on memory-constrained hardware (`20000000` ≈
+  20 MB) or higher on Pi 5 deployments that expect extended outages.
+
+  Heartbeat surface: `dropped_total` (cumulative count of events
+  permanently lost to buffer overflow) added to both feeders' heartbeat
+  JSON and log line. Persistent forensic record — meaningful even after
+  the buffer drains, because heartbeats themselves stall during outages.
+
+  Threshold-crossing logs (one WARNING when buffer first crosses
+  `DRONEAWARE_BUFFER_WARN_PCT`, one INFO when it drains back below 10%
+  after a reconnect). Operators can `journalctl -u droneaware-wifi`
+  during an outage to see buffer state without relying on heartbeats
+  reaching the server.
+
 - **`droneaware update` now applies the newly-installed release's migration
   blocks immediately**, instead of one release late. Previously `cmd_update`
   called `migrate_config_env` at the end of the update, but bash was still

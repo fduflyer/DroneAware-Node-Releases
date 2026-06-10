@@ -93,6 +93,29 @@ EOF
         info "Added v1.2.2 5 GHz scanning options to config.env"
     fi
 
+    # v1.3.0 — byte-bounded forwarder buffer
+    if ! grep -q '^DRONEAWARE_BUFFER_MAX_BYTES=' "$cfg"; then
+        [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+        cat >> "$cfg" <<'EOF'
+
+# ─── Forwarder buffer cap (added by droneaware update for v1.3.0+) ───
+# Bytes-based RAM cap for unsent observations during upstream outages.
+# Replaces the pre-v1.3.0 implicit 1000-event cap. FIFO drop-oldest on
+# overflow preserves recent forensic context during sustained spoof
+# floods near offline nodes. 50 MB is safe on every supported Pi tier
+# (including Pi Zero 2 W) and well under the OOM-killer threshold.
+# Tune lower for memory-constrained hardware or higher for nodes that
+# expect extended outages with high traffic.
+DRONEAWARE_BUFFER_MAX_BYTES=50000000
+
+# Log a warning when the forwarder buffer reaches this fill percentage.
+# Threshold-crossing only — one warning per fill, one info-line when the
+# buffer drains back below 10% after a reconnect.
+DRONEAWARE_BUFFER_WARN_PCT=75
+EOF
+        info "Added v1.3.0 forwarder buffer options to config.env"
+    fi
+
     # Future release migration blocks go here.
     # Pattern:
     #   if ! grep -q '^NEW_FIELD=' "$cfg"; then

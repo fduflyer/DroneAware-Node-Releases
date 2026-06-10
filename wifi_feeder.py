@@ -31,6 +31,7 @@ import socket
 import glob
 import os
 import sys
+import collections
 import serial
 import requests
 
@@ -1011,26 +1012,78 @@ def get_wifi_health(adapter: str | None) -> tuple[bool | None, str | None]:
 
 
 # -- HTTP Forwarder ------------------------------------------------------------
-# (identical contract to ble_feeder.Forwarder)
+# Byte-bounded ring buffer mirroring ble_feeder.Forwarder. Two changes
+# relative to pre-v1.3.0:
+#
+#   1. WiFi parity catch-up. Pre-v1.3.0 wifi cleared the buffer BEFORE the
+#      POST and only counted failures — events lost on any HTTP failure,
+#      zero outage resilience. Now mirrors BLE's pattern: re-queue at the
+#      front of the buffer on POST failure so transient connectivity blips
+#      no longer drop observations.
+#
+#   2. Byte cap instead of event-count cap. Pre-v1.3.0 BLE used
+#      maxlen=1000 events; a 100/sec spoof flood filled that in 10 seconds.
+#      Bytes are the right unit: 50 MB preserves ~33 minutes of spoof
+#      evidence and weeks of normal-traffic outage on the heaviest node
+#      (server-side brief, 2026-06-09).
+
+# v1.3.0 byte-bounded forwarder buffer defaults. Both tunable via env vars
+# at startup (config.env). 50 MB is safe on every supported Pi tier
+# including Pi Zero 2 W (512 MB total) and well under the per-process OOM
+# threshold on default Pi OS.
+DEFAULT_BUFFER_MAX_BYTES = 50_000_000
+DEFAULT_BUFFER_WARN_PCT  = 75
+
+
+def _event_size(event: dict) -> int:
+    """JSON-encoded byte size of a single event — used for cap accounting.
+    Computed once at add-time and stored alongside the event in the buffer
+    so we don't re-serialize on every eviction check."""
+    return len(json.dumps(event, separators=(',', ':')))
+
 
 class Forwarder:
+    """Buffers raw WiFi events and POSTs batches to the DroneAware server.
+
+    Uses a byte-bounded ring buffer so that if the uplink is down for an
+    extended period, oldest events are dropped rather than consuming
+    unbounded memory. Failed batches are re-queued at the front of the
+    buffer (drop-oldest on overflow preserves recency for forensics).
+
+    Tunable via env vars:
+        DRONEAWARE_BUFFER_MAX_BYTES  — hard cap on buffer size (default 50 MB)
+        DRONEAWARE_BUFFER_WARN_PCT   — log a warning at this fill % (default 75)
+    """
+
     def __init__(self, server_url: str, node_id: str,
                  batch_size: int = 10, flush_interval: float = 2.0,
                  token: str = ""):
-        self.url            = server_url.rstrip("/") + "/ingest"
-        self.node_id        = node_id
-        self.batch_size     = batch_size
-        self.flush_interval = flush_interval
-        self.token          = token
-        self.buffer         = []
-        self.last_flush     = time.time()
-        self.sent_total     = 0
-        self.failed_total   = 0
-        self._lock          = threading.Lock()
+        self.url               = server_url.rstrip("/") + "/ingest"
+        self.node_id           = node_id
+        self.batch_size        = batch_size
+        self.flush_interval    = flush_interval
+        self.token             = token
+        # buffer holds (event_dict, size_bytes) tuples so we can pop without
+        # re-serializing. buffer_bytes is the running sum of all sizes.
+        self.buffer            = collections.deque()
+        self.buffer_bytes      = 0
+        self.max_buffer_bytes  = int(os.environ.get("DRONEAWARE_BUFFER_MAX_BYTES",
+                                                    str(DEFAULT_BUFFER_MAX_BYTES)))
+        self.warn_pct          = int(os.environ.get("DRONEAWARE_BUFFER_WARN_PCT",
+                                                    str(DEFAULT_BUFFER_WARN_PCT)))
+        self.last_flush        = time.time()
+        self.sent_total        = 0
+        self.failed_total      = 0
+        self.dropped_total     = 0
+        self._warned_high      = False  # one-shot, resets when buffer drains
+        self._lock             = threading.Lock()
 
     def add(self, event: dict):
+        size = _event_size(event)
         with self._lock:
-            self.buffer.append(event)
+            self.buffer.append((event, size))
+            self.buffer_bytes += size
+            self._evict_to_cap_locked()
             if len(self.buffer) >= self.batch_size:
                 self._flush_locked()
 
@@ -1040,20 +1093,52 @@ class Forwarder:
                 self._flush_locked()
                 self.last_flush = time.time()
 
+    def _evict_to_cap_locked(self):
+        """Drop oldest events until buffer_bytes <= max_buffer_bytes. Logs
+        threshold crossings (one warning per fill, one info on drain)."""
+        while self.buffer_bytes > self.max_buffer_bytes and len(self.buffer) > 1:
+            _, size = self.buffer.popleft()
+            self.buffer_bytes -= size
+            self.dropped_total += 1
+        pct = (self.buffer_bytes * 100) // self.max_buffer_bytes if self.max_buffer_bytes else 0
+        if pct >= self.warn_pct and not self._warned_high:
+            log.warning(
+                f"Forwarder buffer at {pct}% of {self.max_buffer_bytes // 1_000_000} MB cap "
+                f"({len(self.buffer)} events, dropped_total={self.dropped_total})"
+            )
+            self._warned_high = True
+        elif pct < 10 and self._warned_high:
+            log.info(f"Forwarder buffer drained to {pct}% — caught up")
+            self._warned_high = False
+
     def _flush_locked(self):
         if not self.buffer:
             return
-        payload      = {"node_id": self.node_id, "events": self.buffer.copy()}
+        batch = list(self.buffer)
         self.buffer.clear()
+        self.buffer_bytes = 0
+        events = [e for e, _ in batch]
+        payload = {"node_id": self.node_id, "events": events}
         try:
             headers = {"X-Node-Token": self.token} if self.token else {}
             r = requests.post(self.url, json=payload, headers=headers, timeout=5)
             r.raise_for_status()
-            self.sent_total += len(payload["events"])
-            log.debug(f"Forwarded {len(payload['events'])} events ({self.sent_total} total)")
+            self.sent_total += len(events)
+            log.debug(f"Forwarded {len(events)} events ({self.sent_total} total)")
         except requests.RequestException as e:
-            self.failed_total += len(payload["events"])
-            log.warning(f"Forward failed: {e} ({self.failed_total} events lost)")
+            # Re-queue failed events at the front. Any that no longer fit
+            # under the byte cap get evicted via _evict_to_cap_locked below.
+            for event, size in reversed(batch):
+                self.buffer.appendleft((event, size))
+                self.buffer_bytes += size
+            self.failed_total += len(events)
+            self._evict_to_cap_locked()
+            log.warning(
+                f"Forward failed: {e}  "
+                f"(buffered={len(self.buffer)}, "
+                f"buffer_bytes={self.buffer_bytes}, "
+                f"dropped_total={self.dropped_total})"
+            )
 
 
 # -- GPS Reader ----------------------------------------------------------------
@@ -1595,6 +1680,7 @@ class WiFiFeeder:
                 log.info(
                     f"[Heartbeat] Beacon RID={self.count}  NAN={self.nan_count}  "
                     f"sent={self.forwarder.sent_total}  failed={self.forwarder.failed_total}  "
+                    f"dropped={self.forwarder.dropped_total}  "
                     f"cpu={cpu_pct_str}  load={load_str}"
                 )
                 if self.token:
@@ -1621,6 +1707,7 @@ class WiFiFeeder:
                                 "load_1m":      load_1m,
                                 "load_5m":      load_5m,
                                 "load_15m":     load_15m,
+                                "dropped_total": self.forwarder.dropped_total,
                                 "wifi_ok":      wifi_ok,
                                 "wifi_adapter": wifi_adp,
                                 "scanning":     self._scanning,
