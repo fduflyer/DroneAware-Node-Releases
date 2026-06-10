@@ -143,6 +143,51 @@ def get_cpu_load() -> tuple[float | None, float | None, float | None]:
         return None, None, None
 
 
+# /proc/stat baseline for cpu_percent delta calculation.
+# Stored across heartbeat calls so we never block (the standard psutil-style
+# `cpu_percent(interval=1.0)` would sleep 1s every minute, which is wasteful
+# in the asyncio loop).
+_cpu_stat_prev: tuple[int, int] | None = None
+
+
+def get_cpu_percent() -> float | None:
+    """Instantaneous CPU utilization since the previous call, computed from
+    /proc/stat deltas (same metric htop / top / psutil report — fraction of
+    time the CPU was NOT idle).
+
+    Returns None on the first call (no baseline yet), if /proc/stat is
+    unavailable, or on counter wraparound. Otherwise a float in [0.0, 100.0]
+    rounded to one decimal place.
+
+    Distinct from load average: high load with low cpu_percent indicates
+    I/O wait (slow SD card, network); high cpu_percent indicates CPU bound.
+    For DroneAware's "is this Pi about to thermal throttle?" question,
+    cpu_percent is the more direct signal."""
+    global _cpu_stat_prev
+    try:
+        with open("/proc/stat") as f:
+            fields = f.readline().split()[1:]  # skip the "cpu" label
+        nums = [int(x) for x in fields]
+        total = sum(nums)
+        # Kernel fields order: user, nice, system, idle, iowait, irq, softirq, ...
+        # Count idle + iowait as "not doing useful work."
+        idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
+    except Exception:
+        return None
+
+    prev = _cpu_stat_prev
+    _cpu_stat_prev = (total, idle)
+
+    if prev is None:
+        return None  # first call — establish baseline, return None
+    prev_total, prev_idle = prev
+    total_delta = total - prev_total
+    idle_delta  = idle  - prev_idle
+    if total_delta <= 0:
+        return None  # no time passed, or counter wraparound
+    return round((1 - idle_delta / total_delta) * 100, 1)
+
+
 def get_ble_health(adapter: str = "hci0") -> tuple[bool, str]:
     try:
         result = subprocess.run(
@@ -554,12 +599,14 @@ class BLEFeeder:
             try:
                 await asyncio.sleep(60)
                 cpu_temp = get_cpu_temp()
+                cpu_pct  = get_cpu_percent()
                 load_1m, load_5m, load_15m = get_cpu_load()
-                temp_str = f"{cpu_temp}°C" if cpu_temp is not None else "n/a"
-                load_str = f"{load_1m:.2f}" if load_1m is not None else "n/a"
+                temp_str    = f"{cpu_temp}°C" if cpu_temp is not None else "n/a"
+                cpu_pct_str = f"{cpu_pct:.1f}%" if cpu_pct is not None else "n/a"
+                load_str    = f"{load_1m:.2f}" if load_1m is not None else "n/a"
                 log.info(
                     f"[Heartbeat] FAULT — ble_ok=False  reason={reason}  "
-                    f"temp={temp_str}  load={load_str}"
+                    f"temp={temp_str}  cpu={cpu_pct_str}  load={load_str}"
                 )
                 if not self.token:
                     continue
@@ -571,6 +618,7 @@ class BLEFeeder:
                         "uptime_s":     int(time.monotonic() - self.start_time),
                         "fw_version":   FW_VERSION,
                         "cpu_temp_c":   cpu_temp,
+                        "cpu_percent":  cpu_pct,
                         "load_1m":      load_1m,
                         "load_5m":      load_5m,
                         "load_15m":     load_15m,
@@ -618,17 +666,19 @@ class BLEFeeder:
 
                 if ticker % 60 == 0:
                     cpu_temp        = get_cpu_temp()
+                    cpu_pct         = get_cpu_percent()
                     load_1m, load_5m, load_15m = get_cpu_load()
                     ble_ok, ble_adp = get_ble_health(self.adapter)
-                    temp_str = f"{cpu_temp}°C" if cpu_temp is not None else "n/a"
-                    load_str = f"{load_1m:.2f}" if load_1m is not None else "n/a"
+                    temp_str    = f"{cpu_temp}°C" if cpu_temp is not None else "n/a"
+                    cpu_pct_str = f"{cpu_pct:.1f}%" if cpu_pct is not None else "n/a"
+                    load_str    = f"{load_1m:.2f}" if load_1m is not None else "n/a"
 
                     log.info(
                         f"[Heartbeat] seen={self.count}  "
                         f"sent={self.forwarder.sent_total}  "
                         f"dropped={self.forwarder.dropped_total}  "
                         f"buffered={len(self.forwarder.buffer)}  "
-                        f"temp={temp_str}  load={load_str}  ble={ble_ok}"
+                        f"temp={temp_str}  cpu={cpu_pct_str}  load={load_str}  ble={ble_ok}"
                     )
                     if self.token:
                         try:
@@ -645,6 +695,7 @@ class BLEFeeder:
                                     "uptime_s":     int(time.monotonic() - self.start_time),
                                     "fw_version":   FW_VERSION,
                                     "cpu_temp_c":   cpu_temp,
+                                    "cpu_percent":  cpu_pct,
                                     "load_1m":      load_1m,
                                     "load_5m":      load_5m,
                                     "load_15m":     load_15m,

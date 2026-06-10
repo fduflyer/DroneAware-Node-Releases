@@ -951,6 +951,51 @@ def get_cpu_load() -> tuple[float | None, float | None, float | None]:
         return None, None, None
 
 
+# /proc/stat baseline for cpu_percent delta calculation.
+# Stored across heartbeat calls so we never block (the standard psutil-style
+# `cpu_percent(interval=1.0)` would sleep 1s every minute, which is wasteful
+# and racy with the hopper thread).
+_cpu_stat_prev: tuple[int, int] | None = None
+
+
+def get_cpu_percent() -> float | None:
+    """Instantaneous CPU utilization since the previous call, computed from
+    /proc/stat deltas (same metric htop / top / psutil report — fraction of
+    time the CPU was NOT idle).
+
+    Returns None on the first call (no baseline yet), if /proc/stat is
+    unavailable, or on counter wraparound. Otherwise a float in [0.0, 100.0]
+    rounded to one decimal place.
+
+    Distinct from load average: high load with low cpu_percent indicates
+    I/O wait (slow SD card, network); high cpu_percent indicates CPU bound.
+    For DroneAware's "is this Pi about to thermal throttle?" question,
+    cpu_percent is the more direct signal."""
+    global _cpu_stat_prev
+    try:
+        with open("/proc/stat") as f:
+            fields = f.readline().split()[1:]  # skip the "cpu" label
+        nums = [int(x) for x in fields]
+        total = sum(nums)
+        # Kernel fields order: user, nice, system, idle, iowait, irq, softirq, ...
+        # Count idle + iowait as "not doing useful work."
+        idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
+    except Exception:
+        return None
+
+    prev = _cpu_stat_prev
+    _cpu_stat_prev = (total, idle)
+
+    if prev is None:
+        return None  # first call — establish baseline, return None
+    prev_total, prev_idle = prev
+    total_delta = total - prev_total
+    idle_delta  = idle  - prev_idle
+    if total_delta <= 0:
+        return None  # no time passed, or counter wraparound
+    return round((1 - idle_delta / total_delta) * 100, 1)
+
+
 def get_wifi_health(adapter: str | None) -> tuple[bool | None, str | None]:
     if not adapter:
         return None, None
@@ -1417,6 +1462,7 @@ class WiFiFeeder:
                 with _gps_lock:
                     lat, lon = _gps_lat, _gps_lon
                 cpu_temp = get_cpu_temp()
+                cpu_pct  = get_cpu_percent()
                 load_1m, load_5m, load_15m = get_cpu_load()
                 has_gps  = os.path.exists(os.environ.get("GPS_DEVICE", "/dev/ttyUSB0"))
                 mobile   = os.environ.get("NODE_MOBILE", "false").lower() == "true"
@@ -1428,6 +1474,7 @@ class WiFiFeeder:
                         "uptime_s":     int(time.time() - self.start_time),
                         "fw_version":   FW_VERSION,
                         "cpu_temp_c":   cpu_temp,
+                        "cpu_percent":  cpu_pct,
                         "load_1m":      load_1m,
                         "load_5m":      load_5m,
                         "load_15m":     load_15m,
@@ -1456,12 +1503,14 @@ class WiFiFeeder:
             self.forwarder.tick()
             if time.time() - last_heartbeat >= 60:
                 last_heartbeat = time.time()
+                cpu_pct = get_cpu_percent()
                 load_1m, load_5m, load_15m = get_cpu_load()
-                load_str = f"{load_1m:.2f}" if load_1m is not None else "n/a"
+                load_str    = f"{load_1m:.2f}" if load_1m is not None else "n/a"
+                cpu_pct_str = f"{cpu_pct:.1f}%" if cpu_pct is not None else "n/a"
                 log.info(
                     f"[Heartbeat] Beacon RID={self.count}  NAN={self.nan_count}  "
                     f"sent={self.forwarder.sent_total}  failed={self.forwarder.failed_total}  "
-                    f"load={load_str}"
+                    f"cpu={cpu_pct_str}  load={load_str}"
                 )
                 if self.token:
                     try:
@@ -1482,6 +1531,7 @@ class WiFiFeeder:
                                 "uptime_s":     int(time.time() - self.start_time),
                                 "fw_version":   FW_VERSION,
                                 "cpu_temp_c":   cpu_temp,
+                                "cpu_percent":  cpu_pct,
                                 "load_1m":      load_1m,
                                 "load_5m":      load_5m,
                                 "load_15m":     load_15m,
