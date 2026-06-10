@@ -17,9 +17,13 @@ original "multi-radio" plan (which moved to v1.5.0) to focus on improvements
 that emerged from real operator incidents during the v1.2.x cycle.
 
 ### Added
-- **CPU observability — `cpu_percent`, `load_1m`, `load_5m`, `load_15m`
-  reported in heartbeats.** Both wifi_feeder and ble_feeder now report a
-  full CPU picture alongside the existing `cpu_temp_c`:
+- **CPU observability — `cpu_count`, `cpu_percent`, `load_1m`, `load_5m`,
+  `load_15m` reported in heartbeats.** Both wifi_feeder and ble_feeder now
+  report a full CPU picture alongside the existing `cpu_temp_c`:
+  - `cpu_count` — number of logical CPU cores via `os.cpu_count()`. Required
+    context for interpreting `load_*` correctly: `load_1m=2.0` means
+    "saturated" on a 2-core Pi Zero 2 W but "comfortably half-loaded" on a
+    4-core Pi 4 — same number, completely different operational meaning.
   - `cpu_percent` — instantaneous utilization computed from `/proc/stat`
     deltas across heartbeat cycles (same metric htop / top / psutil report,
     and what PiAware's dashboard surfaces). Distinct from load average:
