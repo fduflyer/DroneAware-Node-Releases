@@ -17,6 +17,29 @@ original "multi-radio" plan (which moved to v1.5.0) to focus on improvements
 that emerged from real operator incidents during the v1.2.x cycle.
 
 ### Added
+- **LocalPublisher buffer upgraded to byte cap, matching the Forwarder pattern.**
+  The tmpfs ring buffer at `/run/droneaware/detections.jsonl` (read by
+  LAN consumers like `nc -luk 9999`, `droneaware test`, and future local
+  dashboards) was previously bounded by `MAX_LINES=3600` — at busy nodes
+  with peak burst rates (~50 events/sec on dfw-drones during Zipline
+  dispatch), that's only 72 seconds of history. A single drone's full
+  flight could roll off the buffer before an operator looked at it (this
+  is what @iaincaradoc hit during the Mavic 4 Pro decoder investigation).
+
+  Same byte-bounded ring pattern as the Forwarder (C.7), with a smaller
+  default sized for "a few hours of recent local activity," not "weeks of
+  outage forensics":
+
+  - `DRONEAWARE_LOCAL_BUFFER_MAX_BYTES=10000000` (default 10 MB)
+  - Covers ~2–3 hours at heaviest-node peak burst rates
+  - Days of quieter-node history
+  - ~10× the prior capacity at no meaningful RAM cost (tmpfs)
+
+  Independent of `DRONEAWARE_BUFFER_MAX_BYTES` (the upstream forwarder
+  cap) — operators on Pi Zeros can shrink one without shrinking the
+  other. FIFO drop-oldest preserves the most recent events on overflow,
+  which is what LAN consumers actually want to see.
+
 - **Byte-bounded ring buffer in both feeders' Forwarders (WiFi parity catch-up
   + capacity upgrade).** Two changes shipped together:
 

@@ -1339,23 +1339,43 @@ _LOCAL_ALIASED = {"message_type", "raw_hex", "latitude", "longitude",
                   "altitude_geo", "ground_speed", "heading", "uas_id"}
 
 
+# v1.3.0 byte-bounded LocalPublisher cap. Same pattern as the Forwarder
+# byte cap (C.7) but sized differently — LocalPublisher is for LAN
+# consumers reading a recent-history window (operators tailing `nc -luk
+# 9999`, droneaware test verifying detections, future local web UI), not
+# for multi-day outage forensics. 10 MB covers 2-3 hours even at the
+# heaviest known node's peak burst rate (~50 events/sec on dfw-drones
+# Zipline corridor), and days of quieter traffic. Tunable independently
+# of the Forwarder cap via DRONEAWARE_LOCAL_BUFFER_MAX_BYTES.
+DEFAULT_LOCAL_BUFFER_MAX_BYTES = 10_000_000
+
+
 class LocalPublisher:
     """
     Writes decoded detections to a tmpfs ring buffer and UDP LAN broadcast.
 
     Buffer: /run/droneaware/detections.jsonl  (RAM only — gone on reboot,
-            zero SD card wear). Bounded to MAX_LINES entries.
+            zero SD card wear). Bounded by DRONEAWARE_LOCAL_BUFFER_MAX_BYTES
+            (default 10 MB), FIFO drop-oldest on overflow.
     UDP:    255.255.255.255:9999 — any device on the LAN can listen.
     """
     BUFFER_PATH = "/run/droneaware/detections.jsonl"
     UDP_PORT    = 9999
-    MAX_LINES   = 3600  # ~60 min at 1 event/sec
 
     def __init__(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         os.makedirs(os.path.dirname(self.BUFFER_PATH), exist_ok=True)
-        self._line_count = 0
+        self.max_buffer_bytes = int(os.environ.get(
+            "DRONEAWARE_LOCAL_BUFFER_MAX_BYTES",
+            str(DEFAULT_LOCAL_BUFFER_MAX_BYTES)
+        ))
+        # Initialize byte counter from any leftover file (tmpfs survives only
+        # while the process group is alive, but be defensive).
+        try:
+            self._buffer_bytes = os.path.getsize(self.BUFFER_PATH)
+        except OSError:
+            self._buffer_bytes = 0
 
     def publish(self, event: dict):
         decoded = event.get("decoded") or {}
@@ -1384,29 +1404,47 @@ class LocalPublisher:
             if k not in _LOCAL_ALIASED:
                 record[k] = v
         line = json.dumps(record, separators=(',', ':'))
+        line_with_nl = line + '\n'
 
         try:
-            self._sock.sendto((line + '\n').encode(), ('255.255.255.255', self.UDP_PORT))
+            self._sock.sendto(line_with_nl.encode(), ('255.255.255.255', self.UDP_PORT))
         except Exception:
             pass
 
         try:
             with open(self.BUFFER_PATH, 'a') as f:
-                f.write(line + '\n')
-            self._line_count += 1
-            if self._line_count > self.MAX_LINES:
+                f.write(line_with_nl)
+            # Track byte total incrementally. JSON is almost always ASCII for
+            # RID payloads (lat/lon floats, mac strings, message_type ints) so
+            # len(str) == len(bytes) in the typical case; encode() to be safe
+            # for the rare operator/serial-number field with UTF-8.
+            self._buffer_bytes += len(line_with_nl.encode())
+            if self._buffer_bytes > self.max_buffer_bytes:
                 self._trim()
         except Exception:
             pass
 
     def _trim(self):
+        """Drop oldest lines until file size <= max_buffer_bytes. Reads the
+        whole file, keeps lines from the end inward until under cap, rewrites.
+        Expensive (O(N)) but rare — at 10 MB cap, fires every few thousand
+        events at most."""
         try:
-            with open(self.BUFFER_PATH, 'r') as f:
-                lines = f.readlines()
-            if len(lines) > self.MAX_LINES:
-                with open(self.BUFFER_PATH, 'w') as f:
-                    f.writelines(lines[-self.MAX_LINES:])
-            self._line_count = min(len(lines), self.MAX_LINES)
+            with open(self.BUFFER_PATH, 'rb') as f:
+                raw = f.read()
+            lines = raw.splitlines(keepends=True)
+            kept_reversed = []
+            total = 0
+            for line_bytes in reversed(lines):
+                size = len(line_bytes)
+                if total + size > self.max_buffer_bytes:
+                    break
+                kept_reversed.append(line_bytes)
+                total += size
+            with open(self.BUFFER_PATH, 'wb') as f:
+                for line_bytes in reversed(kept_reversed):
+                    f.write(line_bytes)
+            self._buffer_bytes = total
         except Exception:
             pass
 
