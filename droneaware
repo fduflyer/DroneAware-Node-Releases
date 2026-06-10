@@ -214,6 +214,53 @@ cmd_status() {
             echo -e "  ${RED}●${NC}  ${svc}  (${state})"
         fi
     done
+
+    echo ""
+    # GPS state — read tmpfs state file written by wifi_feeder. Soft-fails
+    # if file missing (feeder not yet started, or pre-v1.3.0 binary).
+    python3 - <<'PYEOF'
+import json, time, sys
+try:
+    with open("/run/droneaware/gps_state.json") as f:
+        s = json.load(f)
+except FileNotFoundError:
+    print("  GPS      : state unknown (wifi_feeder not running, or pre-v1.3.0 binary)")
+    sys.exit(0)
+except Exception as e:
+    print(f"  GPS      : state file unreadable ({e})")
+    sys.exit(0)
+
+status     = s.get("status", "unknown")
+device     = s.get("device")
+baud       = s.get("baud")
+lat        = s.get("lat")
+lon        = s.get("lon")
+updated_at = s.get("updated_at") or 0
+age        = time.time() - updated_at
+
+if age > 120:
+    print(f"  GPS      : state stale ({int(age)}s old — wifi_feeder may have stopped)")
+elif status == "not_configured":
+    print("  GPS      : not configured")
+elif status == "device_missing":
+    print(f"  GPS      : {device} — configured but device not present")
+elif status == "detecting_baud":
+    print(f"  GPS      : {device} — detecting baud rate...")
+elif status == "no_nmea":
+    print(f"  GPS      : {device} — device exists but no valid NMEA detected")
+elif status == "reading":
+    if baud is not None:
+        print(f"  GPS      : {device} @ {baud} baud — reading NMEA, no fix yet")
+    else:
+        print(f"  GPS      : {device} — reading NMEA, no fix yet")
+elif status == "fix":
+    if baud is not None:
+        print(f"  GPS      : {device} @ {baud} baud — fix acquired (lat={lat}, lon={lon})")
+    else:
+        print(f"  GPS      : {device} — fix acquired (lat={lat}, lon={lon})")
+else:
+    print(f"  GPS      : {status}")
+PYEOF
     echo ""
 }
 

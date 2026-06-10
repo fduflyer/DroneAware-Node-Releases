@@ -17,6 +17,29 @@ original "multi-radio" plan (which moved to v1.5.0) to focus on improvements
 that emerged from real operator incidents during the v1.2.x cycle.
 
 ### Added
+- **`droneaware status` now includes a GPS state line.** Operators can run
+  `sudo droneaware status` and see — in one line — which device the feeder
+  is using, the detected baud rate, and whether a satellite fix has been
+  acquired. Renders one of:
+  - `GPS: /dev/serial0 @ 9600 baud — fix acquired (lat=40.4577, lon=-74.3393)`
+  - `GPS: /dev/serial0 @ 9600 baud — reading NMEA, no fix yet`
+  - `GPS: /dev/serial0 — detecting baud rate...`
+  - `GPS: /dev/serial0 — device exists but no valid NMEA detected`
+  - `GPS: /dev/ttyUSB0 — configured but device not present`
+  - `GPS: not configured`
+  - `GPS: state stale (Ns old — wifi_feeder may have stopped)`
+  - `GPS: state unknown (wifi_feeder not running, or pre-v1.3.0 binary)`
+
+  Wifi_feeder writes a small JSON state file at `/run/droneaware/gps_state.json`
+  (tmpfs — no SD card wear) on every GPS state transition and on each valid
+  $GPRMC. CLI reads it without parsing journalctl, so the answer is current
+  rather than "whatever was last logged." Pre-v1.3.0 binaries don't write the
+  state file; CLI falls back gracefully.
+
+  Triggered by Kbrooks's mobile-build "NO GPS dashboard badge" debug session
+  on 2026-06-06, where the operator had no single command to learn whether
+  their GPS had a satellite fix (the actual question that mattered).
+
 - **CPU observability — `cpu_count`, `cpu_percent`, `load_1m`, `load_5m`,
   `load_15m` reported in heartbeats.** Both wifi_feeder and ble_feeder now
   report a full CPU picture alongside the existing `cpu_temp_c`:

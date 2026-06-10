@@ -1070,6 +1070,48 @@ def nmea_to_decimal(value: str, direction: str) -> float:
 GPS_BAUD_RATES = [4800, 9600, 38400, 115200]
 
 
+# Tmpfs state file consumed by `droneaware status`. Updated on every NMEA
+# cycle so operators can run `sudo droneaware status` and see the current
+# GPS state (device path, baud, fix status, lat/lon) without having to
+# grep journalctl. Same /run/droneaware/ pattern as the LocalPublisher
+# detection ring buffer — RAM only, no SD card wear.
+_GPS_STATE_PATH = "/run/droneaware/gps_state.json"
+
+
+def _write_gps_state(*, device: str | None = None, baud: int | None = None,
+                     status: str = "unknown", last_nmea_at: float | None = None,
+                     lat: float | None = None, lon: float | None = None) -> None:
+    """Atomically write the current GPS state for the CLI to read.
+    Soft-fails on any I/O error — state-file display is informational,
+    feeder operation continues regardless of whether this succeeds.
+
+    Status values:
+      not_configured  — no GPS device path found / configured
+      device_missing  — configured/found device path does not exist on disk
+      detecting_baud  — probing baud rates against the device
+      no_nmea         — device opened but no valid NMEA sentences received
+      reading         — serial port open, NMEA flowing, awaiting first fix
+      fix             — most recent $GPRMC was "A" (active/valid); lat/lon populated
+    """
+    try:
+        os.makedirs(os.path.dirname(_GPS_STATE_PATH), exist_ok=True)
+        state = {
+            "device":       device,
+            "baud":         baud,
+            "status":       status,
+            "last_nmea_at": last_nmea_at,
+            "lat":          lat,
+            "lon":          lon,
+            "updated_at":   time.time(),
+        }
+        tmp = _GPS_STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, _GPS_STATE_PATH)
+    except Exception:
+        pass
+
+
 def find_gps_device() -> str | None:
     env_device = os.environ.get("GPS_DEVICE", "").strip()
     if env_device:
@@ -1116,10 +1158,22 @@ def detect_baud_rate(device: str) -> int | None:
 
 
 def gps_reader_thread(device: str):
-    """Background thread: reads NMEA sentences, updates _gps_lat/_gps_lon."""
+    """Background thread: reads NMEA sentences, updates _gps_lat/_gps_lon,
+    and surfaces current state to /run/droneaware/gps_state.json for the
+    droneaware CLI's status command."""
     global _gps_lat, _gps_lon
     while True:
         try:
+            # Device-presence check up front — distinguishes "configured
+            # but missing" from "exists but won't talk" in the state file.
+            if not os.path.exists(device):
+                _write_gps_state(device=device, status="device_missing")
+                log.warning(f"[GPS] Device {device} not present — retrying in 10s")
+                time.sleep(10)
+                continue
+
+            _write_gps_state(device=device, status="detecting_baud")
+
             # Use GPS_BAUD from config.env if set, otherwise auto-detect
             configured_baud = os.environ.get("GPS_BAUD", "").strip()
             if configured_baud:
@@ -1133,11 +1187,14 @@ def gps_reader_thread(device: str):
                 baud = detect_baud_rate(device)
 
             if baud is None:
+                _write_gps_state(device=device, status="no_nmea")
                 log.warning(f"[GPS] Could not detect baud rate on {device} — retrying in 10s")
                 time.sleep(10)
                 continue
             with serial.Serial(device, baudrate=baud, timeout=2) as ser:
                 log.info(f"[GPS] Reading from {device} at {baud} baud")
+                _write_gps_state(device=device, baud=baud, status="reading",
+                                 last_nmea_at=time.time())
                 while True:
                     line = ser.readline().decode('ascii', errors='ignore').strip()
                     if not line.startswith(('$GPRMC', '$GNRMC')):
@@ -1151,12 +1208,20 @@ def gps_reader_thread(device: str):
                         with _gps_lock:
                             _gps_lat = lat
                             _gps_lon = lon
+                        _write_gps_state(device=device, baud=baud, status="fix",
+                                         last_nmea_at=time.time(), lat=lat, lon=lon)
                     except (ValueError, IndexError):
                         continue
         except serial.SerialException as e:
+            # Distinguish "device disappeared mid-read" from a generic error.
+            _write_gps_state(
+                device=device,
+                status="device_missing" if not os.path.exists(device) else "no_nmea",
+            )
             log.warning(f"[GPS] Serial error: {e} — retrying in 10s")
             time.sleep(10)
         except Exception as e:
+            _write_gps_state(device=device, status="no_nmea")
             log.warning(f"[GPS] Unexpected error: {e} — retrying in 10s")
             time.sleep(10)
 
@@ -1617,10 +1682,14 @@ def main():
     gps_device = find_gps_device()
     if gps_device:
         log.info(f"[GPS] Dongle detected at {gps_device}")
+        # Seed initial state so `droneaware status` has something to show
+        # before the reader thread has a chance to update it.
+        _write_gps_state(device=gps_device, status="detecting_baud")
         t = threading.Thread(target=gps_reader_thread, args=(gps_device,), daemon=True)
         t.start()
     else:
         log.info("[GPS] No GPS dongle detected — position will not be reported")
+        _write_gps_state(status="not_configured")
 
     feeder = WiFiFeeder(
         iface=args.iface,
