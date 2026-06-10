@@ -17,6 +17,27 @@ original "multi-radio" plan (which moved to v1.5.0) to focus on improvements
 that emerged from real operator incidents during the v1.2.x cycle.
 
 ### Added
+- **BLE adapter self-recovery before FAULT.** When `ble_feeder` starts and
+  finds `hci0` (or whichever adapter is configured) is DOWN or unhealthy, it
+  now runs a standard recovery sequence before declaring FAULT mode:
+  1. `rfkill unblock bluetooth` — clears any soft block
+  2. `hciconfig <adapter> up` — brings the interface up
+  3. (if still unhealthy) `systemctl restart hciuart` then retry once — last
+     resort, cycles the UART driver for Pi onboard BT
+  If the adapter is healthy after any step, the feeder proceeds normally.
+  Only enters FAULT if all three steps fail.
+
+  Auto-heals the Pi onboard-BT UART sync issue (the "Can't init device hci0:
+  Connection timed out" boot failure that hit njpi-120hotfix on 2026-06-01)
+  without requiring operator intervention. Pre-v1.3.0 behavior was to enter
+  FAULT immediately on a DOWN adapter, requiring a manual reboot to recover.
+
+  Each recovery step logs to the journal (`[Recovery] (1/3) ...`,
+  `[Recovery] (2/3) ...`, etc.) so operators can see what was attempted and
+  what worked. FAULT heartbeat reason now reads `adapter not present (recovery
+  attempted)` to distinguish post-recovery FAULT from pre-recovery FAULT in
+  server-side analysis.
+
 - **GPS auto-discovery now checks GPIO / on-board UART paths.** Previously
   `find_gps_device()` only looked at USB paths (`/dev/ttyUSB*` and
   `/dev/ttyACM*`), so operators wiring a GPS module to the Pi's GPIO header

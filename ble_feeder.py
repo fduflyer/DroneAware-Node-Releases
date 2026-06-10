@@ -199,6 +199,71 @@ def get_ble_health(adapter: str = "hci0") -> tuple[bool, str]:
         return False, adapter
 
 
+async def _attempt_ble_recovery(adapter: str) -> bool:
+    """Run the standard adapter-recovery sequence before tripping FAULT mode.
+    Returns True if the adapter is healthy after recovery, False otherwise.
+
+    Steps (progressive escalation, stops as soon as the adapter comes up):
+
+      1. `rfkill unblock bluetooth` — clears any soft block. Cheap, idempotent,
+         no side effects if no block was set.
+      2. `hciconfig <adapter> up` — brings the interface up if it was DOWN
+         (the common case for the Pi onboard BT after a boot where the UART
+         link to the BT firmware didn't sync correctly — "Can't init device
+         hciN: Connection timed out").
+      3. `systemctl restart hciuart` — last resort. Cycles the UART driver
+         service that owns the link to the Pi's onboard BT chip. Harmless on
+         USB BT dongles (hciuart isn't involved) and on systems without that
+         service. Followed by another `hciconfig up` and re-check.
+
+    All subprocess calls are best-effort (`check=False`) — recovery is an
+    optimistic side path, not load-bearing. If any step fails the next one
+    still runs."""
+
+    log.info(f"[Recovery] Attempting standard recovery on {adapter}")
+
+    # Step 1: clear soft rfkill blocks
+    log.info(f"[Recovery] (1/3) rfkill unblock bluetooth")
+    subprocess.run(
+        ["rfkill", "unblock", "bluetooth"],
+        capture_output=True, check=False, timeout=5,
+    )
+
+    # Step 2: bring the interface up
+    log.info(f"[Recovery] (2/3) hciconfig {adapter} up")
+    subprocess.run(
+        ["hciconfig", adapter, "up"],
+        capture_output=True, check=False, timeout=5,
+    )
+    await asyncio.sleep(2)
+
+    ble_ok, _ = get_ble_health(adapter)
+    if ble_ok:
+        log.info(f"[Recovery] Adapter {adapter} healthy after rfkill + hciconfig up")
+        return True
+
+    # Step 3: cycle the hciuart driver (Pi onboard BT only — no-op for USB)
+    log.info(f"[Recovery] (3/3) systemctl restart hciuart && hciconfig {adapter} up")
+    subprocess.run(
+        ["systemctl", "restart", "hciuart"],
+        capture_output=True, check=False, timeout=10,
+    )
+    await asyncio.sleep(3)
+    subprocess.run(
+        ["hciconfig", adapter, "up"],
+        capture_output=True, check=False, timeout=5,
+    )
+    await asyncio.sleep(2)
+
+    ble_ok, _ = get_ble_health(adapter)
+    if ble_ok:
+        log.info(f"[Recovery] Adapter {adapter} healthy after hciuart restart")
+        return True
+
+    log.warning(f"[Recovery] All recovery attempts failed for {adapter}")
+    return False
+
+
 def get_wifi_health(adapter: str | None) -> tuple[bool | None, str | None]:
     if not adapter:
         return None, None
@@ -638,15 +703,24 @@ class BLEFeeder:
     async def run(self):
         log.info(f"DroneAware BLE Feeder - Node: {self.node_id}  Adapter: {self.adapter}")
 
-        # FAULT mode — BLE adapter not healthy at startup
+        # Adapter not healthy at startup — try the standard recovery sequence
+        # before declaring FAULT. Auto-heals the Pi onboard BT UART sync issue
+        # that intermittently leaves hci0 DOWN at boot, without requiring
+        # operator intervention.
         ble_ok, _ = get_ble_health(self.adapter)
         if not ble_ok:
+            log.warning(
+                f"BLE adapter '{self.adapter}' not healthy at startup — attempting recovery..."
+            )
+            ble_ok = await _attempt_ble_recovery(self.adapter)
+
+        if not ble_ok:
             log.error(
-                f"BLE adapter '{self.adapter}' not healthy — entering FAULT mode."
+                f"BLE adapter '{self.adapter}' not healthy after recovery attempts — entering FAULT mode."
             )
             log.error("WiFi detection (if available) is unaffected and continues independently.")
             log.error("To restore BLE: connect a working Bluetooth adapter and restart this service.")
-            await self._fault_loop("adapter not present")
+            await self._fault_loop("adapter not present (recovery attempted)")
             return
 
         log.info(f"Scanning for Remote ID broadcasts (UUID 0xFFFA)...")
