@@ -10,7 +10,36 @@ Full release artifacts and discussion notes live at the
 
 ---
 
-## [1.3.0] — Unreleased
+## [1.3.0.1] — Unreleased
+
+Hotfix for a v1.3.0 regression in GPS auto-discovery. Two operators on
+static nodes (NJ007 + JeGoBE8900, the latter on non-Pi x86_64 Debian)
+hit persistent log noise from the new A.3 GPIO fallback path: `/dev/serial0`
+exists on every Pi by default as the onboard UART symlink, so v1.3.0's
+unconditional GPIO probing surfaced it as a "GPS candidate" on nodes
+without any GPS hardware. The reader thread then either failed baud
+detection (quiet 10s retries) or hit kernel `Input/output error` on
+non-Pi `/dev/serial0` paths (loud 10s WARNING spam) — neither suppressible
+operator-side in v1.3.0.
+
+### Fixed
+- **GPS GPIO fallback now gated on `NODE_MOBILE=true`.** `find_gps_device()`
+  unchanged for the manual-override case (`GPS_DEVICE` env var still wins
+  always) and the USB-present case (still probed on every node — operator
+  plugged something in, we honor it). Only the GPIO/UART path list
+  (`/dev/serial0`, `/dev/ttyAMA0`, `/dev/ttyS0`) is now gated. Static nodes
+  with no GPS hardware go back to the pre-v1.3.0 behavior: silent
+  "GPS: not configured", no probing, no log noise. Mobile nodes (GPIO
+  NEO-6M builds — the Kbrooks use case) still get GPIO auto-discovery
+  as in v1.3.0. Operators with exotic configurations (static + GPS for
+  time sync) can still force a device path via `GPS_DEVICE`.
+
+  Reported as GitHub issue by @JeGoBE8900 on 2026-06-14. Also surfaced
+  on NJ007 (static node, droneaware-node-3) 2026-06-12.
+
+---
+
+## [1.3.0] — 2026-06-11
 
 Reliability + Observability milestone. Scope intentionally narrowed from the
 original "multi-radio" plan (which moved to v1.5.0) to focus on improvements

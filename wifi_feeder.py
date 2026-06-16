@@ -1201,27 +1201,47 @@ def find_gps_device() -> str | None:
     """Locate a GPS serial device, in priority order:
       1. GPS_DEVICE env var if set (always wins, even if path doesn't exist —
          the reader thread surfaces "device_missing" via the state file in
-         that case)
-      2. USB serial dongles: /dev/ttyUSB* (FTDI etc.) and /dev/ttyACM* (CDC)
+         that case). This is the manual-override escape hatch for any
+         configuration the auto-discovery doesn't cover.
+      2. USB serial dongles: /dev/ttyUSB* (FTDI etc.) and /dev/ttyACM* (CDC).
+         Probed for every node regardless of mobile/static — the operator
+         plugged something in, we honor it.
       3. GPIO / on-board UART paths: /dev/serial0 (Pi 3+/4/5 default mini
          UART), /dev/ttyAMA0 (PL011 — Pi 1/2/Zero or swapped-bt configs),
-         /dev/ttyS0 (mini UART direct fallback)
+         /dev/ttyS0 (mini UART direct fallback). ONLY probed when
+         NODE_MOBILE=true — see below.
 
-    USB-first preserves the existing behavior for nodes with a USB GPS dongle
-    present. GPIO fallbacks only get picked up when no USB GPS is found —
-    handles the Kbrooks-style mobile-unit build with NEO-6M wired to the Pi's
-    GPIO header instead of USB.
+    Why GPIO fallback is gated on NODE_MOBILE=true (v1.3.0.1 fix):
+        /dev/serial0 exists on every Pi by default as a symlink to the
+        onboard UART, regardless of whether GPS hardware is wired to the
+        GPIO header. On static nodes (NODE_MOBILE=false), the operator
+        already provided lat/lon at install time and doesn't need GPS —
+        but v1.3.0's unconditional GPIO probing surfaced /dev/serial0 as
+        a "GPS candidate," then failed baud detection (or hit kernel I/O
+        errors on non-Pi /dev/serial0 paths) and spammed warnings every
+        10 seconds. Static nodes with no GPS hardware now skip the GPIO
+        probe entirely. Mobile nodes still get the GPIO auto-discovery
+        path for GPIO-wired NEO-6M builds. Operators with exotic setups
+        (static + GPS for time sync) can still force a device via the
+        GPS_DEVICE env var.
     """
     env_device = os.environ.get("GPS_DEVICE", "").strip()
     if env_device:
         return env_device
-    candidates = (
-        glob.glob('/dev/ttyUSB*') +
-        glob.glob('/dev/ttyACM*') +
-        ['/dev/serial0', '/dev/ttyAMA0', '/dev/ttyS0']
-    )
-    candidates = [c for c in candidates if os.path.exists(c)]
-    return candidates[0] if candidates else None
+
+    # USB paths — probed for every node.
+    usb_candidates = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
+    usb_candidates = [c for c in usb_candidates if os.path.exists(c)]
+    if usb_candidates:
+        return usb_candidates[0]
+
+    # GPIO/UART paths — only for mobile nodes (see docstring).
+    mobile = os.environ.get("NODE_MOBILE", "false").strip().lower() == "true"
+    if not mobile:
+        return None
+    gpio_candidates = ['/dev/serial0', '/dev/ttyAMA0', '/dev/ttyS0']
+    gpio_candidates = [c for c in gpio_candidates if os.path.exists(c)]
+    return gpio_candidates[0] if gpio_candidates else None
 
 
 def _nmea_checksum_valid(sentence: str) -> bool:
