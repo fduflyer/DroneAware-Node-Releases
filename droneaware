@@ -294,10 +294,17 @@ lon        = s.get("lon")
 updated_at = s.get("updated_at") or 0
 age        = time.time() - updated_at
 
-if age > 120:
-    print(f"  GPS      : state stale ({int(age)}s old — wifi_feeder may have stopped)")
-elif status == "not_configured":
+if status == "not_configured":
+    # Terminal state — wifi_feeder writes this once at startup (when
+    # find_gps_device returns None) and never refreshes it, because
+    # no reader thread is running to write NMEA cycles. The staleness
+    # check below DOES NOT apply — the file being old is expected and
+    # correct, not a sign that wifi_feeder stopped. (v1.3.0.2 fix:
+    # v1.3.0.1's GPIO-gating made this state common on static nodes,
+    # which then tripped the staleness warning incorrectly after 2 min.)
     print("  GPS      : not configured")
+elif age > 120:
+    print(f"  GPS      : state stale ({int(age)}s old — wifi_feeder may have stopped)")
 elif status == "device_missing":
     print(f"  GPS      : {device} — configured but device not present")
 elif status == "detecting_baud":

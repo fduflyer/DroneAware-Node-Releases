@@ -10,7 +10,40 @@ Full release artifacts and discussion notes live at the
 
 ---
 
-## [1.3.0.1] — Unreleased
+## [1.3.0.2] — Unreleased
+
+Follow-up hotfix to v1.3.0.1 — addresses a secondary UX bug that v1.3.0.1's
+fix exposed by making the `not_configured` GPS state much more common on
+static nodes.
+
+### Fixed
+- **`droneaware status` no longer falsely reports "state stale" for
+  not-configured GPS.** v1.3.0.2 reorders the GPS state-file check in
+  `cmd_status` so `not_configured` is handled BEFORE the 120-second
+  staleness check. Pre-v1.3.0.2, after a static node had been running for
+  2+ minutes without GPS hardware, `sudo droneaware status` showed
+  "GPS: state stale (Ns old — wifi_feeder may have stopped)" — misleading
+  because wifi_feeder was running fine; the state file simply isn't
+  refreshed when no reader thread exists.
+
+  The staleness check was originally written (in A.2 / v1.3.0) assuming
+  the state file would always be refreshed by an active reader thread
+  every NMEA cycle. v1.3.0.1's GPIO-gating made `not_configured` a
+  legitimate terminal state where the file is written exactly once at
+  service startup — exposing this assumption gap.
+
+  Active GPS states (`fix`, `reading`, `detecting_baud`, `no_nmea`,
+  `device_missing`) still trip the staleness warning if their reader
+  thread genuinely dies — that signal is preserved. Only `not_configured`
+  is exempt because by definition it has no reader thread.
+
+  Validated on NJ007 (droneaware-node-3) during the v1.3.0.1 post-update
+  check: confirmed staleness warning fires after ~4 minutes pre-v1.3.0.2,
+  not at all post-v1.3.0.2.
+
+---
+
+## [1.3.0.1] — 2026-06-16
 
 Hotfix for a v1.3.0 regression in GPS auto-discovery. Two operators on
 static nodes (NJ007 + JeGoBE8900, the latter on non-Pi x86_64 Debian)
