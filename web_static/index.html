@@ -747,6 +747,20 @@
     }
 
     /* ----- Event handling ----- */
+    function mergeNonNull(target, source) {
+      // Shallow merge that ignores null/undefined fields in `source`. Used
+      // to merge incoming ASTM messages of different types (Basic ID,
+      // Location/Vector, System, Auth) into a single composite picture
+      // per MAC — same logic the backend snapshot uses. Without this, a
+      // System message arriving after a Location/Vector would null-out
+      // the drone's lat/lon and remove its map marker.
+      const out = { ...target };
+      for (const k in source) {
+        if (source[k] !== null && source[k] !== undefined) out[k] = source[k];
+      }
+      return out;
+    }
+
     function handleEvent(evt) {
       const mac = evt.mac || evt.source_mac;
       if (!mac) return;
@@ -756,7 +770,7 @@
         entry = { event: evt, first_seen: now, last_seen: now, marker: null, card: null };
         state.macs.set(mac, entry);
       } else {
-        entry.event = { ...entry.event, ...evt };  // merge so later events keep lat/lon if absent
+        entry.event = mergeNonNull(entry.event, evt);
         entry.last_seen = now;
       }
       updateMarker(mac);

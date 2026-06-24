@@ -209,20 +209,40 @@ class DetectionStore:
     def snapshot(self) -> dict:
         """Build a JSON-serializable snapshot for the /api/detections endpoint.
 
-        Returns one entry per MAC with the most-recent event plus metadata.
-        Per-MAC trail (full event list) is intentionally not included here —
-        sidebar list view only needs the latest. Trail data ships in Tier 2."""
+        Returns one entry per MAC with a MERGED view of the most-recent
+        events plus metadata. Per-MAC trail (full event list) is intentionally
+        not included here — sidebar list view only needs the merged state.
+        Trail data ships in Tier 2.
+
+        Why merged instead of literal-latest: ASTM RID drones broadcast a
+        sequence of different message types (Basic ID, Location/Vector,
+        System, Auth, etc.), each carrying a different subset of fields.
+        Basic ID has the UAS-ID; Location/Vector has lat/lon/heading; System
+        has operator location. If we returned only the literal most-recent
+        event, half the rendering would have nulls for the wrong half of
+        the time. Merging oldest-to-newest with "most recent non-null wins
+        per field" gives a complete picture: lat/lon from the most recent
+        Location/Vector, id from the most recent Basic ID, etc., all in
+        one composite dict."""
         now = time.time()
         with self._lock:
             macs = []
             for mac, dq in self._by_mac.items():
                 if not dq:
                     continue
-                latest_event, _, latest_ts = dq[-1]
+                _, _, latest_ts = dq[-1]
                 _, _, first_ts = dq[0]
+                merged: dict = {}
+                for event, _, _ in dq:
+                    for k, v in event.items():
+                        if v is not None:
+                            merged[k] = v
+                # Always include the MAC explicitly (the dict key is
+                # authoritative — overwrite whatever was in events)
+                merged["mac"] = mac
                 macs.append({
                     "mac":          mac,
-                    "latest":       latest_event,
+                    "latest":       merged,
                     "first_seen":   first_ts,
                     "last_seen":    latest_ts,
                     "age_sec":      now - latest_ts,
