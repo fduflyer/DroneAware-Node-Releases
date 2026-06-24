@@ -9,18 +9,28 @@ network can browse live + recent detections without any server connectivity.
 
 Architecture (Phase A — backend):
 
-  - UDP listener on port 9999 with SO_REUSEPORT to coexist with the
-    LocalPublisher broadcaster the feeders run. Receives JSONL detection
-    events as they're broadcast and feeds them into the in-memory ring.
+  - Tmpfs ring file tail on /run/droneaware/detections.jsonl. This is
+    the LocalPublisher's authoritative log of recent decoded detections;
+    polling it for new lines is the reliable on-Pi consumer pattern.
+    (We initially tried a UDP listener on 9999 with SO_REUSEPORT to mirror
+    the LocalPublisher broadcaster, but Linux doesn't reliably deliver
+    UDP broadcasts to local listeners on the same machine — sendto to
+    255.255.255.255 routes packets out the default-route interface
+    without loopback delivery to 0.0.0.0:9999 listeners. Confirmed
+    empirically on NJ001 2026-06-23: broadcasts visible in tcpdump as
+    `wlan0 Out` but never appeared on `lo` In or any 0.0.0.0 listener.
+    Tmpfs file tail sidesteps the kernel quirk entirely.)
 
   - In-memory ring buffer of detections, per-MAC indexed, byte-bounded at
     DRONEAWARE_LOCAL_BUFFER_MAX_BYTES (default 50 MB when web UI is
     installed — install.sh bumps this from the LocalPublisher default of
     10 MB at install time). FIFO drop-oldest on overflow.
 
-  - Startup replay: at boot, read /run/droneaware/detections.jsonl (the
-    LocalPublisher tmpfs ring file) to seed recent state so the web UI has
-    immediate history available without waiting for new UDP events.
+  - The tail thread also handles startup replay: at boot, reads the
+    whole file from offset 0 (seeds the store with whatever LocalPublisher
+    has already accumulated), then keeps the cursor and polls for new
+    lines every TAIL_POLL_SEC. Handles file truncation (LocalPublisher
+    trims) by resetting the cursor when current size < cursor.
 
   - Background sweep every 1s: prune events older than 30 minutes (matches
     the brand guide's maximum freshness tier — older than 30 min fades to
@@ -87,8 +97,8 @@ def _static_root() -> str:
 
 DEFAULT_PORT       = int(os.environ.get("DRONEAWARE_WEB_PORT", "5000"))
 DEFAULT_BIND       = os.environ.get("DRONEAWARE_WEB_BIND", "0.0.0.0")
-UDP_LISTEN_PORT    = 9999
 LOCAL_RING_PATH    = "/run/droneaware/detections.jsonl"
+TAIL_POLL_SEC      = 0.5  # how often to poll the tmpfs ring for new lines
 
 # Buffer cap. Mirrors DRONEAWARE_LOCAL_BUFFER_MAX_BYTES the LocalPublisher
 # uses. When web UI is installed, install.sh bumps that to 50 MB so the
@@ -287,61 +297,75 @@ store = DetectionStore()
 broker = SSEBroker()
 
 
-# ---- UDP listener -----------------------------------------------------------
+# ---- Tmpfs ring file tail (the data source) ---------------------------------
 
-def udp_listen_thread():
-    """Listen on UDP 9999 for LocalPublisher broadcasts. Parse JSON, add
-    to store, push to SSE subscribers. SO_REUSEPORT lets us coexist with
-    the feeders' broadcaster (which only sends, doesn't receive)."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    # SO_REUSEADDR for cross-restart, SO_REUSEPORT for coexistence with
-    # other listeners on the same port (e.g., operator running `nc -luk 9999`).
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    if hasattr(socket, "SO_REUSEPORT"):
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    sock.bind(("0.0.0.0", UDP_LISTEN_PORT))
-    log.info(f"UDP listener bound to 0.0.0.0:{UDP_LISTEN_PORT}")
+def consumer_thread():
+    """Single thread that handles both startup replay and live tailing of
+    /run/droneaware/detections.jsonl — the LocalPublisher's tmpfs ring file.
+
+    Initial pass reads from offset 0 (replays all currently-known events
+    into the store so the UI has immediate recent history). Subsequent
+    polls every TAIL_POLL_SEC read only new bytes since the last cursor
+    position. Partial lines (file write in progress at poll boundary) are
+    buffered in `pending` until the trailing newline arrives.
+
+    Handles LocalPublisher's periodic file truncation: if current_size <
+    cursor, the file shrunk (was trimmed), so reset cursor to 0 and
+    re-read. Duplicate events from the re-read are harmless — the
+    DetectionStore is per-MAC indexed and naturally deduplicates
+    (a duplicate event for an existing MAC just updates last_seen)."""
+    cursor = 0
+    pending = b""
+    initial_replay_done = False
+
     while True:
         try:
-            data, _ = sock.recvfrom(65536)
-        except OSError as e:
-            log.warning(f"UDP recv error: {e}")
-            time.sleep(0.5)
-            continue
-        try:
-            event = json.loads(data.decode("utf-8", errors="ignore").strip())
-        except json.JSONDecodeError:
-            continue
-        if store.add(event):
-            broker.publish(event)
+            if not os.path.exists(LOCAL_RING_PATH):
+                if not initial_replay_done:
+                    log.info(f"Waiting for {LOCAL_RING_PATH} to appear "
+                             f"(feeders may not be running yet)")
+                    initial_replay_done = True  # only log once
+                time.sleep(TAIL_POLL_SEC)
+                continue
 
+            current_size = os.path.getsize(LOCAL_RING_PATH)
 
-# ---- Startup replay ---------------------------------------------------------
+            if current_size < cursor:
+                # LocalPublisher truncated the file (ring trim).
+                log.info(f"Ring file truncated ({cursor} → {current_size}); "
+                         f"resetting tail cursor")
+                cursor = 0
+                pending = b""
 
-def replay_ring_file():
-    """At startup, replay the LocalPublisher tmpfs ring file into the store
-    so the web UI has immediate recent history before any new UDP event
-    arrives. Soft-fails if the file doesn't exist (feeder not running yet)."""
-    if not os.path.exists(LOCAL_RING_PATH):
-        log.info(f"No tmpfs ring at {LOCAL_RING_PATH} — starting with empty store")
-        return
-    replayed = 0
-    try:
-        with open(LOCAL_RING_PATH) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if store.add(event):
-                    replayed += 1
-    except Exception as e:
-        log.warning(f"Replay of {LOCAL_RING_PATH} failed: {e}")
-        return
-    log.info(f"Replayed {replayed} events from {LOCAL_RING_PATH}")
+            if current_size > cursor:
+                with open(LOCAL_RING_PATH, "rb") as f:
+                    f.seek(cursor)
+                    pending += f.read(current_size - cursor)
+                cursor = current_size
+
+                events_added = 0
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line.decode("utf-8", errors="ignore"))
+                    except json.JSONDecodeError:
+                        continue
+                    if store.add(event):
+                        events_added += 1
+                        broker.publish(event)
+
+                if not initial_replay_done and events_added:
+                    log.info(f"Initial replay: {events_added} events from "
+                             f"{LOCAL_RING_PATH}")
+                    initial_replay_done = True
+
+        except Exception as e:
+            log.warning(f"Tail error: {e}")
+
+        time.sleep(TAIL_POLL_SEC)
 
 
 # ---- Background pruning -----------------------------------------------------
@@ -540,10 +564,9 @@ def main():
     log.info(f"DroneAware Local Web UI v{FW_VERSION}")
     log.info(f"Buffer cap: {store._max_bytes // 1_000_000} MB  "
              f"Stale threshold: {STALE_AGE_SEC}s")
+    log.info(f"Data source: tail {LOCAL_RING_PATH} every {TAIL_POLL_SEC}s")
 
-    replay_ring_file()
-
-    threading.Thread(target=udp_listen_thread, daemon=True).start()
+    threading.Thread(target=consumer_thread, daemon=True).start()
     threading.Thread(target=prune_thread, daemon=True).start()
 
     log.info(f"HTTP server starting on http://{args.bind}:{args.port}/")
