@@ -667,7 +667,14 @@
       const evt = entry.event;
       const age = (Date.now() / 1000) - entry.last_seen;
       const f = freshnessFor(age);
-      const radio = (evt.radio || "?").toUpperCase();
+      // Normalize radio for display: wifi_beacon / wifi_nan / wifi all
+      // render as "WIFI"; ble renders as "BLE". Keeps the card visually
+      // consistent regardless of which LocalPublisher source path the
+      // event came through.
+      const radioRaw = (evt.radio || "").toLowerCase();
+      const radio = radioRaw.startsWith("wifi") ? "WIFI"
+                  : radioRaw === "ble"          ? "BLE"
+                  :                                (evt.radio || "?").toUpperCase();
 
       let card = entry.card;
       if (!card) {
@@ -709,10 +716,20 @@
         const age = (Date.now() / 1000) - entry.last_seen;
         const tier = freshnessFor(age).tier;
         const radio = (evt.radio || "").toLowerCase();
+        // Normalize radio variants: LocalPublisher emits "wifi_beacon"
+        // (Wi-Fi Beacon frames — what cmd_test uses) and "wifi_nan"
+        // (Wi-Fi NAN action frames — many commercial drones) in addition
+        // to "wifi". Map all wifi_* variants to the "wifi" filter chip;
+        // "ble" stays as "ble"; unknown radios pass through to be filtered
+        // by exact match (won't pass any chip, so they're hidden unless
+        // someone explicitly adds a chip for them).
+        const radioKind = radio.startsWith("wifi") ? "wifi"
+                        : radio === "ble"          ? "ble"
+                        :                            radio;
         const isTest = isTestEvent(evt);
 
         const passFresh = f.freshness.has(tier === "aging" ? "recent" : tier);
-        const passRadio = f.radio.has(radio) || (radio === "" && f.radio.size);
+        const passRadio = f.radio.has(radioKind) || (radioKind === "" && f.radio.size);
         const passTest  = f.test || !isTest;
         const visible   = passFresh && passRadio && passTest;
 
