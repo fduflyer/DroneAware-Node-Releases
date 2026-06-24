@@ -419,6 +419,65 @@ def get_cpu_load() -> tuple[float | None, float | None, float | None]:
         return None, None, None
 
 
+CONFIG_ENV_PATH = "/opt/droneaware/config.env"
+GPS_STATE_PATH  = "/run/droneaware/gps_state.json"
+
+
+def _read_config_env(key: str) -> str | None:
+    """Get a config value, preferring env (set by systemd EnvironmentFile)
+    and falling back to parsing /opt/droneaware/config.env directly. The
+    fallback supports manual `sudo python3 web_ui.py` testing where the
+    process isn't launched via systemd. Soft-fails silently if the file
+    is unreadable (e.g., running as non-root)."""
+    val = os.environ.get(key)
+    if val is not None:
+        return val.strip() or None
+    try:
+        with open(CONFIG_ENV_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(f"{key}="):
+                    return line.split("=", 1)[1].strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def get_home_location() -> dict | None:
+    """Returns the node's home location for map centering and distance
+    rings. Two sources:
+
+      - Static node (NODE_MOBILE=false): NODE_LAT / NODE_LON from
+        config.env (set at install time during enrollment).
+      - Mobile node (NODE_MOBILE=true): current GPS fix from
+        /run/droneaware/gps_state.json. Returns None if no fix yet.
+
+    Returns None on any failure or missing data — frontend then keeps
+    the map at the default continental-US view with no rings drawn."""
+    try:
+        mobile = (_read_config_env("NODE_MOBILE") or "false").lower() == "true"
+        if mobile:
+            try:
+                with open(GPS_STATE_PATH) as f:
+                    s = json.load(f)
+            except Exception:
+                return None
+            if s.get("status") != "fix":
+                return None
+            lat, lon = s.get("lat"), s.get("lon")
+            if lat is None or lon is None:
+                return None
+            return {"lat": float(lat), "lon": float(lon), "source": "gps"}
+        else:
+            lat_str = _read_config_env("NODE_LAT")
+            lon_str = _read_config_env("NODE_LON")
+            if not lat_str or not lon_str:
+                return None
+            return {"lat": float(lat_str), "lon": float(lon_str), "source": "static"}
+    except Exception:
+        return None
+
+
 # ---- Flask app --------------------------------------------------------------
 
 app = Flask(
@@ -537,6 +596,7 @@ def api_status():
         "load_5m":     load_5m,
         "load_15m":    load_15m,
         "sse_clients": broker.subscriber_count(),
+        "home":        get_home_location(),  # {lat, lon, source} or null
     })
     return jsonify(s)
 
