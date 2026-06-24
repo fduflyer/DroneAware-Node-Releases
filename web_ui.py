@@ -27,8 +27,11 @@ Architecture (Phase A — backend):
     gray on the UI).
 
   - Flask app on DRONEAWARE_WEB_PORT (default 5000):
-      GET  /                → bundled HTML/CSS/JS dashboard (Phase A:
-                              minimal status page; Phase B: full UI)
+      GET  /                → bundled HTML/CSS/JS dashboard
+                              (Phase B: full UI — sidebar + map + filters +
+                              detail modal + status bar, brand-guide
+                              compliant. Mobile responsive < 768px.)
+      GET  /static/<file>   → bundled Leaflet + any other static assets
       GET  /api/detections  → JSON snapshot of per-MAC current state
       GET  /api/status      → buffer %, CPU %, event/MAC counts, uptime
       GET  /events          → Server-Sent Events stream — pushes events as
@@ -69,6 +72,16 @@ def _read_fw_version(fallback: str) -> str:
 
 
 FW_VERSION = _read_fw_version("1.4.0")
+
+
+def _static_root() -> str:
+    """Locate the bundled web_static directory containing index.html and
+    leaflet.{js,css}. For PyInstaller runs, _MEIPASS points at the
+    extracted bundle dir; for source runs (this dev path), it's
+    web_static/ next to this file."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "web_static")
+
 
 # ---- Configuration ----------------------------------------------------------
 
@@ -364,10 +377,17 @@ def get_cpu_load() -> tuple[float | None, float | None, float | None]:
 
 # ---- Flask app --------------------------------------------------------------
 
-app = Flask(__name__)
+app = Flask(
+    __name__,
+    static_folder=_static_root(),
+    static_url_path="/static",
+)
 
 
-# Phase A placeholder — Phase B replaces this with the bundled HTML/CSS/JS.
+# Phase A placeholder — kept around as a fallback if web_static/index.html is
+# missing (e.g., dev runs without the full asset bundle). Phase B's index.html
+# is served from disk via `/` below — see index() handler. Production deploys
+# always have the full bundle, so this fallback shouldn't fire.
 _PHASE_A_HTML = """<!DOCTYPE html>
 <html>
 <head>
@@ -444,6 +464,13 @@ _PHASE_A_HTML = """<!DOCTYPE html>
 
 @app.route("/")
 def index():
+    """Serve the bundled Phase B UI (web_static/index.html). Falls back to
+    the Phase A placeholder if the bundle is missing — e.g., running from
+    source without the web_static/ directory present."""
+    bundle_index = os.path.join(_static_root(), "index.html")
+    if os.path.isfile(bundle_index):
+        return app.send_static_file("index.html")
+    log.warning(f"No bundled UI at {bundle_index} — falling back to Phase A placeholder")
     return _PHASE_A_HTML.replace("__VERSION__", FW_VERSION), 200, {
         "Content-Type": "text/html; charset=utf-8",
     }
