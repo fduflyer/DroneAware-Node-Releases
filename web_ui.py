@@ -597,6 +597,7 @@ def api_status():
         "load_15m":    load_15m,
         "sse_clients": broker.subscriber_count(),
         "home":        get_home_location(),  # {lat, lon, source} or null
+        "node_id":     _read_config_env("NODE_ID") or "this-node",
     })
     return jsonify(s)
 

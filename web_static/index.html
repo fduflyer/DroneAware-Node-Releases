@@ -202,6 +202,28 @@
       overflow-y: auto;
       padding: 8px;
     }
+
+    /* Tier sections — LIVE / RECENT / OLDER groups within the sidebar.
+       Mirrors the public droneaware.io/live.html sidebar layout. Each
+       section gets a small header with a colored arrow + tier name +
+       count. Hidden entirely when the count is 0 (no clutter). */
+    .tier-group { margin-bottom: 4px; }
+    .tier-group[hidden] { display: none; }
+    .tier-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 10px 4px 6px;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--text-dim);
+    }
+    .tier-arrow { font-size: 9px; line-height: 1; }
+    .tier-name  { color: var(--text-dim); font-weight: 700; }
+    .tier-sep   { color: var(--text-muted); }
+    .tier-count { color: var(--text-primary); font-weight: 700; }
+    .tier-cards { display: flex; flex-direction: column; }
     .card {
       display: flex;
       align-items: flex-start;
@@ -229,13 +251,48 @@
     }
     .card-thumb svg { width: 28px; height: 28px; }
     .card-body { flex: 1; min-width: 0; }
+    .card-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
     .card-id {
       font-size: 13px;
       font-weight: 700;
-      color: var(--text-primary);
+      color: var(--accent);
+      font-family: ui-monospace, "SF Mono", "Cascadia Mono", monospace;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      flex: 1;
+      min-width: 0;
+    }
+    .card-row-right {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .card-age {
+      font-size: 10px;
+      color: var(--text-dim);
+      white-space: nowrap;
+    }
+    .card-makemodel {
+      margin-top: 4px;
+      font-size: 12px;
+      color: var(--text-primary);
+    }
+    .card-make {
+      color: var(--accent);
+      font-weight: 700;
+    }
+    .card-model { color: var(--text-primary); }
+    .card-stats {
+      margin-top: 4px;
+      font-size: 11px;
+      color: var(--text-dim);
     }
     .card-meta {
       font-size: 11px;
@@ -317,6 +374,25 @@
        wipe out the translate and snap the marker to (0,0) of its
        parent (the top-left corner of the map pane). Keep the wrapper
        transform-free; let the child handle the visual pulse. */
+    /* Operator H-marker (per drone) — small circle at operator_lat/lon
+       with the "H" letter. Colored to match the drone's freshness tier;
+       color is set inline on the host div so currentColor cascades to
+       border and box-shadow. */
+    .op-marker {
+      width: 22px; height: 22px;
+      border-radius: 50%;
+      background: rgba(10, 18, 40, 0.75);
+      border: 1.5px solid currentColor;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      font-weight: 700;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      box-shadow: 0 0 6px currentColor;
+    }
+    [data-theme="day"] .op-marker { background: rgba(255, 255, 255, 0.85); }
+
     .home-pulse, .operator-pulse {
       width: 12px; height: 12px;
       border-radius: 50%;
@@ -639,7 +715,6 @@
         <span class="chip off" data-filter="kind" data-value="test">Test</span>
       </div>
       <div class="sidebar-list" id="sidebar-list">
-        <!-- Cards appear here. Empty state initially. -->
         <div class="empty" id="empty-state">
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
             <path d="M22 2L11 13" stroke="#10b981" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
@@ -647,6 +722,35 @@
           </svg>
           <div class="title">No drones detected</div>
           <div class="sub">Your node is scanning.</div>
+        </div>
+        <!-- Tier sections — cards are sorted into the right bucket by
+             applyFilters(). Each section is hidden when empty. -->
+        <div class="tier-group" id="tier-live">
+          <div class="tier-header">
+            <span class="tier-arrow" style="color: var(--fresh-live);">▲</span>
+            <span class="tier-name">LIVE</span>
+            <span class="tier-sep">·</span>
+            <span class="tier-count" id="count-live">0</span>
+          </div>
+          <div class="tier-cards"></div>
+        </div>
+        <div class="tier-group" id="tier-recent">
+          <div class="tier-header">
+            <span class="tier-arrow" style="color: var(--fresh-recent);">▲</span>
+            <span class="tier-name">RECENT</span>
+            <span class="tier-sep">·</span>
+            <span class="tier-count" id="count-recent">0</span>
+          </div>
+          <div class="tier-cards"></div>
+        </div>
+        <div class="tier-group" id="tier-older">
+          <div class="tier-header">
+            <span class="tier-arrow" style="color: var(--fresh-older);">▲</span>
+            <span class="tier-name">OLDER</span>
+            <span class="tier-sep">·</span>
+            <span class="tier-count" id="count-older">0</span>
+          </div>
+          <div class="tier-cards"></div>
         </div>
       </div>
     </div>
@@ -891,7 +995,7 @@
           entry.polyline = L.polyline(entry.trail, {
             color: f.color,
             weight: 2,
-            opacity: 0.7,
+            opacity: 0.75,
             interactive: false,
           }).addTo(state.map);
         } else {
@@ -899,18 +1003,54 @@
           entry.polyline.setStyle({ color: f.color });
         }
       }
+
+      // Operator location ("H" marker) + dashed connector to the drone,
+      // when the System message has populated operator_lat / operator_lon.
+      // Matches the public droneaware.io/live.html look — each drone gets
+      // its own H badge at the pilot's location, colored to match the
+      // drone's freshness tier. Soft-fails for events lacking operator
+      // data (Basic ID alone, BLE before System message arrives, etc.).
+      const opLat = entry.event.operator_lat;
+      const opLon = entry.event.operator_lon;
+      if (typeof opLat === "number" && typeof opLon === "number") {
+        const opIcon = L.divIcon({
+          className: "",
+          html: `<div class="op-marker" style="color: ${f.color};">H</div>`,
+          iconSize: [22, 22],
+          iconAnchor: [11, 11],
+        });
+        if (!entry.opMarker) {
+          entry.opMarker = L.marker([opLat, opLon], { icon: opIcon, interactive: false })
+            .addTo(state.map);
+        } else {
+          entry.opMarker.setLatLng([opLat, opLon]);
+          entry.opMarker.setIcon(opIcon);
+        }
+        // Dashed connector from drone to operator
+        const connectorLatLngs = [[lat, lon], [opLat, opLon]];
+        if (!entry.connector) {
+          entry.connector = L.polyline(connectorLatLngs, {
+            color: f.color,
+            weight: 1.5,
+            opacity: 0.55,
+            dashArray: "6 4",
+            interactive: false,
+          }).addTo(state.map);
+        } else {
+          entry.connector.setLatLngs(connectorLatLngs);
+          entry.connector.setStyle({ color: f.color });
+        }
+      }
     }
 
     function removeMarker(mac) {
       const entry = state.macs.get(mac);
       if (entry) {
-        if (entry.marker) {
-          state.map.removeLayer(entry.marker);
-          entry.marker = null;
-        }
-        if (entry.polyline) {
-          state.map.removeLayer(entry.polyline);
-          entry.polyline = null;
+        for (const k of ["marker", "polyline", "opMarker", "connector"]) {
+          if (entry[k]) {
+            state.map.removeLayer(entry[k]);
+            entry[k] = null;
+          }
         }
         entry.trail = [];
       }
@@ -948,15 +1088,38 @@
         entry.card = card;
       }
       const id = evt.id || evt.uas_id || mac;
+
+      // Stats row: altitude · speed · node-id. Skip components that don't
+      // have data so we don't render dangling '·' separators.
+      const altFt = metersToFtAGL(evt.alt ?? evt.altitude_geo);
+      const altText = altFt != null ? `${altFt} ft AGL` : null;
+      const spdText = speedLabel(evt.speed);
+      const nodeText = state.nodeId || "this-node";
+      const statsParts = [altText, spdText, nodeText].filter(Boolean);
+      const statsHTML = statsParts.length
+        ? `<div class="card-stats">${statsParts.map(escapeHtml).join(" · ")}</div>`
+        : "";
+
+      // Make/Model row (when server enrichment has populated it).
+      const makeModelHTML = (evt.make || evt.model)
+        ? `<div class="card-makemodel">
+             <span class="card-make">${escapeHtml(evt.make || "Unknown")}</span>
+             ${evt.model ? ` · <span class="card-model">${escapeHtml(evt.model)}</span>` : ""}
+           </div>`
+        : "";
+
       card.innerHTML = `
         <div class="card-thumb" style="color: ${f.color};">${DRONE_SVG}</div>
         <div class="card-body">
-          <div class="card-id mono">${escapeHtml(id)}</div>
-          <div class="card-meta">${escapeHtml(evt.type || "?")} · ${relTime(age)}</div>
-          <div class="card-tags">
-            <span class="freshness-dot" style="color: ${f.color};">${f.label}</span>
-            <span class="radio-tag">${escapeHtml(radio)}</span>
+          <div class="card-row">
+            <div class="card-id mono">${escapeHtml(id)}</div>
+            <div class="card-row-right">
+              <span class="radio-tag">${escapeHtml(radio)}</span>
+              <span class="card-age">${relTime(age)}</span>
+            </div>
           </div>
+          ${makeModelHTML}
+          ${statsHTML}
         </div>
       `;
       return card;
@@ -969,23 +1132,21 @@
 
     function applyFilters() {
       const f = state.filters;
-      const list = document.getElementById("sidebar-list");
       const empty = document.getElementById("empty-state");
+      const tierBuckets = {
+        live:   document.querySelector("#tier-live   .tier-cards"),
+        recent: document.querySelector("#tier-recent .tier-cards"),
+        older:  document.querySelector("#tier-older  .tier-cards"),
+      };
+      const counts = { live: 0, recent: 0, older: 0 };
 
-      // Remove empty state if any visible entries
-      let visibleCount = 0;
       for (const [mac, entry] of state.macs) {
         const evt = entry.event;
         const age = (Date.now() / 1000) - entry.last_seen;
         const tier = freshnessFor(age).tier;
         const radio = (evt.radio || "").toLowerCase();
-        // Normalize radio variants: LocalPublisher emits "wifi_beacon"
-        // (Wi-Fi Beacon frames — what cmd_test uses) and "wifi_nan"
-        // (Wi-Fi NAN action frames — many commercial drones) in addition
-        // to "wifi". Map all wifi_* variants to the "wifi" filter chip;
-        // "ble" stays as "ble"; unknown radios pass through to be filtered
-        // by exact match (won't pass any chip, so they're hidden unless
-        // someone explicitly adds a chip for them).
+        // Normalize radio variants: LocalPublisher emits "wifi_beacon",
+        // "wifi_nan", and "ble" — map wifi_* to "wifi" for filter purposes.
         const radioKind = radio.startsWith("wifi") ? "wifi"
                         : radio === "ble"          ? "ble"
                         :                            radio;
@@ -994,19 +1155,35 @@
         const passFresh = f.freshness.has(tier);
         const passRadio = f.radio.has(radioKind) || (radioKind === "" && f.radio.size);
         const passTest  = f.test || !isTest;
-        const visible   = passFresh && passRadio && passTest;
+        const visible   = passFresh && passRadio && passTest && tierBuckets[tier];
 
         if (visible) {
-          if (entry.card && !entry.card.parentNode) list.appendChild(entry.card);
+          // Move (or insert) the card into the correct tier bucket.
+          if (entry.card && entry.card.parentNode !== tierBuckets[tier]) {
+            tierBuckets[tier].appendChild(entry.card);
+          }
           if (entry.marker) entry.marker.setOpacity(1);
-          visibleCount++;
+          if (entry.opMarker) entry.opMarker.setOpacity(1);
+          if (entry.connector) entry.connector.setStyle({ opacity: 0.55 });
+          if (entry.polyline)  entry.polyline.setStyle({ opacity: 0.75 });
+          counts[tier]++;
         } else {
           if (entry.card && entry.card.parentNode) entry.card.remove();
           if (entry.marker) entry.marker.setOpacity(0);
+          if (entry.opMarker) entry.opMarker.setOpacity(0);
+          if (entry.connector) entry.connector.setStyle({ opacity: 0 });
+          if (entry.polyline)  entry.polyline.setStyle({ opacity: 0 });
         }
       }
-      empty.style.display = visibleCount === 0 ? "flex" : "none";
-      document.getElementById("hdr-count").textContent = visibleCount;
+
+      // Update section counts + hide empty sections.
+      for (const tier of ["live", "recent", "older"]) {
+        document.getElementById(`count-${tier}`).textContent = counts[tier];
+        document.getElementById(`tier-${tier}`).hidden = counts[tier] === 0;
+      }
+      const visibleTotal = counts.live + counts.recent + counts.older;
+      empty.style.display = visibleTotal === 0 ? "flex" : "none";
+      document.getElementById("hdr-count").textContent = visibleTotal;
     }
 
     /* ----- Event handling ----- */
@@ -1093,6 +1270,7 @@
         document.getElementById("stat-events").textContent = s.event_count;
         document.getElementById("stat-uptime").textContent = fmtUptime(s.uptime_s);
         document.getElementById("stat-version").textContent = s.version;
+        if (s.node_id) state.nodeId = s.node_id;
 
         // Home location may change on mobile nodes as the GPS fix moves.
         // Only redraw if the location actually changed (avoids tearing down
