@@ -107,9 +107,14 @@ DEFAULT_BUFFER_MAX_BYTES = int(os.environ.get(
     "DRONEAWARE_LOCAL_BUFFER_MAX_BYTES", str(50_000_000)
 ))
 
-# Maximum event age before pruning. Matches brand guide's "Buffer age —
-# last ~30-60 min from RAM" and the max freshness tier (>30 min fades).
-STALE_AGE_SEC      = 30 * 60
+# Maximum event age before pruning. Extended from the brand guide's
+# ~30-60 min default to 12 hours so quieter nodes still have something
+# on their map after long idle periods (per Dan's request 2026-06-24 —
+# many operators don't have constant drone activity; a 30-min window
+# leaves their map empty most of the time). The byte cap
+# (DRONEAWARE_LOCAL_BUFFER_MAX_BYTES, default 50 MB) still bounds RAM,
+# so this just changes the time-based eviction not the size limit.
+STALE_AGE_SEC      = 12 * 3600
 PRUNE_INTERVAL_SEC = 1.0
 
 # SSE per-client queue depth — slow clients drop events rather than
@@ -160,16 +165,30 @@ class DetectionStore:
 
     def add(self, event: dict) -> bool:
         """Add an event to the store. Returns True if accepted (had a MAC),
-        False if dropped (no MAC — can't index)."""
+        False if dropped (no MAC — can't index).
+
+        Timestamp note: we use the BROADCAST time (event.t — when the
+        feeder captured the packet over the air) as the third tuple
+        element, NOT time.time() at insertion. This matters for replay-
+        at-startup: a 10-hour-old event in the tmpfs ring file should
+        be displayed as 10 hours old, not as 'just arrived'. Without
+        this, restarting web_ui made every old detection look LIVE
+        until the next prune sweep ran (which also used insertion-time
+        and so wouldn't prune them either)."""
         mac = self._mac_of(event)
         if not mac:
             return False
         size = self._event_size(event)
-        now = time.time()
+        # Use event.t (broadcast timestamp) when present; fall back to
+        # current wall clock for events that somehow lack it (shouldn't
+        # happen with LocalPublisher output, but defensive).
+        ts = event.get("t")
+        if not isinstance(ts, (int, float)):
+            ts = time.time()
         with self._lock:
             if mac not in self._by_mac:
                 self._by_mac[mac] = collections.deque()
-            self._by_mac[mac].append((event, size, now))
+            self._by_mac[mac].append((event, size, ts))
             self._total_bytes += size
             self._evict_to_cap_locked()
         return True
@@ -233,10 +252,23 @@ class DetectionStore:
                 _, _, latest_ts = dq[-1]
                 _, _, first_ts = dq[0]
                 merged: dict = {}
+                # Trail: chronological list of unique lat/lon positions
+                # across this MAC's retained events. Capped at the last
+                # 60 unique positions. Lets the frontend reconstruct
+                # the flight-path polyline immediately on snapshot load
+                # — without this, trails are client-only state that
+                # gets lost on web_ui restart or browser reload.
+                trail: list = []
                 for event, _, _ in dq:
                     for k, v in event.items():
                         if v is not None:
                             merged[k] = v
+                    lat = event.get("lat")
+                    lon = event.get("lon")
+                    if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                        pt = [lat, lon]
+                        if not trail or trail[-1] != pt:
+                            trail.append(pt)
                 # Always include the MAC explicitly (the dict key is
                 # authoritative — overwrite whatever was in events)
                 merged["mac"] = mac
@@ -247,6 +279,7 @@ class DetectionStore:
                     "last_seen":    latest_ts,
                     "age_sec":      now - latest_ts,
                     "event_count":  len(dq),
+                    "trail":        trail[-60:],
                 })
             total_events = sum(len(dq) for dq in self._by_mac.values())
             return {

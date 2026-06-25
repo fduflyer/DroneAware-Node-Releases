@@ -794,14 +794,15 @@
 
     // Freshness scale matches the public droneaware.io/live.html — three tiers
     // (< 2 min / < 10 min / > 10 min) so operators see the same color story
-    // on both surfaces. Pruning still happens at 30 min (the brand-guide max
-    // freshness tier — beyond that, fade to gray and remove).
+    // on both surfaces. "Older" tier extended to 12 hours per Dan 2026-06-24
+    // — quieter nodes need something to show even after long idle periods.
+    // Anything beyond 12 hours fades to gray and is pruned.
     const FRESHNESS = [
-      { tier: "live",   maxAge:  120, color: "var(--fresh-live)",   label: "LIVE"   },
-      { tier: "recent", maxAge:  600, color: "var(--fresh-recent)", label: "RECENT" },
-      { tier: "older",  maxAge: 1800, color: "var(--fresh-older)",  label: "OLDER"  },
+      { tier: "live",   maxAge:    120, color: "var(--fresh-live)",   label: "LIVE"   },
+      { tier: "recent", maxAge:    600, color: "var(--fresh-recent)", label: "RECENT" },
+      { tier: "older",  maxAge:  43200, color: "var(--fresh-older)",  label: "OLDER"  },
     ];
-    const STALE_PRUNE_SEC = 1800;
+    const STALE_PRUNE_SEC = 43200;  // 12 hours — matches backend STALE_AGE_SEC
 
     /* ----- State ----- */
     const state = {
@@ -1204,14 +1205,23 @@
     function handleEvent(evt) {
       const mac = evt.mac || evt.source_mac;
       if (!mac) return;
-      const now = Date.now() / 1000;
+      // Use the broadcast timestamp (evt.t — when the feeder captured
+      // the packet) for first_seen/last_seen, NOT Date.now(). Same
+      // reason as the backend fix: replayed-at-startup events arrive
+      // via SSE near-instantly but their real broadcast time may be
+      // much older. Using Date.now() here would make 10-hour-old
+      // events look LIVE.
+      const eventTs = (typeof evt.t === "number") ? evt.t : (Date.now() / 1000);
       let entry = state.macs.get(mac);
       if (!entry) {
-        entry = { event: evt, first_seen: now, last_seen: now, marker: null, card: null };
+        entry = { event: evt, first_seen: eventTs, last_seen: eventTs, marker: null, card: null };
         state.macs.set(mac, entry);
       } else {
         entry.event = mergeNonNull(entry.event, evt);
-        entry.last_seen = now;
+        // Advance last_seen only if this event is newer than what we
+        // already know about — protects against out-of-order arrivals.
+        if (eventTs > entry.last_seen) entry.last_seen = eventTs;
+        if (eventTs < entry.first_seen) entry.first_seen = eventTs;
       }
       updateMarker(mac);
       renderCard(mac);
@@ -1225,7 +1235,12 @@
           event: evt,
           first_seen: m.first_seen,
           last_seen: m.last_seen,
-          marker: null, card: null,
+          // Restore the trail directly from the backend snapshot so the
+          // flight-path polyline appears immediately on load — without
+          // this, trails are client-only state and disappear every web_ui
+          // restart or browser reload.
+          trail: (m.trail || []).slice(),
+          marker: null, card: null, polyline: null, opMarker: null, connector: null,
         };
         state.macs.set(m.mac, entry);
         updateMarker(m.mac);
@@ -1447,16 +1462,22 @@
     function zoomToTrail(mac) {
       // "Show Flight Path" CTA action: zoom the map to fit the drone's
       // entire trail (so you see the whole path, not just current pos).
-      // For drones with no trail yet, just center + zoom on current pos.
+      // For drones with no trail yet, just fly in to the current pos
+      // (smooth flyTo so the action is visually obvious — setView
+      // with animate=true looks like nothing happens if you're already
+      // at the right zoom).
       const entry = state.macs.get(mac);
       if (!entry) return;
       if (entry.trail && entry.trail.length >= 2) {
-        state.map.fitBounds(L.latLngBounds(entry.trail), {
+        state.map.flyToBounds(L.latLngBounds(entry.trail), {
           padding: [60, 60],
           maxZoom: 16,
+          duration: 0.7,
         });
       } else if (entry.event && (entry.event.lat != null && entry.event.lon != null)) {
-        state.map.setView([entry.event.lat, entry.event.lon], 15, { animate: true });
+        state.map.flyTo([entry.event.lat, entry.event.lon], 16, {
+          duration: 0.7,
+        });
       }
     }
 
