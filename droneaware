@@ -125,6 +125,26 @@ EOF
         info "Added v1.3.0 forwarder buffer options to config.env"
     fi
 
+    # v1.4.0 — Local Web UI port (added to config.env so operators can
+    # change the listening port without re-running install). install.sh
+    # writes this directly when the operator opts into the Web UI at
+    # install time; this migrate block is the catch-up for the
+    # install-webui post-install opt-in path, or for nodes that simply
+    # update from v1.3.x without the Web UI installed (harmless — env
+    # var is just there if the operator later installs the Web UI).
+    if ! grep -q '^DRONEAWARE_WEB_PORT=' "$cfg"; then
+        [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+        cat >> "$cfg" <<'EOF'
+
+# ─── Local Web UI port (added by droneaware update for v1.4.0+) ───
+# Port the optional local Web UI listens on. Operators can change this
+# if 5000 conflicts with another service (Grafana etc.). Only takes
+# effect when the Web UI is installed (sudo droneaware install-webui).
+DRONEAWARE_WEB_PORT=5000
+EOF
+        info "Added v1.4.0 Web UI port option to config.env"
+    fi
+
     # Future release migration blocks go here.
     # Pattern:
     #   if ! grep -q '^NEW_FIELD=' "$cfg"; then
@@ -178,8 +198,25 @@ cmd_update() {
     chmod +x /tmp/da_ble_feeder /tmp/da_wifi_feeder
     info "Downloaded ${LATEST}."
 
+    # If the operator has opted into the local Web UI (presence of the
+    # systemd unit is the signal), also fetch the updated web_ui binary.
+    # Download failures here log a warning and continue — the feeder
+    # update path must always succeed independently.
+    local update_webui=0
+    if [[ -f /etc/systemd/system/droneaware-web.service ]]; then
+        echo "  Downloading web_ui (Local Web UI)..."
+        if curl -fsSL --retry 3 "${BASE}/web_ui" -o /tmp/da_web_ui; then
+            chmod +x /tmp/da_web_ui
+            update_webui=1
+        else
+            warn "web_ui download failed — feeder update will continue."
+            warn "Web UI binary will remain at the previously installed version."
+        fi
+    fi
+
     echo "  Stopping services..."
     systemctl stop droneaware-ble droneaware-wifi 2>/dev/null || true
+    [[ "$update_webui" == "1" ]] && systemctl stop droneaware-web 2>/dev/null || true
 
     # Also update the droneaware CLI itself
     curl -fsSL --retry 3 "${BASE}/droneaware" -o /tmp/da_cli || true
@@ -189,6 +226,14 @@ cmd_update() {
 
     cp /tmp/da_ble_feeder  "${INSTALL_DIR}/ble_feeder"
     cp /tmp/da_wifi_feeder "${INSTALL_DIR}/wifi_feeder"
+    if [[ "$update_webui" == "1" ]]; then
+        cp /tmp/da_web_ui "${INSTALL_DIR}/web_ui"
+        ln -sf "${INSTALL_DIR}/web_ui" /usr/local/bin/web_ui 2>/dev/null || true
+        # Keep ownership consistent with install.sh (User=droneaware in
+        # the systemd unit). Soft-fail if the droneaware user is somehow
+        # missing — service start will surface the real problem.
+        chown droneaware:droneaware "${INSTALL_DIR}/web_ui" 2>/dev/null || true
+    fi
     # Update the droneaware CLI itself. Must use atomic rename (mv) instead
     # of in-place cp, because bash is currently READING from this same
     # script file. In-place overwrite would shift bash's file pointer to
@@ -200,7 +245,7 @@ cmd_update() {
         chmod +x /usr/local/bin/droneaware.new
         mv /usr/local/bin/droneaware.new /usr/local/bin/droneaware
     fi
-    rm -f /tmp/da_ble_feeder /tmp/da_wifi_feeder /tmp/da_cli
+    rm -f /tmp/da_ble_feeder /tmp/da_wifi_feeder /tmp/da_web_ui /tmp/da_cli
     echo "$LATEST" > "$VERSION_FILE"
 
     # Nodes installed before v1.0.19 have service files pointing to /usr/local/bin/.
@@ -245,6 +290,11 @@ cmd_update() {
     else
         warn "No Bluetooth adapter detected — skipping droneaware-ble"
     fi
+    # Restart Web UI too if the unit is installed (operator opted in
+    # at some point — either at install or later via install-webui).
+    if [[ -f /etc/systemd/system/droneaware-web.service ]]; then
+        systemctl start droneaware-web 2>/dev/null || warn "droneaware-web failed to start (run: journalctl -u droneaware-web)"
+    fi
     info "Services restarted."
     echo ""
     info "Update complete — now running ${LATEST}."
@@ -270,8 +320,31 @@ cmd_status() {
             echo -e "  ${RED}●${NC}  ${svc}  (${state})"
         fi
     done
+    # Web UI status + URL when the optional service is installed.
+    if [[ -f /etc/systemd/system/droneaware-web.service ]]; then
+        local web_state
+        web_state=$(systemctl is-active droneaware-web 2>/dev/null)
+        if [[ "$web_state" == "active" ]]; then
+            echo -e "  ${GREEN}●${NC}  droneaware-web  (running)"
+        else
+            echo -e "  ${RED}●${NC}  droneaware-web  (${web_state})"
+        fi
+    fi
 
     echo ""
+
+    # Web UI URL — shown when service is active and bound, so operators
+    # know how to reach it from another device on the LAN.
+    if systemctl is-active --quiet droneaware-web 2>/dev/null; then
+        local web_port web_ip
+        web_port=$(grep '^DRONEAWARE_WEB_PORT=' "${INSTALL_DIR}/config.env" 2>/dev/null | cut -d= -f2)
+        [[ -z "$web_port" ]] && web_port="5000"
+        web_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        [[ -z "$web_ip" ]] && web_ip="<pi-ip>"
+        echo "  Web UI   : http://${web_ip}:${web_port}/"
+        echo ""
+    fi
+
     # GPS state — read tmpfs state file written by wifi_feeder. Soft-fails
     # if file missing (feeder not yet started, or pre-v1.3.0 binary).
     python3 - <<'PYEOF'
@@ -670,11 +743,124 @@ PYJSON
     echo ""
 }
 
+cmd_install_webui() {
+    require_root "install-webui"
+    echo ""
+    echo -e "${BOLD}DroneAware Local Web UI — Install${NC}"
+    echo ""
+
+    # The Web UI requires an enrolled node. The token at
+    # /etc/droneaware/token is the enrollment artifact — if it's missing,
+    # install.sh has not completed successfully and there's no point
+    # installing a viewer for a non-functional detection pipeline.
+    if [[ ! -f /etc/droneaware/token ]]; then
+        fatal "No node credential found at /etc/droneaware/token.
+       The Web UI requires an enrolled node. Run sudo bash install.sh first
+       to register your account and enroll this node, then re-run
+       install-webui to add the local Web UI."
+    fi
+
+    # If the service is already installed, refresh-only mode.
+    if [[ -f /etc/systemd/system/droneaware-web.service ]] && [[ -x "${INSTALL_DIR}/web_ui" ]]; then
+        info "Web UI is already installed."
+        local web_ip
+        web_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        [[ -z "$web_ip" ]] && web_ip="<pi-ip>"
+        echo "       Status:   $(systemctl is-active droneaware-web 2>/dev/null || echo 'unknown')"
+        echo "       URL:      http://${web_ip}:5000/"
+        echo "       To update the binary, run: sudo droneaware update"
+        echo ""
+        return 0
+    fi
+
+    # RAM check — same logic as install.sh, but operator already has a
+    # running node so they probably know what they're doing if RAM is tight.
+    local total_ram_mb
+    total_ram_mb=$(awk '/MemTotal/ { print int($2/1024) }' /proc/meminfo)
+    if [ "$total_ram_mb" -lt 700 ]; then
+        warn "Limited RAM detected (${total_ram_mb} MB)"
+        echo "    The local Web UI uses ~80 MB which may push this hardware into"
+        echo "    swap. Recommended to skip the Web UI on Pi Zero / Pi 1 / Pi 2 tier."
+        echo ""
+        read -rp "  Install anyway? [y/N] " yn </dev/tty
+        [[ "$yn" =~ ^[Yy] ]] || { info "Skipped."; return 0; }
+    fi
+
+    # Resolve the BINARY_VERSION currently installed (operator's running
+    # firmware) so the web_ui binary we download matches.
+    local current_version
+    current_version=$(cat "$VERSION_FILE" 2>/dev/null)
+    [[ -z "$current_version" ]] && fatal "Cannot determine installed firmware version (missing ${VERSION_FILE})."
+
+    local base_url="https://github.com/${GITHUB_REPO}/releases/download/${current_version}"
+    echo "  Downloading web_ui (${current_version})..."
+    if ! curl -fsSL --retry 3 "${base_url}/web_ui" -o /tmp/da_web_ui; then
+        fatal "Web UI binary download failed. Check your internet connection and try again."
+    fi
+    chmod +x /tmp/da_web_ui
+    cp /tmp/da_web_ui "${INSTALL_DIR}/web_ui"
+    rm -f /tmp/da_web_ui
+    ln -sf "${INSTALL_DIR}/web_ui" /usr/local/bin/web_ui 2>/dev/null || true
+
+    echo "  Installing systemd unit..."
+    if ! curl -fsSL --retry 3 \
+            "${base_url}/droneaware-web.service" \
+            -o /etc/systemd/system/droneaware-web.service; then
+        rm -f "${INSTALL_DIR}/web_ui" /usr/local/bin/web_ui
+        fatal "droneaware-web.service download failed. Web UI binary cleaned up."
+    fi
+
+    # Ensure droneaware user exists for User=droneaware in the unit.
+    if ! getent passwd droneaware >/dev/null; then
+        useradd --system --shell /bin/false --no-create-home droneaware 2>/dev/null || true
+        info "Created droneaware system user for Web UI."
+    fi
+    chown droneaware:droneaware "${INSTALL_DIR}/web_ui" 2>/dev/null || true
+
+    # Bump LocalPublisher buffer + add port (idempotent additions).
+    if grep -q '^DRONEAWARE_LOCAL_BUFFER_MAX_BYTES=' "${INSTALL_DIR}/config.env"; then
+        sed -i 's/^DRONEAWARE_LOCAL_BUFFER_MAX_BYTES=.*/DRONEAWARE_LOCAL_BUFFER_MAX_BYTES=50000000/' \
+            "${INSTALL_DIR}/config.env"
+    else
+        echo "DRONEAWARE_LOCAL_BUFFER_MAX_BYTES=50000000" >> "${INSTALL_DIR}/config.env"
+    fi
+    if ! grep -q '^DRONEAWARE_WEB_PORT=' "${INSTALL_DIR}/config.env"; then
+        echo "DRONEAWARE_WEB_PORT=5000" >> "${INSTALL_DIR}/config.env"
+    fi
+
+    # Restart feeders if needed to pick up the buffer bump, then start
+    # the Web UI immediately (this is the post-install path — operator
+    # has a running node, no reason to force a reboot).
+    systemctl daemon-reload
+    systemctl restart droneaware-wifi 2>/dev/null || true
+    systemctl restart droneaware-ble  2>/dev/null || true
+    systemctl enable  droneaware-web > /dev/null 2>&1
+    systemctl start   droneaware-web
+
+    sleep 2
+    if systemctl is-active --quiet droneaware-web; then
+        local web_ip
+        web_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        [[ -z "$web_ip" ]] && web_ip="<pi-ip>"
+        info "Web UI installed and running."
+        echo ""
+        echo "  URL:  http://${web_ip}:5000/"
+        echo ""
+        echo "  Available on your LAN. Connect from any device on the same"
+        echo "  network to view live detections."
+        echo ""
+    else
+        warn "Web UI installed but service did not start cleanly."
+        warn "Check: sudo journalctl -u droneaware-web -n 30"
+    fi
+}
+
 case "$1" in
-    update)  cmd_update ;;
-    status)  cmd_status ;;
-    logs)    cmd_logs "$@" ;;
-    test)    cmd_test "$@" ;;
+    update)         cmd_update ;;
+    status)         cmd_status ;;
+    logs)           cmd_logs "$@" ;;
+    test)           cmd_test "$@" ;;
+    install-webui)  cmd_install_webui ;;
     __migrate)
         # Internal subcommand used by cmd_update for post-install config
         # migration. The double-underscore prefix is a convention signaling
@@ -694,11 +880,12 @@ case "$1" in
         echo "  Usage: sudo droneaware <command>"
         echo ""
         echo "  Commands:"
-        echo "    update       Download and install the latest firmware"
-        echo "    status       Show service status and firmware version"
-        echo "    logs         Tail live logs  (wifi by default, or: droneaware logs ble)"
-        echo "    test         Transmit a 60-second test flight and verify detection"
+        echo "    update          Download and install the latest firmware"
+        echo "    status          Show service status and firmware version"
+        echo "    logs            Tail live logs  (wifi by default, or: droneaware logs ble)"
+        echo "    test            Transmit a 60-second test flight and verify detection"
         echo "    test --dry-run  Check rate-limit availability without transmitting"
+        echo "    install-webui   Install the optional local Web UI (LAN dashboard)"
         echo ""
         ;;
 esac
