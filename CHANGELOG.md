@@ -79,6 +79,23 @@ email alerts still trigger, public map presence still works.
   install, the installer logs a warning and continues. The base install
   always completes; the Web UI is purely additive.
 
+- **Local HTTP API** — three read-only endpoints exposed by the Web UI
+  service on the same port (default 5000), making detection data
+  accessible to Home Assistant, Node-RED, Homebridge, and any HTTP-aware
+  automation tool:
+  - `GET /api/detections` — JSON snapshot of all currently tracked
+    drones with merged ASTM fields, trail of last 60 positions per
+    drone, first/last seen, age.
+  - `GET /api/status` — node telemetry (version, uptime, CPU temp,
+    load average, SSE client count, home location, node_id, ring
+    buffer stats).
+  - `GET /events` — Server-Sent Events stream, real-time push of each
+    new detection. Sub-second latency, no polling.
+
+  Read-only by design (no POST/PUT). LAN-accessible on `0.0.0.0:5000`
+  with no authentication — treat as a trusted-LAN service. See README
+  "Local / Offline Use" for full response shape and consumer examples.
+
 - **`sudo droneaware install-webui`** — new CLI subcommand for
   post-install opt-in. Operators who declined the Web UI at install time
   can add it later without re-running install.sh. Requires the node to
