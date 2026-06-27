@@ -1,0 +1,23 @@
+[Unit]
+Description=DroneAware Local Web UI
+Documentation=https://github.com/fduflyer/DroneAware-Node-Releases
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/droneaware/config.env
+ExecStart=/opt/droneaware/web_ui
+Restart=on-failure
+RestartSec=5
+User=droneaware
+Group=droneaware
+
+# The Web UI reads only world-readable tmpfs files written by the feeders
+# (/run/droneaware/detections.jsonl, /run/droneaware/gps_state.json) and
+# serves HTTP on an unprivileged port. Runs as the unprivileged droneaware
+# user — config.env env vars are loaded via EnvironmentFile regardless of
+# the file's chmod 600 permissions.
+
+[Install]
+WantedBy=multi-user.target
