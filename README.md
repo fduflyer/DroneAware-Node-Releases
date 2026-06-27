@@ -233,6 +233,129 @@ cleared on reboot). You can tail it directly:
 tail -f /run/droneaware/detections.jsonl
 ```
 
+**HTTP API (v1.4.0+):**
+If you installed the optional Web UI, the same service exposes a small
+read-only JSON / SSE API on port 5000 — often easier to consume than
+UDP for Home Assistant, Node-RED, Homebridge, or any HTTP-aware
+automation tool. Unlike UDP, you also get a full snapshot of recent
+state on connect.
+
+**Endpoints** (all `GET`, no auth, LAN-accessible):
+
+| Endpoint | Returns |
+|---|---|
+| `/api/detections` | JSON snapshot of all currently tracked drones |
+| `/api/status` | Node telemetry (version, uptime, load, home location, buffer stats) |
+| `/events` | Server-Sent Events stream — real-time push of each new detection |
+
+---
+
+### `/api/detections` response shape
+
+Top-level object:
+
+| Field | Type | Notes |
+|---|---|---|
+| `macs` | array | One entry per tracked drone (see below) |
+| `total_events` | int | Raw events held across all drones |
+| `mac_count` | int | Number of currently tracked drones |
+| `buffer_bytes` | int | Ring buffer bytes in use |
+| `buffer_max` | int | Configured max bytes |
+| `buffer_pct` | int | 0–100 |
+| `snapshot_at` | float | Unix seconds at snapshot build time |
+
+Each `macs[]` entry:
+
+| Field | Type | Notes |
+|---|---|---|
+| `mac` | string | MAC address, e.g. `"fa:0b:bc:12:34:56"` |
+| `latest` | object | Merged ASTM fields (table below) |
+| `first_seen` | float | Unix seconds — first event for this drone |
+| `last_seen` | float | Unix seconds — most recent event |
+| `age_sec` | float | Seconds since `last_seen` |
+| `event_count` | int | Raw events held for this drone |
+| `trail` | array of `[lat, lon]` | Last 60 unique positions, chronological |
+
+The `latest` object — any field may be `null` until the relevant ASTM
+message type is received:
+
+| Field | Type | Range / units | Source |
+|---|---|---|---|
+| `t` | float | Unix seconds | Broadcast time of most recent event |
+| `id` | string | hex | UAS-ID — from Basic ID message |
+| `lat` | float | [-90, 90] degrees, WGS84 | Location/Vector message |
+| `lon` | float | [-180, 180] degrees, WGS84 | Location/Vector message |
+| `alt` | float | meters, geodetic (WGS84) | Location/Vector message |
+| `speed` | float | m/s, ground speed | Location/Vector message |
+| `hdg` | float | [0, 360) degrees, compass | Location/Vector message |
+| `rssi` | int | dBm (negative, e.g. `-68`) | Capture-time signal strength |
+| `radio` | string | `"wifi_beacon"`, `"wifi_nan"`, `"ble"` | Capture transport |
+| `type` | string | ASTM message type | e.g. `"Basic ID"`, `"Location/Vector"`, `"System"` |
+| `operator_lat` | float | [-90, 90] degrees, WGS84 | System message |
+| `operator_lon` | float | [-180, 180] degrees, WGS84 | System message |
+
+---
+
+### `/api/status` response shape
+
+| Field | Type | Notes |
+|---|---|---|
+| `version` | string | Node firmware version, e.g. `"1.4.0"` |
+| `uptime_s` | int | Seconds since web_ui started |
+| `cpu_temp_c` | float \| null | Pi CPU temperature; null on non-Pi hardware |
+| `load_1m` / `load_5m` / `load_15m` | float \| null | Unix load averages |
+| `sse_clients` | int | Active SSE subscribers |
+| `home` | object \| null | `{"lat": float, "lon": float, "source": string}` |
+| `node_id` | string | `NODE_ID` from config.env |
+| `mac_count` | int | Currently tracked drones |
+| `event_count` | int | Total events in buffer |
+| `buffer_bytes` / `buffer_max` / `buffer_pct` | int | Ring buffer stats |
+
+---
+
+### `/events` SSE stream
+
+Each message is a single decoded detection — the same wire format as a
+UDP broadcast record (see UDP section above). Same field types as the
+`latest` object table; aggregate fields (`mac_count`, `event_count`, etc.)
+do not appear on individual events. SSE framing is:
+
+```
+data: {"t":1745000000.0,"mac":"fa:0b:bc:12:34:56","radio":"wifi_beacon","rssi":-68,"type":"Location/Vector","lat":40.7128,"lon":-74.0060,"alt":120.5,"speed":8.25,"hdg":270.0,"id":null}\n
+\n
+```
+
+Keep-alive comment (`: keep-alive`) is emitted every 15 seconds of
+silence to prevent proxies/browsers from timing out the connection.
+
+---
+
+### Examples
+
+**Snapshot:**
+```bash
+curl http://<pi-ip>:5000/api/detections | jq .
+```
+
+**Live stream in Python:**
+```python
+import requests, json
+r = requests.get("http://<pi-ip>:5000/events", stream=True)
+for line in r.iter_lines():
+    if line.startswith(b"data: "):
+        print(json.loads(line[6:]))
+```
+
+**Or simply tail it from the shell:**
+```bash
+curl -N http://<pi-ip>:5000/events
+```
+
+The API is read-only — there are no POST/PUT endpoints, so it cannot
+be used to inject detections or change node configuration. Bound to
+`0.0.0.0:5000` with no authentication; treat it like any other LAN
+service.
+
 > **Privacy note:** Your node's precise GPS coordinates are never publicly
 > visible. The DroneAware map displays only a 2-mile detection ring around your
 > node — your exact location is kept private.

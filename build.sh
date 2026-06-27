@@ -1,11 +1,11 @@
 #!/bin/bash
 # DroneAware Node — Binary Build Script
 #
-# Compiles ble_feeder.py and wifi_feeder.py into self-contained ARM64
-# executables using PyInstaller. Run this on a Raspberry Pi 4 (64-bit OS)
-# or any aarch64 Linux machine.
+# Compiles ble_feeder.py, wifi_feeder.py, and web_ui.py into self-contained
+# ARM64 executables using PyInstaller. Run this on a Raspberry Pi 4 (64-bit
+# OS) or any aarch64 Linux machine.
 #
-# Output: dist/ble_feeder  and  dist/wifi_feeder
+# Output: dist/ble_feeder, dist/wifi_feeder, dist/web_ui
 #
 # After building, copy the binaries to your server's static file host:
 #   scp dist/ble_feeder dist/wifi_feeder user@droneaware.io:/srv/node/
@@ -46,7 +46,8 @@ python3 -m venv "$BUILD_VENV"
     "bleak==2.1.1" \
     "requests==2.32.5" \
     "charset-normalizer==3.4.6" \
-    "pyserial==3.5"
+    "pyserial==3.5" \
+    "flask==3.1.1"
 
 echo "      Done."
 
@@ -83,6 +84,22 @@ echo "      Building wifi_feeder..."
     "$SCRIPT_DIR/wifi_feeder.py" \
     > /dev/null 2>&1
 
+# web_ui — bundles web_static/ (index.html, leaflet.js, leaflet.css) into
+# the binary via --add-data so a single PyInstaller --onefile artifact
+# contains every runtime asset. web_ui.py's _static_root() reads
+# sys._MEIPASS to find the bundled dir at runtime.
+echo "      Building web_ui..."
+"$BUILD_VENV/bin/pyinstaller" \
+    --onefile \
+    --distpath "$DIST_DIR" \
+    --workpath "$SCRIPT_DIR/.build_work/web" \
+    --specpath "$SCRIPT_DIR/.build_specs" \
+    --name web_ui \
+    --add-data "$SCRIPT_DIR/web_static:web_static" \
+    --hidden-import flask \
+    "$SCRIPT_DIR/web_ui.py" \
+    > /dev/null 2>&1
+
 echo "      Done."
 
 # ---------------------------------------------------------------------------
@@ -90,7 +107,7 @@ echo "      Done."
 # ---------------------------------------------------------------------------
 echo "[3/3] Verifying output..."
 
-for binary in ble_feeder wifi_feeder; do
+for binary in ble_feeder wifi_feeder web_ui; do
     path="$DIST_DIR/$binary"
     if [[ -f "$path" ]]; then
         size=$(du -sh "$path" | cut -f1)
@@ -108,12 +125,13 @@ echo ""
 echo " Binaries are in: $DIST_DIR/"
 echo ""
 echo " Deploy to your server:"
-echo "   scp $DIST_DIR/ble_feeder  $DIST_DIR/wifi_feeder \\"
+echo "   scp $DIST_DIR/ble_feeder $DIST_DIR/wifi_feeder $DIST_DIR/web_ui \\"
 echo "       user@droneaware.io:/srv/node/"
 echo ""
 echo " Test locally on this Pi:"
 echo "   sudo $DIST_DIR/ble_feeder --help"
 echo "   sudo $DIST_DIR/wifi_feeder --help"
+echo "   sudo $DIST_DIR/web_ui --help"
 echo "=================================================="
 echo ""
 

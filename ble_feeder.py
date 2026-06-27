@@ -453,23 +453,72 @@ _LOCAL_ALIASED = {"message_type", "raw_hex", "latitude", "longitude",
 # Tunable independently of the Forwarder cap via DRONEAWARE_LOCAL_BUFFER_MAX_BYTES.
 DEFAULT_LOCAL_BUFFER_MAX_BYTES = 10_000_000
 
+# Comma-separated list of "host:port" pairs the LocalPublisher sends
+# each detection to via UDP. Default is the LAN broadcast address; set
+# to one or more unicast targets to forward to specific listeners (e.g.,
+# a Docker container that can't receive broadcasts on the host network).
+# Multiple targets are sent in order; per-target failures are silent so
+# one unreachable consumer doesn't break the rest.
+DEFAULT_LOCAL_UDP_TARGETS = "255.255.255.255:9999"
+
+
+def _parse_udp_targets(spec: str) -> list[tuple[str, int]]:
+    """Parse 'host:port,host:port,...' into [(host, port), ...].
+    Skips empty / malformed entries with a log warning."""
+    out: list[tuple[str, int]] = []
+    for entry in spec.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" in entry:
+            host, port_str = entry.rsplit(":", 1)
+            try:
+                out.append((host, int(port_str)))
+            except ValueError:
+                log.warning(f"[LocalPublisher] Invalid UDP target '{entry}' — skipping")
+        else:
+            # Bare host with no port — assume the default 9999.
+            out.append((entry, 9999))
+    return out
+
 
 class LocalPublisher:
     """
-    Writes decoded detections to a tmpfs ring buffer and UDP LAN broadcast.
+    Writes decoded detections to a tmpfs ring buffer and UDP forwarder.
 
     Buffer: /run/droneaware/detections.jsonl  (RAM only — gone on reboot,
             zero SD card wear). Bounded by DRONEAWARE_LOCAL_BUFFER_MAX_BYTES
             (default 10 MB), FIFO drop-oldest on overflow.
-    UDP:    255.255.255.255:9999 — any device on the LAN can listen.
+    UDP:    Targets list from DRONEAWARE_LOCAL_UDP_TARGETS (default
+            255.255.255.255:9999 — broadcast to any device on the LAN).
+            Operators with consumers that can't receive broadcasts (Docker
+            container with non-host networking, point-to-point listeners,
+            etc.) can set explicit unicast targets like
+            "192.168.1.100:5555" or mix broadcast + unicast with
+            "255.255.255.255:9999,192.168.1.100:5555".
     """
     BUFFER_PATH = "/run/droneaware/detections.jsonl"
-    UDP_PORT    = 9999
 
     def __init__(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # SO_BROADCAST stays set regardless of target — harmless for
+        # unicast sends, required for the default broadcast target.
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         os.makedirs(os.path.dirname(self.BUFFER_PATH), exist_ok=True)
+
+        # Parse UDP targets — empty env var falls back to the default
+        # broadcast address so existing operators see zero behavior change.
+        targets_spec = os.environ.get("DRONEAWARE_LOCAL_UDP_TARGETS", "").strip()
+        if not targets_spec:
+            targets_spec = DEFAULT_LOCAL_UDP_TARGETS
+        self._udp_targets = _parse_udp_targets(targets_spec)
+        if not self._udp_targets:
+            log.warning(f"[LocalPublisher] No valid UDP targets in '{targets_spec}' "
+                        f"— falling back to {DEFAULT_LOCAL_UDP_TARGETS}")
+            self._udp_targets = _parse_udp_targets(DEFAULT_LOCAL_UDP_TARGETS)
+        log.info(f"[LocalPublisher] UDP targets: "
+                 f"{', '.join(f'{h}:{p}' for h, p in self._udp_targets)}")
+
         self.max_buffer_bytes = int(os.environ.get(
             "DRONEAWARE_LOCAL_BUFFER_MAX_BYTES",
             str(DEFAULT_LOCAL_BUFFER_MAX_BYTES)
@@ -507,10 +556,14 @@ class LocalPublisher:
         line = json.dumps(record, separators=(',', ':'))
         line_with_nl = line + '\n'
 
-        try:
-            self._sock.sendto(line_with_nl.encode(), ('255.255.255.255', self.UDP_PORT))
-        except Exception:
-            pass
+        # Send to all configured UDP targets (default: broadcast to
+        # 255.255.255.255:9999). Per-target sendto failures are silent.
+        data = line_with_nl.encode()
+        for host, port in self._udp_targets:
+            try:
+                self._sock.sendto(data, (host, port))
+            except OSError:
+                pass
 
         try:
             with open(self.BUFFER_PATH, 'a') as f:

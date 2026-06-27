@@ -10,6 +10,161 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.4.0] — Unreleased
+
+Local Web UI milestone. First new user-facing service since the feeders
+themselves. Optional, opt-in at install time (default Y on Pi 3+ class
+hardware, default N on Pi Zero 2 W class due to RAM constraints). The
+node works fully without it — detections still forward to droneaware.io,
+email alerts still trigger, public map presence still works.
+
+### Added
+
+- **Local Web UI** — operator-facing detection viewer running on the Pi
+  itself, available to anyone on the LAN at `http://<pi-ip>:5000/`. Works
+  even when the Pi has no internet connectivity to droneaware.io. New
+  `web_ui` PyInstaller binary (~13 MB) + new `droneaware-web.service`
+  systemd unit.
+
+  **What it shows:**
+  - Dark-themed Leaflet map with CartoDB Dark Matter tiles (matches the
+    public droneaware.io/live.html style)
+  - Paper-airplane drone markers colored by freshness tier
+    (cyan < 2 min, orange < 10 min, red > 10 min — same scale as the
+    public site)
+  - Per-drone flight-path polylines (last 60 unique positions)
+  - Per-drone "H" operator markers + dashed connector lines
+    (when ASTM System messages provide operator location)
+  - Sidebar with detection cards grouped by freshness tier
+    (LIVE / RECENT / OLDER)
+  - Filter chips for freshness and radio type
+  - Detail popup per drone with full ASTM field set (Type/Altitude/
+    Speed/Heading/RSSI/Channel/first-seen/last-seen)
+  - 10 concentric distance rings at 1-mile intervals centered on the
+    node's home location (config.env NODE_LAT/NODE_LON for static
+    nodes, current GPS fix for mobile nodes)
+  - Theme toggle (dark default, day mode override, persisted to
+    localStorage)
+
+  **Architecture:**
+  - Single PyInstaller binary bundles Flask + Leaflet + all static
+    assets. No CDN dependencies at runtime; the only external requests
+    are CartoDB tile loads in the browser (operators on air-gapped
+    networks see a blank tile background but everything else works).
+  - Tails `/run/droneaware/detections.jsonl` (the LocalPublisher tmpfs
+    ring file) for new events every 500 ms. No UDP listener — Linux
+    doesn't reliably loopback-deliver UDP broadcasts to listeners on the
+    same machine as the sender.
+  - In-memory ring per MAC, byte-bounded at
+    `DRONEAWARE_LOCAL_BUFFER_MAX_BYTES` (default 50 MB, bumped from the
+    10 MB LocalPublisher default when Web UI is installed). Events
+    older than 12 hours pruned.
+  - Server-Sent Events (`/events` endpoint) push new detections to
+    connected browsers — no polling, sub-second latency from feeder
+    capture to browser display.
+  - Backend snapshot includes the per-MAC trail array so flight-path
+    polylines render immediately on browser load instead of building
+    up empty over time.
+
+  **Install-time prompt:**
+  ```
+  ─── Optional: Local Web UI ───
+  ...
+  Install local Web UI? [Y/n]
+  ```
+  RAM-aware: defaults to N on hardware with less than 700 MB total RAM
+  (Pi Zero / Pi 1 / Pi 2 class). Otherwise defaults to Y.
+
+  **Failure-safe:** if the binary or service file download fails during
+  install, the installer logs a warning and continues. The base install
+  always completes; the Web UI is purely additive.
+
+- **Local HTTP API** — three read-only endpoints exposed by the Web UI
+  service on the same port (default 5000), making detection data
+  accessible to Home Assistant, Node-RED, Homebridge, and any HTTP-aware
+  automation tool:
+  - `GET /api/detections` — JSON snapshot of all currently tracked
+    drones with merged ASTM fields, trail of last 60 positions per
+    drone, first/last seen, age.
+  - `GET /api/status` — node telemetry (version, uptime, CPU temp,
+    load average, SSE client count, home location, node_id, ring
+    buffer stats).
+  - `GET /events` — Server-Sent Events stream, real-time push of each
+    new detection. Sub-second latency, no polling.
+
+  Read-only by design (no POST/PUT). LAN-accessible on `0.0.0.0:5000`
+  with no authentication — treat as a trusted-LAN service. See README
+  "Local / Offline Use" for full response shape and consumer examples.
+
+- **`sudo droneaware install-webui`** — new CLI subcommand for
+  post-install opt-in. Operators who declined the Web UI at install time
+  can add it later without re-running install.sh. Requires the node to
+  already be enrolled (token at `/etc/droneaware/token`). Installs the
+  same components as the install-time path but starts the service
+  immediately (no reboot required on an already-running node).
+
+  Visible in `sudo droneaware help` output alongside `update`/`status`/
+  `test`. install.sh's decline path explicitly mentions the subcommand
+  so operators know it exists.
+
+- **`sudo droneaware status` shows Web UI URL** when the service is
+  active:
+  ```
+  Web UI   : http://192.168.68.187:5000/
+  ```
+
+- **`sudo droneaware update` updates the Web UI binary** alongside the
+  feeders when the service is installed. Download failure for `web_ui`
+  is non-fatal — feeder update completes normally and the Web UI keeps
+  running on the previous version.
+
+- **New config.env keys** (added via migrate_config_env on update, or
+  written directly by install.sh / install-webui at first install):
+  - `DRONEAWARE_WEB_PORT=5000` — port the Web UI listens on. Change to
+    avoid conflict with other services (Grafana etc.).
+  - `DRONEAWARE_LOCAL_UDP_TARGETS=` — comma-separated list of
+    `host:port` pairs the feeders forward each detection JSON to via
+    UDP. Default (empty) sends to `255.255.255.255:9999` (LAN
+    broadcast). Operators with consumers that can't receive broadcasts
+    (Docker containers, point-to-point listeners behind NAT, airport
+    tower displays, etc.) can override with explicit unicast targets:
+    `DRONEAWARE_LOCAL_UDP_TARGETS=192.168.1.100:5555`. Mix broadcast +
+    unicast with `255.255.255.255:9999,192.168.1.100:5555`. Per-target
+    send failures are silent — one unreachable consumer won't disrupt
+    delivery to others.
+  - When Web UI is installed: `DRONEAWARE_LOCAL_BUFFER_MAX_BYTES` is
+    bumped from 10000000 (10 MB default) to 50000000 (50 MB) so the
+    LocalPublisher tmpfs ring holds more recent history for the Web
+    UI to display.
+
+### Architecture notes
+
+- **systemd unit runs as `droneaware` user**, not root. Web UI is
+  network-facing (even if LAN-only) and binds an unprivileged port —
+  least-privilege reduces blast radius of any future vulnerability.
+  install.sh creates the droneaware system user if missing (most Pis
+  already have it as the imager-created user).
+
+- **No server-side accommodation needed.** The Web UI is a pure local
+  consumer of LocalPublisher data. Wire format unchanged, heartbeat
+  schema unchanged, no new API endpoints.
+
+### Known limitations (deferred to v1.4.x)
+
+These items are out of scope for v1.4.0 and will land in follow-up
+releases as their server-side dependencies become available:
+
+- **Drone make/model enrichment** — sidebar cards and detail popups
+  show UAS-ID only, not make/model. Server-side enrichment endpoint
+  needs to be defined before the Web UI can query it.
+- **Drone thumbnail images** — same blocker.
+- **Search bar** for drone models — blocked on enrichment.
+- **Time-slider scrubbing** — design discussion needed.
+- **Marker labels** on the map — blocked on enrichment (UAS-ID hex
+  strings aren't useful labels).
+
+---
+
 ## [1.3.0.2] — Unreleased
 
 Follow-up hotfix to v1.3.0.1 — addresses a secondary UX bug that v1.3.0.1's
