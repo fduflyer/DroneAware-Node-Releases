@@ -105,6 +105,16 @@ email alerts still trigger, public map presence still works.
   written directly by install.sh / install-webui at first install):
   - `DRONEAWARE_WEB_PORT=5000` — port the Web UI listens on. Change to
     avoid conflict with other services (Grafana etc.).
+  - `DRONEAWARE_LOCAL_UDP_TARGETS=` — comma-separated list of
+    `host:port` pairs the feeders forward each detection JSON to via
+    UDP. Default (empty) sends to `255.255.255.255:9999` (LAN
+    broadcast). Operators with consumers that can't receive broadcasts
+    (Docker containers, point-to-point listeners behind NAT, airport
+    tower displays, etc.) can override with explicit unicast targets:
+    `DRONEAWARE_LOCAL_UDP_TARGETS=192.168.1.100:5555`. Mix broadcast +
+    unicast with `255.255.255.255:9999,192.168.1.100:5555`. Per-target
+    send failures are silent — one unreachable consumer won't disrupt
+    delivery to others.
   - When Web UI is installed: `DRONEAWARE_LOCAL_BUFFER_MAX_BYTES` is
     bumped from 10000000 (10 MB default) to 50000000 (50 MB) so the
     LocalPublisher tmpfs ring holds more recent history for the Web

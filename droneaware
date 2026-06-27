@@ -145,6 +145,33 @@ EOF
         info "Added v1.4.0 Web UI port option to config.env"
     fi
 
+    # v1.4.0 — LocalPublisher UDP targets. Default unchanged (broadcast
+    # to 255.255.255.255:9999), but operators with consumers that can't
+    # receive broadcasts (Docker containers, point-to-point listeners
+    # behind NAT, etc.) can override with one or more unicast targets.
+    # Format: "host:port,host:port" — empty value falls back to default.
+    if ! grep -q '^DRONEAWARE_LOCAL_UDP_TARGETS=' "$cfg"; then
+        [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+        cat >> "$cfg" <<'EOF'
+
+# ─── LocalPublisher UDP targets (added by droneaware update for v1.4.0+) ───
+# Comma-separated list of "host:port" pairs the feeders forward each
+# detection JSON to. Empty value (default) sends to 255.255.255.255:9999
+# (LAN broadcast — any device on your network can listen). Set to one
+# or more unicast targets for consumers that can't receive broadcasts,
+# e.g.:
+#   DRONEAWARE_LOCAL_UDP_TARGETS=192.168.1.100:5555
+# Or mix broadcast + unicast to keep LAN consumers AND add a specific
+# target (a Docker container's exposed port, an airport tower display,
+# etc.):
+#   DRONEAWARE_LOCAL_UDP_TARGETS=255.255.255.255:9999,192.168.1.100:5555
+# Per-target send failures are silent — one unreachable consumer won't
+# disrupt delivery to others.
+DRONEAWARE_LOCAL_UDP_TARGETS=
+EOF
+        info "Added v1.4.0 LocalPublisher UDP targets option to config.env"
+    fi
+
     # Future release migration blocks go here.
     # Pattern:
     #   if ! grep -q '^NEW_FIELD=' "$cfg"; then
