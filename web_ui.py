@@ -69,11 +69,16 @@ from flask import Flask, Response, jsonify, request
 # ---- Version stamping (CI overwrites .ver file at build time) ---------------
 
 def _read_fw_version(fallback: str) -> str:
-    """Read embedded version file (written by CI build). Falls back to dev
-    value when running from source."""
+    """Read embedded version file (written by build.sh into web_static/
+    before the PyInstaller --add-data call). Falls back to dev value
+    when running from source without a stamped .ver. The file lives
+    inside web_static/ because that's the directory PyInstaller bundles
+    via --add-data web_static:web_static — at runtime it resolves to
+    _MEIPASS/web_static/.ver."""
     try:
         ver_path = os.path.join(
-            getattr(sys, "_MEIPASS", os.path.dirname(__file__)), ".ver",
+            getattr(sys, "_MEIPASS", os.path.dirname(__file__)),
+            "web_static", ".ver",
         )
         with open(ver_path) as f:
             return f.read().strip()
