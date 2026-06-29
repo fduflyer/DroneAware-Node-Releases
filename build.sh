@@ -84,8 +84,20 @@ echo "      Building wifi_feeder..."
     "$SCRIPT_DIR/wifi_feeder.py" \
     > /dev/null 2>&1
 
-# web_ui — bundles web_static/ (index.html, leaflet.js, leaflet.css) into
-# the binary via --add-data so a single PyInstaller --onefile artifact
+# Stamp the version into web_static/.ver so the web_ui binary
+# self-reports the correct firmware version at runtime. web_ui.py's
+# _read_fw_version() reads this file from sys._MEIPASS. Without this,
+# /api/status.version falls through to the hardcoded fallback in
+# web_ui.py and lies about the build. VERSION is set by the CI workflow
+# (inputs.version, prefixed with "v" by convention); falls back to "dev"
+# for local builds without a version export.
+VERSION="${VERSION:-dev}"
+[[ "$VERSION" =~ ^v ]] || VERSION="v$VERSION"
+echo "$VERSION" > "$SCRIPT_DIR/web_static/.ver"
+echo "      Stamped web_static/.ver with: $VERSION"
+
+# web_ui — bundles web_static/ (index.html, leaflet.js, leaflet.css, .ver)
+# into the binary via --add-data so a single PyInstaller --onefile artifact
 # contains every runtime asset. web_ui.py's _static_root() reads
 # sys._MEIPASS to find the bundled dir at runtime.
 echo "      Building web_ui..."

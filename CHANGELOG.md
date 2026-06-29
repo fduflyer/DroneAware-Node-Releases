@@ -10,6 +10,66 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.4.2] — Unreleased
+
+Three small follow-ups to v1.4.0/v1.4.1, all surfaced during NJ007
+field deployment. One is a render-perf fix (operator-visible), two
+are quality-of-life cleanups for operator config + build telemetry.
+No new features, no schema changes, no breaking changes.
+
+### Fixed
+
+- **Web UI no longer lags at close zoom.** The Local Web UI's
+  10 concentric distance rings around home are drawn as Leaflet vector
+  overlays. At street-level zoom (>~14), the 10-mile ring is ~27,000
+  pixels across — most of it off-screen, but the default SVG renderer
+  keeps the full path in the DOM and re-projects it on every pan.
+  Measured: 329 ms of browser Presentation delay per pointer event
+  (Chrome DevTools INP) at the affected zoom range. Two changes:
+  - Switch Leaflet to the Canvas renderer (`preferCanvas: true` on
+    the map). Canvas culls off-screen vector geometry far more
+    aggressively than SVG. Also benefits the dashed
+    operator→drone connectors and the flight-path polyline when
+    toggled on. HTML divIcon markers (drone, operator H, home
+    pulse) are unaffected — they're DOM elements, not overlays.
+  - Hide `state.homeLayer` (rings + ring labels + home pulse marker)
+    when zoom > 14. At street-level zoom the rings provide no useful
+    range context anyway. Layer membership is preserved, so panning
+    or zooming back out restores everything instantly.
+
+- **`web_ui` now self-reports the correct firmware version.** The
+  binary's `_read_fw_version()` was looking for a `.ver` file
+  embedded by CI at build time, but `build.sh` never wrote that
+  file — so every release fell through to the hardcoded fallback
+  string in `web_ui.py`. As a result, both v1.4.0 and v1.4.1 self-
+  reported as `v1.4.0` in `/api/status.version` and the UI footer,
+  even though the actual content was correct. `build.sh` now writes
+  `web_static/.ver` from the `VERSION` env var (passed in by
+  `.github/workflows/build.yaml` from `inputs.version`) before the
+  web_ui PyInstaller call. PyInstaller's existing `--add-data`
+  picks it up automatically; no Python changes needed. `.gitignore`
+  updated to skip the build artifact. (Note: this fixes the version
+  string display going forward — installed v1.4.0/v1.4.1 binaries
+  will continue to misreport. `sudo droneaware status` was always
+  correct on those nodes — it reads `/opt/droneaware/version`, not
+  the binary's embedded value.)
+
+- **`sudo droneaware install-webui` now adds every release-level
+  config.env key**, not just the two Web-UI-specific ones. The
+  post-install opt-in path previously wrote only
+  `DRONEAWARE_LOCAL_BUFFER_MAX_BYTES` and `DRONEAWARE_WEB_PORT`
+  directly, skipping `migrate_config_env`. Operators who landed on
+  the Web UI via `install-webui` (rather than via the regular
+  `droneaware update` flow) missed `DRONEAWARE_LOCAL_UDP_TARGETS` and
+  its comment block. Functionally nothing was broken — the feeders
+  default to broadcasting to `255.255.255.255:9999` when the var is
+  unset — but the key wasn't documented in config.env so operators
+  couldn't discover the override. `cmd_install_webui` now calls
+  `migrate_config_env` at the end of its work (idempotent, harmless
+  if migrate already ran via `cmd_update`).
+
+---
+
 ## [1.4.1] — Unreleased
 
 Local Web UI polish — four UX fixes from initial field testing of

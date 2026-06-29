@@ -26,6 +26,7 @@ jobs:
           commands: |
             apt-get update
             apt-get install -y python3 python3-pip python3-venv
+            export VERSION="${{ inputs.version }}"
             bash ./build.sh
       - uses: actions/upload-artifact@v7
         with:
