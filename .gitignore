@@ -4,6 +4,9 @@ dist/
 # Build environment
 .build_venv/
 
+# CI-stamped version file (written by build.sh, embedded in web_ui binary)
+web_static/.ver
+
 # Python
 __pycache__/
 *.pyc

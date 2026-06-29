@@ -860,16 +860,43 @@
       }).addTo(state.map);
     }
 
+    // Above this zoom level, the distance rings + labels are hidden from
+    // the map. At street-level zoom (z > 14) the closest ring is the size
+    // of the viewport and the 10-mile ring is ~27,000 pixels across —
+    // expensive for the renderer to keep around (measured 329ms of
+    // Presentation delay per pointer event before this fix) and useless
+    // as range context for the operator. Threshold picked empirically;
+    // tune downward if low-end clients still struggle at z=14.
+    const HOME_LAYER_HIDE_ZOOM = 14;
+
     function initMap() {
       const m = L.map("map", {
         center: [40.0, -98.0],     // continental US default; recentered on home if available
         zoom: 5,
         zoomControl: true,
         attributionControl: true,
+        // Canvas renderer culls off-screen vector geometry far more
+        // aggressively than SVG. Critical for the 10 large distance
+        // rings and the dashed operator→drone connectors. HTML divIcon
+        // markers (drone, operator H, home pulse) are unaffected —
+        // they're DOM elements, not vector overlays.
+        preferCanvas: true,
       });
       state.map = m;
       state.homeLayer = L.layerGroup().addTo(m);   // holds home marker + rings
       applyMapTheme();
+
+      // Hide the home layer (rings + labels + home marker) at street-level
+      // zoom. Layer membership is preserved so re-attaching restores
+      // everything instantly when the operator zooms back out.
+      m.on("zoomend", () => {
+        const z = m.getZoom();
+        if (z > HOME_LAYER_HIDE_ZOOM) {
+          if (m.hasLayer(state.homeLayer)) m.removeLayer(state.homeLayer);
+        } else {
+          if (!m.hasLayer(state.homeLayer)) state.homeLayer.addTo(m);
+        }
+      });
     }
 
     /* ----- Home location + distance rings ----- */

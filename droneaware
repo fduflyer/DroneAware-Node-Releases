@@ -855,6 +855,15 @@ cmd_install_webui() {
         echo "DRONEAWARE_WEB_PORT=5000" >> "${INSTALL_DIR}/config.env"
     fi
 
+    # Run the full release migration so operators who land here via the
+    # post-install opt-in path (not cmd_update) still get every config
+    # key the current release introduces — including
+    # DRONEAWARE_LOCAL_UDP_TARGETS, which is feeder-side, not Web-UI-
+    # specific, and so isn't covered by the two direct writes above.
+    # migrate_config_env is idempotent (every block grep-gated), so the
+    # extra call is harmless when migrate already ran via cmd_update.
+    migrate_config_env
+
     # Restart feeders if needed to pick up the buffer bump, then start
     # the Web UI immediately (this is the post-install path — operator
     # has a running node, no reason to force a reboot).
