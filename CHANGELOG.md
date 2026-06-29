@@ -10,6 +10,55 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.4.1] — Unreleased
+
+Local Web UI polish — four UX fixes from initial field testing of
+v1.4.0 on a deployed node. Frontend-only changes (web_static/
+index.html); no changes to web_ui.py, the feeders, the droneaware
+CLI, or config.env. Operators with the Web UI installed pick up the
+fixes via `sudo droneaware update` (which redownloads the web_ui
+binary with the embedded static bundle), followed by
+`sudo systemctl restart droneaware-web`.
+
+### Fixed
+
+- **Day-mode now swaps the map basemap too.** Clicking the theme
+  toggle previously flipped the UI chrome (sidebar, status bar,
+  popup) to light colors but left the Leaflet map on CartoDB Dark
+  Matter, leaving a jarring light/dark mismatch. The map now uses
+  CartoDB Positron in day mode and Dark Matter in dark mode. Theme
+  switch is instantaneous; no page reload required.
+
+- **Sidebar drone cards now sort newest-first.** Previously the list
+  was in MAC-insertion order (effectively oldest-detected at the
+  top). Cards now sort by `last_seen` descending within each
+  freshness tier (LIVE / RECENT / OLDER), so the most recent
+  broadcast surfaces first. Re-sort happens on every refresh — a
+  drone that just emitted a new broadcast jumps to the top of its
+  tier.
+
+- **Drone popup's "Detection Details" panel stays open when
+  expanded** (renamed from "Specs" per operator feedback).
+  Previously the popup's HTML was replaced on every event update for
+  the selected drone, which closed any open `<details>` panel
+  mid-read and detached the click handler from the Show Flight Path
+  button. Popup content is no longer re-rendered on live updates;
+  fresh data is available by closing and reopening the popup. Map
+  marker position + tier color continue to update in real time, and
+  the sidebar card always shows live data.
+
+- **Flight path polyline is now opt-in per drone.** Previously every
+  tracked drone's full trail (up to 60 positions) rendered
+  automatically on the map, cluttering the view. The default view
+  now shows only the operator H markers and the dashed connector
+  from operator to drone. The "Show Flight Path" button in the
+  drone popup toggles the polyline on/off; the button label updates
+  to "Hide Flight Path" while shown. Trail data is still tracked
+  continuously, so the polyline appears with full history the moment
+  the user toggles it on.
+
+---
+
 ## [1.4.0] — Unreleased
 
 Local Web UI milestone. First new user-facing service since the feeders
