@@ -806,7 +806,7 @@
 
     /* ----- State ----- */
     const state = {
-      macs: new Map(),               // mac -> { event, first_seen, last_seen, marker, card, trail, polyline }
+      macs: new Map(),               // mac -> { event, first_seen, last_seen, marker, card, trail, polyline, showTrail, opMarker, connector }
       filters: {
         freshness: new Set(["live", "recent", "older"]),
         radio:     new Set(["wifi", "ble"]),
@@ -842,6 +842,24 @@
     }
 
     /* ----- Map init ----- */
+    // Tile layer URLs per theme. CartoDB Dark Matter is the dark-mode
+    // (brand-default) basemap; CartoDB Positron is its day-mode sibling.
+    const TILE_URLS = {
+      dark: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+      day:  "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+    };
+
+    function applyMapTheme() {
+      const t = document.documentElement.dataset.theme || "dark";
+      const url = TILE_URLS[t] || TILE_URLS.dark;
+      if (state.tileLayer) state.map.removeLayer(state.tileLayer);
+      state.tileLayer = L.tileLayer(url, {
+        attribution: '&copy; OpenStreetMap &copy; CARTO',
+        subdomains: "abcd",
+        maxZoom: 19,
+      }).addTo(state.map);
+    }
+
     function initMap() {
       const m = L.map("map", {
         center: [40.0, -98.0],     // continental US default; recentered on home if available
@@ -849,13 +867,9 @@
         zoomControl: true,
         attributionControl: true,
       });
-      L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
-        attribution: '&copy; OpenStreetMap &copy; CARTO',
-        subdomains: "abcd",
-        maxZoom: 19,
-      }).addTo(m);
       state.map = m;
       state.homeLayer = L.layerGroup().addTo(m);   // holds home marker + rings
+      applyMapTheme();
     }
 
     /* ----- Home location + distance rings ----- */
@@ -971,39 +985,38 @@
           autoPanPadding: [40, 60],
         });
         // Wire the popup CTA button after it's rendered into the DOM.
+        // Toggles the flight-path polyline on/off; label tracks state.
+        // We keep the popup open after toggling so the user can flip it
+        // back without re-clicking the marker.
         entry.marker.on("popupopen", (e) => {
           const root = e.popup.getElement();
           if (!root) return;
           const cta = root.querySelector(".da-popup-cta");
-          if (cta) cta.addEventListener("click", () => {
-            entry.marker.closePopup();
-            zoomToTrail(mac);
+          if (!cta) return;
+          cta.textContent = entry.showTrail ? "Hide Flight Path" : "Show Flight Path";
+          cta.addEventListener("click", () => {
+            toggleTrail(mac);
+            cta.textContent = entry.showTrail ? "Hide Flight Path" : "Show Flight Path";
           });
         });
       } else {
         entry.marker.setLatLng([lat, lon]);
         entry.marker.setIcon(icon);
-        // If the popup is open, refresh its content so live updates show.
-        if (entry.marker.isPopupOpen()) {
-          entry.marker.setPopupContent(buildPopupHTML(mac));
-        }
+        // Intentionally do NOT setPopupContent on live updates. Replacing
+        // popup HTML while the user is interacting with it collapses the
+        // open Detection Details panel and detaches the Show Flight Path
+        // button's click handler. Users get fresh popup data by closing
+        // and reopening; live data continues to update in the sidebar
+        // card and on the map marker (position + tier color) regardless.
       }
 
-      // Maintain a position history; render as a polyline trail.
+      // Track position history for the flight-path overlay, but only
+      // render it on-map when the user has explicitly requested it via
+      // the "Show Flight Path" button in the drone popup. The trail
+      // array stays current either way, so the polyline appears with
+      // full history the moment the user toggles it on.
       appendTrail(entry, lat, lon);
-      if (entry.trail.length >= 2) {
-        if (!entry.polyline) {
-          entry.polyline = L.polyline(entry.trail, {
-            color: f.color,
-            weight: 2,
-            opacity: 0.75,
-            interactive: false,
-          }).addTo(state.map);
-        } else {
-          entry.polyline.setLatLngs(entry.trail);
-          entry.polyline.setStyle({ color: f.color });
-        }
-      }
+      if (entry.showTrail) renderTrailPolyline(entry, f.color);
 
       // Operator location ("H" marker) + dashed connector to the drone,
       // when the System message has populated operator_lat / operator_lon.
@@ -1141,7 +1154,15 @@
       };
       const counts = { live: 0, recent: 0, older: 0 };
 
-      for (const [mac, entry] of state.macs) {
+      // Sort by last_seen DESC so newest detections appear at the top
+      // of each tier group. We always reappend visible cards below;
+      // appendChild moves the element to the end of its parent, so
+      // iterating newest→oldest and appending in turn yields top-to-
+      // bottom order: newest first, oldest last.
+      const sorted = [...state.macs.entries()].sort(
+        (a, b) => b[1].last_seen - a[1].last_seen
+      );
+      for (const [mac, entry] of sorted) {
         const evt = entry.event;
         const age = (Date.now() / 1000) - entry.last_seen;
         const tier = freshnessFor(age).tier;
@@ -1159,10 +1180,10 @@
         const visible   = passFresh && passRadio && passTest && tierBuckets[tier];
 
         if (visible) {
-          // Move (or insert) the card into the correct tier bucket.
-          if (entry.card && entry.card.parentNode !== tierBuckets[tier]) {
-            tierBuckets[tier].appendChild(entry.card);
-          }
+          // Always reappend so the sort order (set above) is reflected
+          // in the DOM. appendChild moves an existing node rather than
+          // duplicating it, so this is cheap even when nothing changes.
+          if (entry.card) tierBuckets[tier].appendChild(entry.card);
           if (entry.marker) entry.marker.setOpacity(1);
           if (entry.opMarker) entry.opMarker.setOpacity(1);
           if (entry.connector) entry.connector.setStyle({ opacity: 0.55 });
@@ -1427,7 +1448,7 @@
           </div>
           <button class="da-popup-cta">Show Flight Path</button>
           <details class="da-popup-specs">
-            <summary>Specs</summary>
+            <summary>Detection Details</summary>
             <div class="da-popup-specs-body">
               <span class="k">Radio</span><span class="v">${escapeHtml(radioTxt)}</span>
               <span class="k">Channel</span><span class="v">${evt.channel ?? "—"}</span>
@@ -1459,13 +1480,51 @@
       state.map.closePopup();
     }
 
+    function renderTrailPolyline(entry, color) {
+      if (!entry.trail || entry.trail.length < 2) return;
+      if (!entry.polyline) {
+        entry.polyline = L.polyline(entry.trail, {
+          color, weight: 2, opacity: 0.75, interactive: false,
+        }).addTo(state.map);
+      } else {
+        entry.polyline.setLatLngs(entry.trail);
+        entry.polyline.setStyle({ color });
+      }
+    }
+
+    function removeTrailPolyline(entry) {
+      if (entry.polyline) {
+        state.map.removeLayer(entry.polyline);
+        entry.polyline = null;
+      }
+    }
+
+    function toggleTrail(mac) {
+      // Flip a per-drone showTrail flag. When turning on, render the
+      // polyline immediately (using freshness-appropriate color) and
+      // pan/zoom the map to fit the full trail. When turning off,
+      // remove the polyline from the map. State persists per-MAC for
+      // the life of the session — re-opening the popup shows the
+      // correct button label.
+      const entry = state.macs.get(mac);
+      if (!entry) return;
+      entry.showTrail = !entry.showTrail;
+      if (entry.showTrail) {
+        const age = (Date.now() / 1000) - entry.last_seen;
+        const f = freshnessFor(age);
+        renderTrailPolyline(entry, f.color);
+        zoomToTrail(mac);
+      } else {
+        removeTrailPolyline(entry);
+      }
+    }
+
     function zoomToTrail(mac) {
-      // "Show Flight Path" CTA action: zoom the map to fit the drone's
-      // entire trail (so you see the whole path, not just current pos).
-      // For drones with no trail yet, just fly in to the current pos
-      // (smooth flyTo so the action is visually obvious — setView
-      // with animate=true looks like nothing happens if you're already
-      // at the right zoom).
+      // Zoom the map to fit the drone's entire trail (so you see the
+      // whole path, not just current pos). For drones with no trail
+      // yet, fly in to the current pos (smooth flyTo so the action is
+      // visually obvious — setView with animate=true looks like
+      // nothing happens if you're already at the right zoom).
       const entry = state.macs.get(mac);
       if (!entry) return;
       if (entry.trail && entry.trail.length >= 2) {
@@ -1491,6 +1550,7 @@
       const next = cur === "dark" ? "day" : "dark";
       document.documentElement.dataset.theme = next;
       localStorage.setItem("da_theme", next);
+      applyMapTheme();
     }
 
     /* ----- Filter chip wiring ----- */
