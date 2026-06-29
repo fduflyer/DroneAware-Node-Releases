@@ -792,6 +792,133 @@ enroll_node() {
 }
 
 # ---------------------------------------------------------------------------
+# === Optional Web UI start ===
+# 10.5. Optional: install the local Web UI
+# ---------------------------------------------------------------------------
+# Strictly additive step. If the operator declines, install_webui() returns
+# without touching anything. If they accept, the web_ui binary and its
+# systemd unit get installed; failures here log a warning and continue
+# (the base install must always succeed). Inserted after enroll_node so
+# the web_ui binary download is gated on successful enrollment.
+install_webui() {
+    heading "Optional: Local Web UI"
+    echo "  DroneAware can run a local detection viewer on this Pi, available"
+    echo "  to anyone on your LAN at  http://<pi-ip>:5000/"
+    echo ""
+    echo "  This is OPTIONAL. Your node will work fully without it:"
+    echo "    ✓ Detections forwarded to droneaware.io"
+    echo "    ✓ Email alerts via the dashboard"
+    echo "    ✓ Public map presence (if enrolled as public)"
+    echo "    ✓ LAN broadcast on UDP/9999 (for nc -luk 9999 and similar)"
+    echo ""
+    echo "  The local Web UI adds:"
+    echo "    • Map view of live + recent detections from this node"
+    echo "    • Works without internet connectivity to droneaware.io"
+    echo "    • ~80 MB RAM use total (50 MB detection buffer + ~30 MB process)"
+    echo "    • Listens on port 5000 (configurable in config.env)"
+    echo ""
+
+    # RAM-aware default. Pi Zero 2 W class (< 700 MB) → default N with
+    # explicit opt-in; everything else → default Y.
+    local total_ram_mb
+    total_ram_mb=$(awk '/MemTotal/ { print int($2/1024) }' /proc/meminfo)
+    local default_choice="y"
+    if [ "$total_ram_mb" -lt 700 ]; then
+        warn "Limited RAM detected (${total_ram_mb} MB)"
+        echo "    The local Web UI uses ~80 MB which may push this hardware into"
+        echo "    swap (slower SD card writes, shorter SD lifespan). Recommended"
+        echo "    to skip the Web UI on this Pi tier."
+        echo ""
+        default_choice="n"
+    fi
+
+    local webui_yn
+    if [[ "$default_choice" == "y" ]]; then
+        read -rp "  Install local Web UI? [Y/n] " webui_yn </dev/tty
+        webui_yn=${webui_yn:-Y}
+    else
+        read -rp "  Install local Web UI anyway? [y/N] " webui_yn </dev/tty
+        webui_yn=${webui_yn:-N}
+    fi
+
+    if [[ ! "$webui_yn" =~ ^[Yy] ]]; then
+        info "Skipping local Web UI."
+        echo "       You can install it any time later by running:"
+        echo "         sudo droneaware install-webui"
+        echo ""
+        return 0
+    fi
+
+    # --- Operator accepted: install web_ui binary + service ---
+    local base_url="https://github.com/${GITHUB_REPO}/releases/download/${BINARY_VERSION}"
+    local local_root
+    local_root="$(dirname "${LOCAL_DIST}")"
+
+    echo "    Downloading web_ui binary..."
+    if [[ "$LOCAL_INSTALL" == "1" ]]; then
+        cp "${LOCAL_DIST}/web_ui" "${INSTALL_DIR}/web_ui" 2>/dev/null \
+            || { warn "Web UI binary not found in local dist — skipping Web UI install."; return 0; }
+    else
+        if ! curl -fsSL --retry 3 "${base_url}/web_ui" -o "${INSTALL_DIR}/web_ui"; then
+            warn "Web UI binary download failed — skipping Web UI install."
+            warn "You can retry later with: sudo droneaware install-webui"
+            return 0
+        fi
+    fi
+    chmod +x "${INSTALL_DIR}/web_ui"
+    ln -sf "${INSTALL_DIR}/web_ui" /usr/local/bin/web_ui 2>/dev/null || true
+    info "web_ui binary → ${INSTALL_DIR}/web_ui"
+
+    echo "    Installing systemd unit..."
+    if [[ "$LOCAL_INSTALL" == "1" ]]; then
+        cp "${local_root}/droneaware-web.service" /etc/systemd/system/droneaware-web.service
+    else
+        if ! curl -fsSL --retry 3 \
+                "${base_url}/droneaware-web.service" \
+                -o /etc/systemd/system/droneaware-web.service; then
+            warn "droneaware-web.service download failed — skipping Web UI install."
+            rm -f "${INSTALL_DIR}/web_ui" /usr/local/bin/web_ui
+            return 0
+        fi
+    fi
+
+    # Ensure droneaware user exists for User=droneaware in the unit.
+    # The Pi OS imager typically creates a 'droneaware' user during initial
+    # setup, but operators who picked a different username need it created
+    # as a system user for the unprivileged web_ui process.
+    if ! getent passwd droneaware >/dev/null; then
+        useradd --system --shell /bin/false --no-create-home droneaware 2>/dev/null || true
+        info "Created droneaware system user for Web UI."
+    fi
+    chown droneaware:droneaware "${INSTALL_DIR}/web_ui" 2>/dev/null || true
+
+    # Bump LocalPublisher buffer to match the Web UI's 50 MB cap; add
+    # DRONEAWARE_WEB_PORT if not already present.
+    if grep -q '^DRONEAWARE_LOCAL_BUFFER_MAX_BYTES=' "${INSTALL_DIR}/config.env"; then
+        sed -i 's/^DRONEAWARE_LOCAL_BUFFER_MAX_BYTES=.*/DRONEAWARE_LOCAL_BUFFER_MAX_BYTES=50000000/' \
+            "${INSTALL_DIR}/config.env"
+    else
+        echo "DRONEAWARE_LOCAL_BUFFER_MAX_BYTES=50000000" >> "${INSTALL_DIR}/config.env"
+    fi
+    if ! grep -q '^DRONEAWARE_WEB_PORT=' "${INSTALL_DIR}/config.env"; then
+        echo "DRONEAWARE_WEB_PORT=5000" >> "${INSTALL_DIR}/config.env"
+    fi
+
+    systemctl daemon-reload
+    systemctl enable droneaware-web > /dev/null 2>&1
+    # NOTE: do NOT start the service at install time — operator is going to
+    # reboot for the feeders anyway. Web UI starts on next boot alongside
+    # the feeders (consistent with feeder install pattern). The
+    # `sudo droneaware install-webui` post-install path DOES start
+    # immediately since the node is already running.
+    info "droneaware-web service installed and enabled."
+
+    WEB_UI_INSTALLED=1
+    return 0
+}
+# === Optional Web UI end ===
+
+# ---------------------------------------------------------------------------
 # 11. Print summary
 # ---------------------------------------------------------------------------
 print_summary() {
@@ -808,6 +935,15 @@ print_summary() {
     echo  "║  Reboot now to start your feeders:  sudo reboot now               ║"
     echo  "║  After reboot, services start automatically on every boot.         ║"
     echo  "║  To view logs:  journalctl -u droneaware-ble -f                    ║"
+    if [[ "${WEB_UI_INSTALLED:-0}" == "1" ]]; then
+        local pi_ip
+        pi_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        [[ -z "$pi_ip" ]] && pi_ip="<pi-ip>"
+        echo  "╠══════════════════════════════════════════════════════════════════════╣"
+        printf "║  Local Web UI:  http://%-45s║\n" "${pi_ip}:5000/"
+        echo  "║  Available on your LAN after reboot. View live detections          ║"
+        echo  "║  without internet connectivity to droneaware.io.                   ║"
+    fi
     echo  "╠══════════════════════════════════════════════════════════════════════╣"
     echo  "║  NOTE: On first boot your Pi may reboot once automatically to      ║"
     echo  "║  configure the Bluetooth adapter. This is normal — wait 30         ║"
@@ -831,4 +967,5 @@ download_binaries
 install_services
 write_config
 enroll_node
+install_webui
 print_summary

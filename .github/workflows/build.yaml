@@ -57,23 +57,27 @@ jobs:
           subject-path: |
             ${{ steps.download.outputs.download-path }}/ble_feeder
             ${{ steps.download.outputs.download-path }}/wifi_feeder
+            ${{ steps.download.outputs.download-path }}/web_ui
             install.sh
             droneaware
             droneaware-bt-select
             droneaware-bt-select.service
             droneaware-ble.service
             droneaware-wifi.service
+            droneaware-web.service
       - name: Create Release
         run: |
           [[ "$VERSION" =~ ^v ]] || VERSION="v$VERSION"
           gh release create "${VERSION}" "${DL_PATH}/ble_feeder" \
             "${DL_PATH}/wifi_feeder" \
+            "${DL_PATH}/web_ui" \
             install.sh \
             droneaware \
             droneaware-bt-select \
             droneaware-bt-select.service \
             droneaware-ble.service \
             droneaware-wifi.service \
+            droneaware-web.service \
             --generate-notes
         env:
           VERSION: ${{ inputs.version }}
@@ -94,9 +98,10 @@ jobs:
             echo 'Verify downloaded files with `sha256sum -c` against this list:'
             echo ""
             echo '```'
-            for f in ble_feeder wifi_feeder install.sh droneaware \
+            for f in ble_feeder wifi_feeder web_ui install.sh droneaware \
                      droneaware-bt-select droneaware-bt-select.service \
-                     droneaware-ble.service droneaware-wifi.service; do
+                     droneaware-ble.service droneaware-wifi.service \
+                     droneaware-web.service; do
               src="${DL_PATH}/${f}"
               [[ -f "$src" ]] || src="${f}"
               sha=$(sha256sum "$src" | awk '{print $1}')

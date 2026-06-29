@@ -1,0 +1,1548 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#0A1228">
+  <title>DroneAware Local Viewer</title>
+
+  <!-- Bundled Leaflet (no CDN at runtime per brand guide) -->
+  <link rel="stylesheet" href="/static/leaflet.css">
+
+  <!-- Brand mark favicon (paper airplane, green #10b981) — inlined as data URI
+       so the browser tab icon works without an additional asset request. -->
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' fill='transparent'/%3E%3Cpath d='M22 2L11 13' stroke='%2310b981' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M22 2L15 22L11 13L2 9L22 2Z' stroke='%2310b981' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E">
+
+  <style>
+    /* =========================================================================
+       Color tokens — dark mode default, [data-theme="day"] override.
+       Brand-mark green (#10b981) is reserved for the logo only; cyan
+       (#00E5FF) is the accent for links / focus / selected state / .io.
+       ========================================================================= */
+    :root {
+      --bg-primary:    #0A1228;
+      --bg-surface:    #0F1B3A;
+      --bg-elevated:   #142450;
+      --border:        #1E3A6E;
+      --border-hover:  #2E5AA8;
+      --text-primary:  #E4ECFA;
+      --text-dim:      #94A3B8;
+      --text-muted:    #64748B;
+      --accent:        #00E5FF;
+      --brand:         #10b981;
+      /* Freshness scale — matches public droneaware.io/live.html */
+      --fresh-live:    #00E5FF;            /* < 2 min — cyan with glow */
+      --fresh-recent:  #FB923C;            /* < 10 min — orange */
+      --fresh-older:   #F87171;            /* > 10 min — red */
+      --fresh-gray:    rgb(107,114,128);   /* > 30 min — pruned */
+      --status-ok:     #10B981;
+      --status-warn:   #FB923C;
+      --status-error:  #F87171;
+      --status-idle:   #64748B;
+    }
+    [data-theme="day"] {
+      --bg-primary:    #F7FAFD;
+      --bg-surface:    #FFFFFF;
+      --bg-elevated:   #F1F5F9;
+      --border:        #CBD5E1;
+      --border-hover:  #94A3B8;
+      --text-primary:  #0F172A;
+      --text-dim:      #475569;
+      --text-muted:    #94A3B8;
+      --accent:        #0BA5D9;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter",
+                   Roboto, Helvetica, Arial, sans-serif;
+      font-size: 13px;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      overflow: hidden;
+    }
+
+    .mono {
+      font-family: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono",
+                   Consolas, "Courier New", monospace;
+    }
+
+    /* ========== Header (44px fixed top) ========== */
+    .header {
+      height: 44px;
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 16px;
+      gap: 12px;
+      position: relative;
+      z-index: 10;
+    }
+    .brand-wordmark {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 700;
+      font-size: 16px;
+      letter-spacing: -0.01em;
+      color: var(--text-primary);
+      text-decoration: none;
+      flex-shrink: 0;
+    }
+    .brand-wordmark .brand-tld { color: var(--brand); }  /* green — matches the paper-airplane brand mark */
+    .brand-wordmark svg { width: 22px; height: 22px; flex-shrink: 0; }
+
+    .header-center {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      font-size: 12px;
+      color: var(--text-dim);
+    }
+    .header-center .sep { color: var(--text-muted); }
+    .header-center .label {
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 10px;
+      color: var(--text-muted);
+    }
+    .header-center .count { color: var(--text-primary); font-weight: 700; }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 2px 8px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .status-pill .dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--status-ok);
+      box-shadow: 0 0 6px var(--status-ok);
+    }
+    .status-pill.offline .dot { background: var(--status-idle); box-shadow: none; }
+
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .icon-btn {
+      width: 30px; height: 30px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text-dim);
+      border-radius: 6px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+    }
+    .icon-btn:hover {
+      background: var(--bg-elevated);
+      color: var(--text-primary);
+      border-color: var(--border-hover);
+    }
+    .icon-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    /* ========== Main layout (sidebar + map) ========== */
+    .main {
+      display: flex;
+      height: calc(100% - 44px - 28px);  /* minus header, minus status bar */
+    }
+    .sidebar {
+      width: 340px;
+      flex-shrink: 0;
+      background: var(--bg-surface);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .sidebar-filters {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      font-size: 11px;
+      cursor: pointer;
+      user-select: none;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .chip:hover { border-color: var(--border-hover); }
+    .chip.on { border-color: var(--accent); color: var(--text-primary); }
+    .chip.off { color: var(--text-muted); opacity: 0.6; }
+    .chip-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: currentColor;
+    }
+
+    .sidebar-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+    }
+
+    /* Tier sections — LIVE / RECENT / OLDER groups within the sidebar.
+       Mirrors the public droneaware.io/live.html sidebar layout. Each
+       section gets a small header with a colored arrow + tier name +
+       count. Hidden entirely when the count is 0 (no clutter). */
+    .tier-group { margin-bottom: 4px; }
+    .tier-group[hidden] { display: none; }
+    .tier-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 10px 4px 6px;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--text-dim);
+    }
+    .tier-arrow { font-size: 9px; line-height: 1; }
+    .tier-name  { color: var(--text-dim); font-weight: 700; }
+    .tier-sep   { color: var(--text-muted); }
+    .tier-count { color: var(--text-primary); font-weight: 700; }
+    .tier-cards { display: flex; flex-direction: column; }
+    .card {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--bg-surface);
+      margin-bottom: 6px;
+      cursor: pointer;
+      transition: background 0.12s, border-color 0.12s;
+    }
+    .card:hover {
+      background: var(--bg-elevated);
+      border-color: var(--border-hover);
+    }
+    .card.selected { border-color: var(--accent); }
+    .card-thumb {
+      flex-shrink: 0;
+      width: 36px; height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--fresh-recent);  /* default — overridden by JS */
+    }
+    .card-thumb svg { width: 28px; height: 28px; }
+    .card-body { flex: 1; min-width: 0; }
+    .card-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .card-id {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--accent);
+      font-family: ui-monospace, "SF Mono", "Cascadia Mono", monospace;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex: 1;
+      min-width: 0;
+    }
+    .card-row-right {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .card-age {
+      font-size: 10px;
+      color: var(--text-dim);
+      white-space: nowrap;
+    }
+    .card-makemodel {
+      margin-top: 4px;
+      font-size: 12px;
+      color: var(--text-primary);
+    }
+    .card-make {
+      color: var(--accent);
+      font-weight: 700;
+    }
+    .card-model { color: var(--text-primary); }
+    .card-stats {
+      margin-top: 4px;
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+    .card-meta {
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-top: 2px;
+    }
+    .card-tags {
+      margin-top: 6px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      font-size: 10px;
+    }
+    .freshness-dot {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-dim);
+    }
+    .freshness-dot::before {
+      content: "";
+      width: 6px; height: 6px; border-radius: 50%;
+      background: currentColor;
+    }
+    .radio-tag {
+      padding: 1px 6px;
+      border-radius: 8px;
+      background: var(--bg-elevated);
+      color: var(--text-dim);
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    /* Empty state */
+    .empty {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      padding: 32px;
+      color: var(--text-muted);
+    }
+    .empty svg {
+      width: 96px;
+      height: 96px;
+      opacity: 0.7;
+    }
+    .empty .title { font-size: 14px; font-weight: 700; color: var(--text-dim); }
+    .empty .sub { font-size: 12px; }
+
+    /* ========== Map ========== */
+    .map {
+      flex: 1;
+      height: 100%;
+      background: var(--bg-primary);
+    }
+    .leaflet-container {
+      background: var(--bg-primary);
+      font-family: inherit;
+    }
+    .drone-marker {
+      transform-origin: center;
+    }
+    .drone-marker svg {
+      width: 24px; height: 24px;
+      transition: color 0.2s;
+    }
+    .drone-marker.live svg {
+      filter: drop-shadow(0 0 8px var(--fresh-live));
+    }
+    /* Pulse rule applies to the INNER dot, NOT the Leaflet wrapper.
+       Leaflet positions markers via transform: translate3d() on the
+       wrapper element — applying `transform: scale()` there would
+       wipe out the translate and snap the marker to (0,0) of its
+       parent (the top-left corner of the map pane). Keep the wrapper
+       transform-free; let the child handle the visual pulse. */
+    /* Operator H-marker (per drone) — small circle at operator_lat/lon
+       with the "H" letter. Colored to match the drone's freshness tier;
+       color is set inline on the host div so currentColor cascades to
+       border and box-shadow. */
+    .op-marker {
+      width: 22px; height: 22px;
+      border-radius: 50%;
+      background: rgba(10, 18, 40, 0.75);
+      border: 1.5px solid currentColor;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      font-weight: 700;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      box-shadow: 0 0 6px currentColor;
+    }
+    [data-theme="day"] .op-marker { background: rgba(255, 255, 255, 0.85); }
+
+    .home-pulse, .operator-pulse {
+      width: 12px; height: 12px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 6px var(--accent);
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+    .home-pulse {
+      width: 14px; height: 14px;
+      background: var(--brand);  /* green — your node, not a drone */
+      box-shadow: 0 0 8px var(--brand);
+    }
+    @keyframes pulse {
+      0%, 100% { transform: scale(1);   opacity: 1; }
+      50%      { transform: scale(1.4); opacity: 0.6; }
+    }
+
+    /* Distance-ring labels — small mile markers on each ring */
+    .ring-label {
+      font-family: ui-monospace, "SF Mono", "Cascadia Mono", monospace;
+      font-size: 9px;
+      color: rgba(0, 229, 255, 0.55);
+      background: transparent;
+      border: none;
+      padding: 0 4px;
+      pointer-events: none;
+      text-shadow: 0 0 2px var(--bg-primary);
+    }
+
+    /* ========== Status bar (28px bottom) ========== */
+    .statusbar {
+      height: 28px;
+      background: var(--bg-surface);
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 16px;
+      gap: 16px;
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+    .statusbar .sep { color: var(--text-muted); }
+    .statusbar .label {
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 9px;
+      color: var(--text-muted);
+    }
+    .statusbar .val { color: var(--text-primary); font-weight: 700; }
+
+    /* ========== Detail popup (Leaflet L.popup, styled per public live.html) ==========
+       Uses Leaflet's popup wrapper so we get the tail/arrow connecting back
+       to the drone marker — same affordance the public site has. Custom
+       inner styling matches the production drone detail card. */
+    .da-popup-container .leaflet-popup-content-wrapper {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+      padding: 0;
+    }
+    .da-popup-container .leaflet-popup-tip {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+    }
+    .da-popup-container .leaflet-popup-content {
+      margin: 0;
+      width: 320px !important;
+    }
+    .da-popup-container .leaflet-popup-close-button {
+      color: var(--text-dim) !important;
+      font-size: 20px !important;
+      padding: 8px 10px !important;
+      top: 4px !important;
+      right: 4px !important;
+    }
+
+    .da-popup-inner { padding: 18px 18px 14px; }
+
+    .da-popup-header {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 12px;
+      padding-right: 22px;  /* leave room for the X */
+    }
+    .da-popup-header-text { flex: 1; min-width: 0; }
+    .da-popup-id {
+      font-family: ui-monospace, "SF Mono", "Cascadia Mono", monospace;
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--accent);
+      word-break: break-all;
+      line-height: 1.2;
+    }
+    .da-popup-mac {
+      font-family: ui-monospace, "SF Mono", "Cascadia Mono", monospace;
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-top: 4px;
+    }
+    .da-popup-thumb {
+      width: 60px; height: 60px;
+      border-radius: 8px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      color: var(--text-muted);
+      font-size: 24px;
+    }
+    .da-popup-thumb svg { width: 30px; height: 30px; opacity: 0.5; }
+
+    .da-popup-makemodel {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+    }
+    .da-popup-make { color: var(--accent); font-weight: 700; }
+    .da-popup-sep  { color: var(--text-muted); }
+    .da-popup-model { color: var(--text-primary); }
+    .da-popup-badge {
+      margin-left: auto;
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--text-muted);
+    }
+
+    .da-popup-grid {
+      display: grid;
+      grid-template-columns: 80px 1fr;
+      row-gap: 8px;
+      column-gap: 12px;
+      margin-bottom: 14px;
+    }
+    .da-popup-label {
+      color: var(--text-dim);
+      font-size: 12px;
+    }
+    .da-popup-value {
+      color: var(--text-primary);
+      font-size: 13px;
+    }
+
+    .da-popup-divider {
+      height: 1px;
+      background: var(--border);
+      margin: 12px 0;
+    }
+    .da-popup-noderow {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 12px;
+      color: var(--text-dim);
+      margin-bottom: 14px;
+    }
+    .da-popup-noderow .v {
+      color: var(--text-primary);
+      margin-left: 6px;
+      font-family: ui-monospace, "SF Mono", "Cascadia Mono", monospace;
+    }
+    .da-popup-cta {
+      display: block;
+      width: 100%;
+      padding: 11px;
+      background: var(--accent);
+      color: #0A1228;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background 0.15s, transform 0.05s;
+      font-family: inherit;
+    }
+    .da-popup-cta:hover  { background: #5cefff; }
+    .da-popup-cta:active { transform: translateY(1px); }
+
+    .da-popup-specs {
+      margin-top: 12px;
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+    .da-popup-specs summary {
+      cursor: pointer;
+      padding: 6px 0;
+      list-style: none;
+      color: var(--text-dim);
+      user-select: none;
+    }
+    .da-popup-specs summary::before {
+      content: "⌄ ";
+      display: inline-block;
+      transition: transform 0.15s;
+    }
+    .da-popup-specs[open] summary::before { content: "⌃ "; }
+    .da-popup-specs-body {
+      padding: 8px 0 0;
+      display: grid;
+      grid-template-columns: max-content 1fr;
+      gap: 4px 12px;
+    }
+    .da-popup-specs-body .k { color: var(--text-muted); }
+    .da-popup-specs-body .v {
+      color: var(--text-primary);
+      font-family: ui-monospace, "SF Mono", "Cascadia Mono", monospace;
+    }
+
+    /* ========== Toast notifications ========== */
+    .toast-container {
+      position: fixed;
+      bottom: 40px;
+      right: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      z-index: 1100;
+    }
+    .toast {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent);
+      padding: 12px;
+      font-size: 14px;
+      color: var(--text-primary);
+      border-radius: 4px;
+      max-width: 320px;
+      cursor: pointer;
+      animation: slideUp 0.2s ease-out;
+    }
+    @keyframes slideUp {
+      from { transform: translateY(20px); opacity: 0; }
+      to   { transform: translateY(0);    opacity: 1; }
+    }
+
+    /* ========== Mobile responsive (< 768px) ========== */
+    @media (max-width: 767px) {
+      .main { flex-direction: column; }
+      .sidebar {
+        position: fixed;
+        bottom: 28px;
+        left: 0; right: 0;
+        width: 100%;
+        max-height: 60vh;
+        transform: translateY(calc(100% - 48px));
+        transition: transform 0.25s ease-out;
+        border-right: none;
+        border-top: 1px solid var(--border);
+        border-top-left-radius: 12px;
+        border-top-right-radius: 12px;
+        z-index: 50;
+      }
+      .sidebar.open { transform: translateY(0); }
+      .sidebar::before {
+        content: "";
+        position: absolute;
+        top: 6px; left: 50%;
+        transform: translateX(-50%);
+        width: 36px; height: 4px;
+        border-radius: 2px;
+        background: var(--text-muted);
+        opacity: 0.5;
+      }
+      .sidebar-filters { padding-top: 24px; }
+      .map { width: 100%; height: 100%; }
+      .modal-body { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <!-- Header -->
+  <div class="header">
+    <a href="/" class="brand-wordmark" title="DroneAware Local Viewer">
+      <!-- Brand mark SVG: paper airplane, green #10b981 (fixed) -->
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+        <path d="M22 2L11 13" stroke="#10b981" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="#10b981" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+      </svg>
+      <span><span class="brand-name">DroneAware</span><span class="brand-tld">.io</span></span>
+    </a>
+    <div class="header-center">
+      <span class="label">LOCAL VIEWER</span>
+      <span class="sep">·</span>
+      <span><span class="count" id="hdr-count">0</span> drones</span>
+      <span class="sep">·</span>
+      <span class="status-pill" id="hdr-status">
+        <span class="dot"></span><span id="hdr-status-label">LIVE</span>
+      </span>
+    </div>
+    <div class="header-right">
+      <button class="icon-btn" id="btn-theme" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    </div>
+  </div>
+
+  <!-- Main: sidebar + map -->
+  <div class="main">
+    <div class="sidebar" id="sidebar">
+      <div class="sidebar-filters">
+        <span class="chip on" data-filter="freshness" data-value="live">
+          <span class="chip-dot" style="color: var(--fresh-live);"></span>&lt; 2 min
+        </span>
+        <span class="chip on" data-filter="freshness" data-value="recent">
+          <span class="chip-dot" style="color: var(--fresh-recent);"></span>&lt; 10 min
+        </span>
+        <span class="chip on" data-filter="freshness" data-value="older">
+          <span class="chip-dot" style="color: var(--fresh-older);"></span>&gt; 10 min
+        </span>
+        <span class="chip on" data-filter="radio" data-value="wifi">WiFi</span>
+        <span class="chip on" data-filter="radio" data-value="ble">BLE</span>
+        <span class="chip off" data-filter="kind" data-value="test">Test</span>
+      </div>
+      <div class="sidebar-list" id="sidebar-list">
+        <div class="empty" id="empty-state">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+            <path d="M22 2L11 13" stroke="#10b981" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="#10b981" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+          </svg>
+          <div class="title">No drones detected</div>
+          <div class="sub">Your node is scanning.</div>
+        </div>
+        <!-- Tier sections — cards are sorted into the right bucket by
+             applyFilters(). Each section is hidden when empty. -->
+        <div class="tier-group" id="tier-live">
+          <div class="tier-header">
+            <span class="tier-arrow" style="color: var(--fresh-live);">▲</span>
+            <span class="tier-name">LIVE</span>
+            <span class="tier-sep">·</span>
+            <span class="tier-count" id="count-live">0</span>
+          </div>
+          <div class="tier-cards"></div>
+        </div>
+        <div class="tier-group" id="tier-recent">
+          <div class="tier-header">
+            <span class="tier-arrow" style="color: var(--fresh-recent);">▲</span>
+            <span class="tier-name">RECENT</span>
+            <span class="tier-sep">·</span>
+            <span class="tier-count" id="count-recent">0</span>
+          </div>
+          <div class="tier-cards"></div>
+        </div>
+        <div class="tier-group" id="tier-older">
+          <div class="tier-header">
+            <span class="tier-arrow" style="color: var(--fresh-older);">▲</span>
+            <span class="tier-name">OLDER</span>
+            <span class="tier-sep">·</span>
+            <span class="tier-count" id="count-older">0</span>
+          </div>
+          <div class="tier-cards"></div>
+        </div>
+      </div>
+    </div>
+    <div class="map" id="map"></div>
+  </div>
+
+  <!-- Status bar -->
+  <div class="statusbar">
+    <span><span class="label">Buffer</span> <span class="val mono" id="stat-buffer">0%</span></span>
+    <span class="sep">·</span>
+    <span><span class="label">CPU</span> <span class="val mono" id="stat-cpu">—</span></span>
+    <span class="sep">·</span>
+    <span><span class="label">Load</span> <span class="val mono" id="stat-load">—</span></span>
+    <span class="sep">·</span>
+    <span><span class="label">Events</span> <span class="val mono" id="stat-events">0</span></span>
+    <span class="sep">·</span>
+    <span><span class="label">Uptime</span> <span class="val mono" id="stat-uptime">0s</span></span>
+    <span style="margin-left: auto;"><span class="label">v</span><span class="val mono" id="stat-version">—</span></span>
+  </div>
+
+  <!-- Drone detail popup is now a Leaflet L.popup bound to each marker.
+       See bindDronePopup() in the JS below — no fixed overlay div needed. -->
+
+
+  <!-- Toast container -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <!-- Bundled Leaflet -->
+  <script src="/static/leaflet.js"></script>
+
+  <script>
+    "use strict";
+    /* =========================================================================
+       DroneAware Local Viewer client
+       SSE-driven, vanilla JS, no framework. Backend serves /api/detections
+       (snapshot), /api/status (stats), /events (SSE stream).
+       ========================================================================= */
+
+    // FA paper-plane SVG (drone marker) — color via currentColor.
+    const DRONE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="currentColor"><path d="M498.1 5.6c10.1 7 15.4 19.1 13.5 31.2l-64 416c-1.5 9.7-7.4 18.2-16 23s-18.9 5.4-28 1.6L284 427.7l-68.5 74.1c-8.9 9.7-22.9 12.9-35.2 8.1S160 493.2 160 480V396.4c0-4 1.5-7.8 4.2-10.7L331.8 202.8c5.8-6.3 5.6-16-.4-22s-15.7-6.4-22-.7L106 360.8 17.7 316.6C7.1 311.3 .3 300.7 0 288.9s5.9-22.8 16.1-28.7l448-256c10.7-6.1 23.9-5.5 34 1.4z"/></svg>`;
+
+    // Freshness scale matches the public droneaware.io/live.html — three tiers
+    // (< 2 min / < 10 min / > 10 min) so operators see the same color story
+    // on both surfaces. "Older" tier extended to 12 hours per Dan 2026-06-24
+    // — quieter nodes need something to show even after long idle periods.
+    // Anything beyond 12 hours fades to gray and is pruned.
+    const FRESHNESS = [
+      { tier: "live",   maxAge:    120, color: "var(--fresh-live)",   label: "LIVE"   },
+      { tier: "recent", maxAge:    600, color: "var(--fresh-recent)", label: "RECENT" },
+      { tier: "older",  maxAge:  43200, color: "var(--fresh-older)",  label: "OLDER"  },
+    ];
+    const STALE_PRUNE_SEC = 43200;  // 12 hours — matches backend STALE_AGE_SEC
+
+    /* ----- State ----- */
+    const state = {
+      macs: new Map(),               // mac -> { event, first_seen, last_seen, marker, card, trail, polyline }
+      filters: {
+        freshness: new Set(["live", "recent", "older"]),
+        radio:     new Set(["wifi", "ble"]),
+        test:      false,
+      },
+      selectedMac: null,
+      sse: null,
+      map: null,
+    };
+
+    /* ----- Helpers ----- */
+    function freshnessFor(ageSec) {
+      for (const f of FRESHNESS) if (ageSec < f.maxAge) return f;
+      return { tier: "gray", color: "var(--fresh-gray)", label: "GRAY" };
+    }
+    function relTime(secAgo) {
+      if (secAgo < 60)  return Math.floor(secAgo) + "s ago";
+      if (secAgo < 3600) return Math.floor(secAgo / 60) + "m ago";
+      return Math.floor(secAgo / 3600) + "h " + Math.floor((secAgo % 3600) / 60) + "m ago";
+    }
+    function fmtUptime(sec) {
+      const d = Math.floor(sec / 86400);
+      const h = Math.floor((sec % 86400) / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      if (d) return `${d}d ${h}h`;
+      if (h) return `${h}h ${m}m`;
+      return `${m}m`;
+    }
+    function isTestEvent(evt) {
+      // cmd_test broadcasts use a recognizable ID prefix — adjust as needed
+      const id = (evt.id || "").toString().toUpperCase();
+      return id.startsWith("TEST-") || id.startsWith("DA-TEST") || (evt.mac || "").startsWith("00:00:00");
+    }
+
+    /* ----- Map init ----- */
+    function initMap() {
+      const m = L.map("map", {
+        center: [40.0, -98.0],     // continental US default; recentered on home if available
+        zoom: 5,
+        zoomControl: true,
+        attributionControl: true,
+      });
+      L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+        attribution: '&copy; OpenStreetMap &copy; CARTO',
+        subdomains: "abcd",
+        maxZoom: 19,
+      }).addTo(m);
+      state.map = m;
+      state.homeLayer = L.layerGroup().addTo(m);   // holds home marker + rings
+    }
+
+    /* ----- Home location + distance rings ----- */
+    // 10 concentric rings at 1-mile intervals around the node's home
+    // location. No offset applied — offline view is inherently private
+    // (LAN-only, no internet exposure), so showing the actual node
+    // location is fine. Rings give the operator instant range context
+    // for any detection on the map.
+    const MILE_METERS = 1609.344;
+    const RING_COUNT = 10;
+
+    function drawHomeView(home) {
+      if (!home || home.lat == null || home.lon == null) {
+        // No home location available — leave map at continental-US default
+        // with no rings. Fires for un-enrolled nodes or mobile nodes with
+        // no GPS fix yet.
+        return;
+      }
+      state.homeLayer.clearLayers();
+      const center = [home.lat, home.lon];
+
+      // Recenter the map on home. Zoom 11 gives a ~15-mile-wide view,
+      // comfortable for showing all 10 rings on a typical display.
+      state.map.setView(center, 11);
+
+      // Concentric distance rings: 1mi through 10mi, dashed cyan.
+      for (let i = 1; i <= RING_COUNT; i++) {
+        L.circle(center, {
+          radius: i * MILE_METERS,
+          color: "#00E5FF",
+          weight: 1,
+          opacity: 0.22,
+          fillOpacity: 0,
+          dashArray: "4 4",
+          interactive: false,
+        }).addTo(state.homeLayer);
+
+        // Distance label at the 12 o'clock position of each ring.
+        const labelLat = home.lat + (i * MILE_METERS) / 111320;  // meters → degrees lat
+        L.marker([labelLat, home.lon], {
+          icon: L.divIcon({
+            className: "ring-label",
+            html: `${i} mi`,
+            iconSize: [40, 12],
+            iconAnchor: [20, 6],
+          }),
+          interactive: false,
+          keyboard: false,
+        }).addTo(state.homeLayer);
+      }
+
+      // Home marker (green per brand mark; differentiates from drones).
+      // className="" so Leaflet doesn't apply its default leaflet-div-icon
+      // styles (white bg + border). The .home-pulse child handles the
+      // visual; Leaflet's wrapper handles positioning.
+      L.marker(center, {
+        icon: L.divIcon({
+          className: "",
+          html: '<div class="home-pulse"></div>',
+          iconSize: [14, 14],
+          iconAnchor: [7, 7],
+        }),
+        interactive: false,
+        keyboard: false,
+        zIndexOffset: 1000,  // stays above drone markers
+      }).addTo(state.homeLayer);
+    }
+
+    /* ----- Markers ----- */
+    function makeDroneIcon(color, isLive, heading) {
+      const tilt = (heading || 0) - 45;  // FA paper-plane "forward" is upper-right
+      const cls = "drone-marker" + (isLive ? " live" : "");
+      return L.divIcon({
+        className: cls,
+        html: `<div style="color: ${color}; transform: rotate(${tilt}deg);">${DRONE_SVG}</div>`,
+        iconSize: [40, 40],
+        iconAnchor: [20, 20],
+      });
+    }
+
+    // Per-MAC position history for flight-path rendering. Capped at
+    // TRAIL_MAX positions to keep memory bounded; older positions drop
+    // off the back of the trail as the drone moves.
+    const TRAIL_MAX = 60;
+
+    function appendTrail(entry, lat, lon) {
+      if (!entry.trail) entry.trail = [];
+      // Skip dupes (same lat/lon as last point — no movement, no new vertex)
+      const last = entry.trail[entry.trail.length - 1];
+      if (last && last[0] === lat && last[1] === lon) return;
+      entry.trail.push([lat, lon]);
+      if (entry.trail.length > TRAIL_MAX) entry.trail.shift();
+    }
+
+    function updateMarker(mac) {
+      const entry = state.macs.get(mac);
+      if (!entry) return;
+      const evt = entry.event;
+      const lat = evt.lat || evt.latitude;
+      const lon = evt.lon || evt.longitude;
+      if (typeof lat !== "number" || typeof lon !== "number") return;
+
+      const age = (Date.now() / 1000) - entry.last_seen;
+      const f = freshnessFor(age);
+      const icon = makeDroneIcon(f.color, f.tier === "live", evt.heading || evt.hdg || 0);
+
+      if (!entry.marker) {
+        entry.marker = L.marker([lat, lon], { icon }).addTo(state.map);
+        entry.marker.bindPopup(() => buildPopupHTML(mac), {
+          maxWidth: 360,
+          minWidth: 320,
+          className: "da-popup-container",
+          autoPanPadding: [40, 60],
+        });
+        // Wire the popup CTA button after it's rendered into the DOM.
+        entry.marker.on("popupopen", (e) => {
+          const root = e.popup.getElement();
+          if (!root) return;
+          const cta = root.querySelector(".da-popup-cta");
+          if (cta) cta.addEventListener("click", () => {
+            entry.marker.closePopup();
+            zoomToTrail(mac);
+          });
+        });
+      } else {
+        entry.marker.setLatLng([lat, lon]);
+        entry.marker.setIcon(icon);
+        // If the popup is open, refresh its content so live updates show.
+        if (entry.marker.isPopupOpen()) {
+          entry.marker.setPopupContent(buildPopupHTML(mac));
+        }
+      }
+
+      // Maintain a position history; render as a polyline trail.
+      appendTrail(entry, lat, lon);
+      if (entry.trail.length >= 2) {
+        if (!entry.polyline) {
+          entry.polyline = L.polyline(entry.trail, {
+            color: f.color,
+            weight: 2,
+            opacity: 0.75,
+            interactive: false,
+          }).addTo(state.map);
+        } else {
+          entry.polyline.setLatLngs(entry.trail);
+          entry.polyline.setStyle({ color: f.color });
+        }
+      }
+
+      // Operator location ("H" marker) + dashed connector to the drone,
+      // when the System message has populated operator_lat / operator_lon.
+      // Matches the public droneaware.io/live.html look — each drone gets
+      // its own H badge at the pilot's location, colored to match the
+      // drone's freshness tier. Soft-fails for events lacking operator
+      // data (Basic ID alone, BLE before System message arrives, etc.).
+      const opLat = entry.event.operator_lat;
+      const opLon = entry.event.operator_lon;
+      if (typeof opLat === "number" && typeof opLon === "number") {
+        const opIcon = L.divIcon({
+          className: "",
+          html: `<div class="op-marker" style="color: ${f.color};">H</div>`,
+          iconSize: [22, 22],
+          iconAnchor: [11, 11],
+        });
+        if (!entry.opMarker) {
+          entry.opMarker = L.marker([opLat, opLon], { icon: opIcon, interactive: false })
+            .addTo(state.map);
+        } else {
+          entry.opMarker.setLatLng([opLat, opLon]);
+          entry.opMarker.setIcon(opIcon);
+        }
+        // Dashed connector from drone to operator
+        const connectorLatLngs = [[lat, lon], [opLat, opLon]];
+        if (!entry.connector) {
+          entry.connector = L.polyline(connectorLatLngs, {
+            color: f.color,
+            weight: 1.5,
+            opacity: 0.55,
+            dashArray: "6 4",
+            interactive: false,
+          }).addTo(state.map);
+        } else {
+          entry.connector.setLatLngs(connectorLatLngs);
+          entry.connector.setStyle({ color: f.color });
+        }
+      }
+    }
+
+    function removeMarker(mac) {
+      const entry = state.macs.get(mac);
+      if (entry) {
+        for (const k of ["marker", "polyline", "opMarker", "connector"]) {
+          if (entry[k]) {
+            state.map.removeLayer(entry[k]);
+            entry[k] = null;
+          }
+        }
+        entry.trail = [];
+      }
+    }
+
+    /* ----- Sidebar cards ----- */
+    function renderCard(mac) {
+      const entry = state.macs.get(mac);
+      if (!entry) return;
+      const evt = entry.event;
+      const age = (Date.now() / 1000) - entry.last_seen;
+      const f = freshnessFor(age);
+      // Normalize radio for display: wifi_beacon / wifi_nan / wifi all
+      // render as "WIFI"; ble renders as "BLE". Keeps the card visually
+      // consistent regardless of which LocalPublisher source path the
+      // event came through.
+      const radioRaw = (evt.radio || "").toLowerCase();
+      const radio = radioRaw.startsWith("wifi") ? "WIFI"
+                  : radioRaw === "ble"          ? "BLE"
+                  :                                (evt.radio || "?").toUpperCase();
+
+      let card = entry.card;
+      if (!card) {
+        card = document.createElement("div");
+        card.className = "card";
+        card.dataset.mac = mac;
+        // Sidebar click = "focus this drone on the map":
+        //   - Center the viewport on the drone's current position
+        //   - Zoom in to a comfortable single-drone view
+        //   - Pulse the card to confirm the click landed
+        // Detail modal opens via the marker click (or via dblclick on the card
+        // — added below). Different interactions for different intents.
+        card.addEventListener("click", () => focusDrone(mac));
+        card.addEventListener("dblclick", () => openModal(mac));
+        entry.card = card;
+      }
+      const id = evt.id || evt.uas_id || mac;
+
+      // Stats row: altitude · speed · node-id. Skip components that don't
+      // have data so we don't render dangling '·' separators.
+      const altFt = metersToFtAGL(evt.alt ?? evt.altitude_geo);
+      const altText = altFt != null ? `${altFt} ft AGL` : null;
+      const spdText = speedLabel(evt.speed);
+      const nodeText = state.nodeId || "this-node";
+      const statsParts = [altText, spdText, nodeText].filter(Boolean);
+      const statsHTML = statsParts.length
+        ? `<div class="card-stats">${statsParts.map(escapeHtml).join(" · ")}</div>`
+        : "";
+
+      // Make/Model row (when server enrichment has populated it).
+      const makeModelHTML = (evt.make || evt.model)
+        ? `<div class="card-makemodel">
+             <span class="card-make">${escapeHtml(evt.make || "Unknown")}</span>
+             ${evt.model ? ` · <span class="card-model">${escapeHtml(evt.model)}</span>` : ""}
+           </div>`
+        : "";
+
+      card.innerHTML = `
+        <div class="card-thumb" style="color: ${f.color};">${DRONE_SVG}</div>
+        <div class="card-body">
+          <div class="card-row">
+            <div class="card-id mono">${escapeHtml(id)}</div>
+            <div class="card-row-right">
+              <span class="radio-tag">${escapeHtml(radio)}</span>
+              <span class="card-age">${relTime(age)}</span>
+            </div>
+          </div>
+          ${makeModelHTML}
+          ${statsHTML}
+        </div>
+      `;
+      return card;
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c =>
+        ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+
+    function applyFilters() {
+      const f = state.filters;
+      const empty = document.getElementById("empty-state");
+      const tierBuckets = {
+        live:   document.querySelector("#tier-live   .tier-cards"),
+        recent: document.querySelector("#tier-recent .tier-cards"),
+        older:  document.querySelector("#tier-older  .tier-cards"),
+      };
+      const counts = { live: 0, recent: 0, older: 0 };
+
+      for (const [mac, entry] of state.macs) {
+        const evt = entry.event;
+        const age = (Date.now() / 1000) - entry.last_seen;
+        const tier = freshnessFor(age).tier;
+        const radio = (evt.radio || "").toLowerCase();
+        // Normalize radio variants: LocalPublisher emits "wifi_beacon",
+        // "wifi_nan", and "ble" — map wifi_* to "wifi" for filter purposes.
+        const radioKind = radio.startsWith("wifi") ? "wifi"
+                        : radio === "ble"          ? "ble"
+                        :                            radio;
+        const isTest = isTestEvent(evt);
+
+        const passFresh = f.freshness.has(tier);
+        const passRadio = f.radio.has(radioKind) || (radioKind === "" && f.radio.size);
+        const passTest  = f.test || !isTest;
+        const visible   = passFresh && passRadio && passTest && tierBuckets[tier];
+
+        if (visible) {
+          // Move (or insert) the card into the correct tier bucket.
+          if (entry.card && entry.card.parentNode !== tierBuckets[tier]) {
+            tierBuckets[tier].appendChild(entry.card);
+          }
+          if (entry.marker) entry.marker.setOpacity(1);
+          if (entry.opMarker) entry.opMarker.setOpacity(1);
+          if (entry.connector) entry.connector.setStyle({ opacity: 0.55 });
+          if (entry.polyline)  entry.polyline.setStyle({ opacity: 0.75 });
+          counts[tier]++;
+        } else {
+          if (entry.card && entry.card.parentNode) entry.card.remove();
+          if (entry.marker) entry.marker.setOpacity(0);
+          if (entry.opMarker) entry.opMarker.setOpacity(0);
+          if (entry.connector) entry.connector.setStyle({ opacity: 0 });
+          if (entry.polyline)  entry.polyline.setStyle({ opacity: 0 });
+        }
+      }
+
+      // Update section counts + hide empty sections.
+      for (const tier of ["live", "recent", "older"]) {
+        document.getElementById(`count-${tier}`).textContent = counts[tier];
+        document.getElementById(`tier-${tier}`).hidden = counts[tier] === 0;
+      }
+      const visibleTotal = counts.live + counts.recent + counts.older;
+      empty.style.display = visibleTotal === 0 ? "flex" : "none";
+      document.getElementById("hdr-count").textContent = visibleTotal;
+    }
+
+    /* ----- Event handling ----- */
+    function mergeNonNull(target, source) {
+      // Shallow merge that ignores null/undefined fields in `source`. Used
+      // to merge incoming ASTM messages of different types (Basic ID,
+      // Location/Vector, System, Auth) into a single composite picture
+      // per MAC — same logic the backend snapshot uses. Without this, a
+      // System message arriving after a Location/Vector would null-out
+      // the drone's lat/lon and remove its map marker.
+      const out = { ...target };
+      for (const k in source) {
+        if (source[k] !== null && source[k] !== undefined) out[k] = source[k];
+      }
+      return out;
+    }
+
+    function handleEvent(evt) {
+      const mac = evt.mac || evt.source_mac;
+      if (!mac) return;
+      // Use the broadcast timestamp (evt.t — when the feeder captured
+      // the packet) for first_seen/last_seen, NOT Date.now(). Same
+      // reason as the backend fix: replayed-at-startup events arrive
+      // via SSE near-instantly but their real broadcast time may be
+      // much older. Using Date.now() here would make 10-hour-old
+      // events look LIVE.
+      const eventTs = (typeof evt.t === "number") ? evt.t : (Date.now() / 1000);
+      let entry = state.macs.get(mac);
+      if (!entry) {
+        entry = { event: evt, first_seen: eventTs, last_seen: eventTs, marker: null, card: null };
+        state.macs.set(mac, entry);
+      } else {
+        entry.event = mergeNonNull(entry.event, evt);
+        // Advance last_seen only if this event is newer than what we
+        // already know about — protects against out-of-order arrivals.
+        if (eventTs > entry.last_seen) entry.last_seen = eventTs;
+        if (eventTs < entry.first_seen) entry.first_seen = eventTs;
+      }
+      updateMarker(mac);
+      renderCard(mac);
+    }
+
+    function handleSnapshot(snap) {
+      for (const m of (snap.macs || [])) {
+        const evt = m.latest;
+        if (!evt) continue;
+        const entry = {
+          event: evt,
+          first_seen: m.first_seen,
+          last_seen: m.last_seen,
+          // Restore the trail directly from the backend snapshot so the
+          // flight-path polyline appears immediately on load — without
+          // this, trails are client-only state and disappear every web_ui
+          // restart or browser reload.
+          trail: (m.trail || []).slice(),
+          marker: null, card: null, polyline: null, opMarker: null, connector: null,
+        };
+        state.macs.set(m.mac, entry);
+        updateMarker(m.mac);
+        renderCard(m.mac);
+      }
+    }
+
+    /* ----- Freshness refresh + prune ----- */
+    function refreshFreshness() {
+      const now = Date.now() / 1000;
+      const toPrune = [];
+      for (const [mac, entry] of state.macs) {
+        const age = now - entry.last_seen;
+        if (age > STALE_PRUNE_SEC) {
+          toPrune.push(mac);
+          continue;
+        }
+        updateMarker(mac);
+        renderCard(mac);
+      }
+      for (const mac of toPrune) {
+        removeMarker(mac);
+        const entry = state.macs.get(mac);
+        if (entry && entry.card && entry.card.parentNode) entry.card.remove();
+        state.macs.delete(mac);
+      }
+      applyFilters();
+    }
+
+    /* ----- Status bar ----- */
+    async function refreshStatus() {
+      try {
+        const r = await fetch("/api/status");
+        if (!r.ok) return;
+        const s = await r.json();
+        document.getElementById("stat-buffer").textContent =
+          `${s.buffer_pct}% (${(s.buffer_bytes / 1e6).toFixed(1)} MB)`;
+        document.getElementById("stat-cpu").textContent =
+          s.cpu_temp_c != null ? `${s.cpu_temp_c}°C` : "—";
+        document.getElementById("stat-load").textContent =
+          s.load_1m != null ? s.load_1m.toFixed(2) : "—";
+        document.getElementById("stat-events").textContent = s.event_count;
+        document.getElementById("stat-uptime").textContent = fmtUptime(s.uptime_s);
+        document.getElementById("stat-version").textContent = s.version;
+        if (s.node_id) state.nodeId = s.node_id;
+
+        // Home location may change on mobile nodes as the GPS fix moves.
+        // Only redraw if the location actually changed (avoids tearing down
+        // the rings every 2 seconds for static nodes).
+        if (s.home) {
+          const cur = state.lastHome;
+          if (!cur || cur.lat !== s.home.lat || cur.lon !== s.home.lon) {
+            drawHomeView(s.home);
+            state.lastHome = { lat: s.home.lat, lon: s.home.lon };
+          }
+        }
+      } catch (e) {}
+    }
+
+    /* ----- SSE ----- */
+    function connectSSE() {
+      if (state.sse) try { state.sse.close(); } catch (e) {}
+      const es = new EventSource("/events");
+      es.onmessage = (e) => {
+        try { handleEvent(JSON.parse(e.data)); } catch {}
+      };
+      es.onerror = () => {
+        setHeaderStatus(false);
+        // EventSource auto-reconnects; just visually flip to OFFLINE
+      };
+      es.onopen = () => setHeaderStatus(true);
+      state.sse = es;
+    }
+    function setHeaderStatus(live) {
+      const pill = document.getElementById("hdr-status");
+      const label = document.getElementById("hdr-status-label");
+      if (live) {
+        pill.classList.remove("offline");
+        label.textContent = "LIVE";
+      } else {
+        pill.classList.add("offline");
+        label.textContent = "OFFLINE";
+      }
+    }
+
+    /* ----- Focus a drone on the map (sidebar click target) ----- */
+    function focusDrone(mac) {
+      const entry = state.macs.get(mac);
+      if (!entry) return;
+      const evt = entry.event;
+      const lat = evt.lat || evt.latitude;
+      const lon = evt.lon || evt.longitude;
+      if (typeof lat !== "number" || typeof lon !== "number") return;
+      state.map.setView([lat, lon], 14, { animate: true });
+      // Mark the card as selected (visual confirmation)
+      document.querySelectorAll(".card.selected").forEach(el =>
+        el.classList.remove("selected"));
+      if (entry.card) entry.card.classList.add("selected");
+      state.selectedMac = mac;
+      // Open the popup at the marker, after the map has finished its pan
+      // (so the popup auto-pans to a comfortable position from the
+      // post-pan viewport, not the pre-pan one).
+      setTimeout(() => {
+        if (entry.marker) entry.marker.openPopup();
+      }, 250);
+    }
+
+    /* ----- Drone detail popup (Leaflet popup content) ----- */
+    // ASTM F3411-22a UA Type table (subset most commonly seen)
+    const UA_TYPES = {
+      0: "Undeclared", 1: "Aeroplane", 2: "Helicopter/Multirotor",
+      3: "Gyroplane",  4: "Hybrid",    5: "Ornithopter",
+      6: "Glider",     7: "Kite",      8: "Free Balloon",
+      9: "Captive Balloon", 10: "Airship", 11: "Free Fall",
+      12: "Rocket",    13: "Tethered Powered", 14: "Ground Obstacle",
+    };
+
+    function metersToFtAGL(meters) {
+      if (typeof meters !== "number") return null;
+      return Math.round(meters * 3.28084);
+    }
+    function speedLabel(mps) {
+      if (typeof mps !== "number") return null;
+      if (mps < 1.0) return "Hovering";
+      return `${(mps * 3.6).toFixed(1)} km/h`;
+    }
+
+    function buildPopupHTML(mac) {
+      const entry = state.macs.get(mac);
+      if (!entry) return "<div class='da-popup-inner'>—</div>";
+      const evt = entry.event;
+      const id = evt.id || evt.uas_id || mac;
+      const ageSec = (Date.now() / 1000) - entry.last_seen;
+
+      // Make/model only shown when server-side enrichment has populated
+      // these fields (item #9 in v1.4.0 punch list — not yet implemented).
+      // Until then, the row is hidden so we don't show "Unknown · —".
+      const hasMakeModel = evt.make || evt.model;
+      const makeModelHTML = hasMakeModel ? `
+        <div class="da-popup-makemodel">
+          <span class="da-popup-make">${escapeHtml(evt.make || "Unknown")}</span>
+          <span class="da-popup-sep">·</span>
+          <span class="da-popup-model">${escapeHtml(evt.model || "—")}</span>
+          ${evt.faa_documented ? '<span class="da-popup-badge">FAA DOC</span>' : ""}
+        </div>` : "";
+
+      const altFt = metersToFtAGL(evt.alt ?? evt.altitude_geo);
+      const speedTxt = speedLabel(evt.speed);
+      const typeTxt = UA_TYPES[evt.ua_type] || evt.type || "—";
+      const headingTxt = (evt.hdg != null) ? `${evt.hdg}°`
+                       : (evt.heading != null) ? `${evt.heading}°`
+                       : "—";
+      const radio = (evt.radio || "").toLowerCase();
+      const radioTxt = radio.startsWith("wifi") ? "WiFi"
+                     : radio === "ble" ? "BLE"
+                     : (evt.radio || "—").toUpperCase();
+
+      return `
+        <div class="da-popup-inner">
+          <div class="da-popup-header">
+            <div class="da-popup-header-text">
+              <div class="da-popup-id">${escapeHtml(id)}</div>
+              <div class="da-popup-mac">${escapeHtml(mac)}</div>
+            </div>
+            <div class="da-popup-thumb" title="Drone image — requires server enrichment">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="currentColor">
+                <path d="M498.1 5.6c10.1 7 15.4 19.1 13.5 31.2l-64 416c-1.5 9.7-7.4 18.2-16 23s-18.9 5.4-28 1.6L284 427.7l-68.5 74.1c-8.9 9.7-22.9 12.9-35.2 8.1S160 493.2 160 480V396.4c0-4 1.5-7.8 4.2-10.7L331.8 202.8c5.8-6.3 5.6-16-.4-22s-15.7-6.4-22-.7L106 360.8 17.7 316.6C7.1 311.3 .3 300.7 0 288.9s5.9-22.8 16.1-28.7l448-256c10.7-6.1 23.9-5.5 34 1.4z"/>
+              </svg>
+            </div>
+          </div>
+          ${makeModelHTML}
+          <div class="da-popup-grid">
+            <div class="da-popup-label">Type</div>
+            <div class="da-popup-value">${escapeHtml(typeTxt)}</div>
+            <div class="da-popup-label">Altitude</div>
+            <div class="da-popup-value">${altFt != null ? altFt + " ft AGL" : "—"}</div>
+            <div class="da-popup-label">Speed</div>
+            <div class="da-popup-value">${speedTxt || "—"}</div>
+          </div>
+          <div class="da-popup-divider"></div>
+          <div class="da-popup-noderow">
+            <div>Node <span class="v">${escapeHtml(state.nodeId || "this-node")}</span></div>
+            <div>RSSI <span class="v">${evt.rssi != null ? evt.rssi + " dBm" : "—"}</span></div>
+          </div>
+          <button class="da-popup-cta">Show Flight Path</button>
+          <details class="da-popup-specs">
+            <summary>Specs</summary>
+            <div class="da-popup-specs-body">
+              <span class="k">Radio</span><span class="v">${escapeHtml(radioTxt)}</span>
+              <span class="k">Channel</span><span class="v">${evt.channel ?? "—"}</span>
+              <span class="k">Msg type</span><span class="v">${escapeHtml(evt.type || "—")}</span>
+              <span class="k">Heading</span><span class="v">${escapeHtml(headingTxt)}</span>
+              <span class="k">Lat</span><span class="v">${(typeof evt.lat === "number") ? evt.lat.toFixed(6) : "—"}</span>
+              <span class="k">Lon</span><span class="v">${(typeof evt.lon === "number") ? evt.lon.toFixed(6) : "—"}</span>
+              <span class="k">Op lat</span><span class="v">${(typeof evt.operator_lat === "number") ? evt.operator_lat.toFixed(6) : "—"}</span>
+              <span class="k">Op lon</span><span class="v">${(typeof evt.operator_lon === "number") ? evt.operator_lon.toFixed(6) : "—"}</span>
+              <span class="k">First seen</span><span class="v">${relTime((Date.now()/1000) - entry.first_seen)}</span>
+              <span class="k">Last seen</span><span class="v">${relTime(ageSec)}</span>
+              <span class="k">Trail pts</span><span class="v">${entry.trail ? entry.trail.length : 0}</span>
+            </div>
+          </details>
+        </div>`;
+    }
+
+    function openModal(mac) {
+      // "Modal" name kept for back-compat; now opens the Leaflet popup
+      // bound to the drone's marker (which has the tail/anchor styling
+      // matching the public droneaware.io/live.html drone detail card).
+      const entry = state.macs.get(mac);
+      if (!entry || !entry.marker) return;
+      state.selectedMac = mac;
+      entry.marker.openPopup();
+    }
+    function closeModal() {
+      state.selectedMac = null;
+      state.map.closePopup();
+    }
+
+    function zoomToTrail(mac) {
+      // "Show Flight Path" CTA action: zoom the map to fit the drone's
+      // entire trail (so you see the whole path, not just current pos).
+      // For drones with no trail yet, just fly in to the current pos
+      // (smooth flyTo so the action is visually obvious — setView
+      // with animate=true looks like nothing happens if you're already
+      // at the right zoom).
+      const entry = state.macs.get(mac);
+      if (!entry) return;
+      if (entry.trail && entry.trail.length >= 2) {
+        state.map.flyToBounds(L.latLngBounds(entry.trail), {
+          padding: [60, 60],
+          maxZoom: 16,
+          duration: 0.7,
+        });
+      } else if (entry.event && (entry.event.lat != null && entry.event.lon != null)) {
+        state.map.flyTo([entry.event.lat, entry.event.lon], 16, {
+          duration: 0.7,
+        });
+      }
+    }
+
+    /* ----- Theme ----- */
+    function loadTheme() {
+      const t = localStorage.getItem("da_theme") || "dark";
+      document.documentElement.dataset.theme = t;
+    }
+    function toggleTheme() {
+      const cur = document.documentElement.dataset.theme || "dark";
+      const next = cur === "dark" ? "day" : "dark";
+      document.documentElement.dataset.theme = next;
+      localStorage.setItem("da_theme", next);
+    }
+
+    /* ----- Filter chip wiring ----- */
+    function initFilters() {
+      document.querySelectorAll(".chip").forEach(chip => {
+        chip.addEventListener("click", () => {
+          const filter = chip.dataset.filter;
+          const value = chip.dataset.value;
+          const on = chip.classList.toggle("on");
+          chip.classList.toggle("off", !on);
+          if (filter === "kind" && value === "test") {
+            state.filters.test = on;
+          } else if (filter === "freshness") {
+            if (on) state.filters.freshness.add(value);
+            else    state.filters.freshness.delete(value);
+          } else if (filter === "radio") {
+            if (on) state.filters.radio.add(value);
+            else    state.filters.radio.delete(value);
+          }
+          applyFilters();
+        });
+      });
+    }
+
+    /* ----- Init ----- */
+    document.addEventListener("DOMContentLoaded", async () => {
+      loadTheme();
+      initMap();
+      initFilters();
+      document.getElementById("btn-theme").addEventListener("click", toggleTheme);
+
+      // Initial snapshot
+      try {
+        const r = await fetch("/api/detections");
+        if (r.ok) handleSnapshot(await r.json());
+      } catch {}
+
+      connectSSE();
+      refreshStatus();
+      applyFilters();
+
+      // Periodic loops
+      setInterval(refreshStatus, 2000);
+      setInterval(refreshFreshness, 1000);
+
+      // Pause SSE handling when tab is hidden (per brand guide)
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible" && (!state.sse || state.sse.readyState !== EventSource.OPEN)) {
+          connectSSE();
+        }
+      });
+    });
+  </script>
+</body>
+</html>
