@@ -10,6 +10,29 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.4.3] — Unreleased
+
+One-line follow-up to v1.4.2's `.ver` stamping work. The v1.4.2 build
+correctly wrote `web_static/.ver` and PyInstaller correctly bundled it
+into the binary at `_MEIPASS/web_static/.ver` — but `_read_fw_version()`
+in `web_ui.py` was looking for the file at `_MEIPASS/.ver` (bundle
+root), not under `web_static/`. So the v1.4.2 binary embedded the
+right version string but couldn't find it at runtime, fell through to
+the hardcoded fallback in `web_ui.py:84`, and continued to misreport
+as `1.4.0`. Verified via `find /tmp -name .ver` on a v1.4.2 install —
+the file was present with the correct value.
+
+### Fixed
+
+- **`web_ui` now actually self-reports the correct version.** Path
+  fix in `_read_fw_version()` — append `web_static/` so the lookup
+  matches the location PyInstaller bundles the file. Single-line
+  Python change. `build.sh`, `.gitignore`, and the workflow's
+  `VERSION` export are unchanged from v1.4.2; they were correct, the
+  Python lookup was the missing piece.
+
+---
+
 ## [1.4.2] — Unreleased
 
 Three small follow-ups to v1.4.0/v1.4.1, all surfaced during NJ007
