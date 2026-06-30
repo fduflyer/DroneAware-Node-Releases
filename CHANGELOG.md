@@ -10,6 +10,87 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.4.5] — Unreleased
+
+Delivers the offline operability the v1.4.0 Local Web UI release
+promised but only half-delivered. v1.4.0 made the Web UI itself work
+without internet to droneaware.io (feeders, sidebar, API, SSE all
+local), but the Leaflet basemap still required the browser to reach
+CartoDB at runtime — air-gapped operators got drone markers floating
+on a blank background. v1.4.5 closes that gap.
+
+### Added
+
+- **Bundled world-overview basemap inside the web_ui binary.** A
+  ~15 MB MBTiles file (`web_static/world-tiles.mbtiles`) covering
+  zoom 0-6 worldwide in CartoDB Dark Matter style ships inside the
+  web_ui PyInstaller binary via the existing `--add-data
+  web_static:web_static`. At those zoom levels the operator sees
+  country boundaries, state outlines, coastlines, and major cities —
+  enough recognizable context to know where drone markers are even
+  with zero internet connectivity from the browser.
+
+- **`/tiles/<z>/<x>/<y>.png` route in web_ui.** Serves the bundled
+  MBTiles content. Queries the SQLite file by tile coordinate (with
+  XYZ→TMS row conversion), returns the PNG bytes with aggressive
+  browser caching (`Cache-Control: max-age=86400, immutable` —
+  tile content is fixed for the life of the release). Returns 404
+  for zoom levels beyond the bundle range or for missing tiles, so
+  Leaflet's tile error handler degrades gracefully.
+
+- **`tiles_local` + `tiles_local_max_zoom` fields in `/api/status`.**
+  Lets the frontend (and any API consumer) know whether the bundled
+  basemap is available on this node and up to what zoom level.
+
+- **Dual-layer Leaflet config with online/offline auto-fallback.**
+  The Web UI's tile source is no longer hardcoded to CartoDB:
+  - Initial source picked by `navigator.onLine` at page load
+  - First `tileerror` event on the CartoDB layer triggers an
+    immediate swap to the bundled local layer — covers the
+    "navigator says online but firewall blocks CartoDB" case
+  - `window.online` / `offline` events keep the source in sync
+    with the browser's network state
+  - Online operators get the full street-level CartoDB experience
+    unchanged; offline operators get the world overview seamlessly
+    without any setup or page refresh
+  - Local layer uses `maxNativeZoom: 6` — Leaflet stretches the
+    zoom-6 tiles for higher zooms so the operator can still zoom
+    into a drone's position; the basemap gets blurry but stays
+    correctly positioned
+
+### Architecture notes
+
+- **No new dependencies.** `sqlite3` is in the Python standard
+  library; MBTiles is just a SQLite file with a specific schema.
+- **No operator action required.** Operators upgrade via
+  `sudo droneaware update`; the bundled MBTiles ships with the new
+  web_ui binary automatically. Existing Web UI installs get the
+  offline basemap on next update.
+- **No CDN dependencies for the offline path.** The bundled basemap
+  serves from the local file system; the only external requests
+  remain CartoDB tile loads while online (unchanged from v1.4.0).
+- **Online behavior unchanged.** Online operators see exactly what
+  they saw in v1.4.0 — CartoDB Dark Matter or Positron tiles, full
+  street-level detail at all zoom levels.
+
+### Known limitations (acceptable trade-offs)
+
+- **Bundled tiles are dark-mode only.** Bundling both Dark Matter
+  and Positron would roughly double the binary size (~30 MB
+  instead of ~15 MB). Day-mode toggle while offline leaves the
+  basemap on Dark Matter; the rest of the UI chrome (sidebar,
+  popups, status bar) still flips to day colors. Online operators
+  in day mode see Positron tiles as before.
+- **Maximum offline zoom is 6.** At higher zoom levels the bundle's
+  zoom-6 tiles stretch (visibly blurry but positionally correct).
+  Operators wanting street-level offline detail can either re-run
+  the maintainer script with `--max-zoom 7` for a ~50 MB bundle
+  (and we ship a bigger binary), or wait for v1.4.6's per-region
+  download command which provides street-level detail for the
+  operator's area without inflating the universal world bundle.
+
+---
+
 ## [1.4.4] — Unreleased
 
 Closes the install.sh side of the same config-key drift bug that v1.4.2

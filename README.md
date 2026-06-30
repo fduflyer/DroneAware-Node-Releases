@@ -233,12 +233,25 @@ cleared on reboot). You can tail it directly:
 tail -f /run/droneaware/detections.jsonl
 ```
 
+**Local Web UI (v1.4.0+) — works offline (v1.4.5+):**
+If you installed the optional Web UI (`sudo droneaware install-webui`),
+point any LAN device at `http://<pi-ip>:5000/` for a live detection map.
+The Web UI runs entirely on the Pi — no internet connectivity to
+droneaware.io required.
+
+From v1.4.5+, the Web UI also bundles a world-overview basemap inside
+the binary, so the map renders cleanly even when the browser can't
+reach CartoDB. Online operators get full street-level detail from
+CartoDB; offline operators get a recognizable country / state context
+with drone markers correctly positioned. The fallback is automatic —
+Leaflet detects failed tile loads and switches sources without a
+refresh.
+
 **HTTP API (v1.4.0+):**
-If you installed the optional Web UI, the same service exposes a small
-read-only JSON / SSE API on port 5000 — often easier to consume than
-UDP for Home Assistant, Node-RED, Homebridge, or any HTTP-aware
-automation tool. Unlike UDP, you also get a full snapshot of recent
-state on connect.
+The Web UI service exposes a small read-only JSON / SSE API on the same
+port (5000) — often easier to consume than UDP for Home Assistant,
+Node-RED, Homebridge, or any HTTP-aware automation tool. Unlike UDP,
+you also get a full snapshot of recent state on connect.
 
 **Endpoints** (all `GET`, no auth, LAN-accessible):
 
