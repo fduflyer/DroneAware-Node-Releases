@@ -698,6 +698,27 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# 9.5. Single-source-of-truth release config — let the droneaware CLI's
+# migrate_config_env fill in any keys install.sh's write_config didn't
+# include. Previously install.sh's write_config + the CLI's
+# migrate_config_env were two parallel lists of "current release keys"
+# that could drift; e.g., DRONEAWARE_LOCAL_UDP_TARGETS was added to
+# migrate when shipped in v1.4.0 but never reached write_config, leaving
+# the key absent from fresh-install config.env's until v1.4.4. Now
+# migrate is canonical; write_config only needs the minimum bootstrap.
+# Failure here is non-fatal — every release key has a code-side default.
+# ---------------------------------------------------------------------------
+migrate_config() {
+    if [[ -x /usr/local/bin/droneaware ]]; then
+        if ! /usr/local/bin/droneaware __migrate; then
+            warn "Release config migration encountered issues — install continues. Run 'sudo droneaware __migrate' to retry."
+        fi
+    else
+        warn "droneaware CLI not found at /usr/local/bin/droneaware — skipping release config migration."
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # 10. Enroll node — requires a logged-in DroneAware account
 # ---------------------------------------------------------------------------
 enroll_node() {
@@ -966,6 +987,7 @@ install_packages
 download_binaries
 install_services
 write_config
+migrate_config
 enroll_node
 install_webui
 print_summary

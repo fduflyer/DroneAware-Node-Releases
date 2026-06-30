@@ -10,6 +10,51 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.4.4] — Unreleased
+
+Closes the install.sh side of the same config-key drift bug that v1.4.2
+fixed for the install-webui path. Also the **first non-pre-release in
+the v1.4.x line** — operators on v1.3.0.2 will get all of v1.4.x's
+work (Local Web UI, API, UDP target configurability, UX polish, render
+perf, version display fixes, and now the config-key fix) in a single
+`sudo droneaware update` hop, skipping the broken-version-display
+prereleases v1.4.0 through v1.4.2 entirely.
+
+### Fixed
+
+- **Fresh installs now get every release config key.** install.sh's
+  `write_config` was a parallel list of "current release keys" that
+  drifted from the canonical list in the droneaware CLI's
+  `migrate_config_env`. Concretely, `DRONEAWARE_LOCAL_UDP_TARGETS`
+  (added late in the v1.4.0 cycle) reached `migrate_config_env` but
+  never reached `write_config`, so brand-new installs missed the key
+  in their config.env. Functionally harmless — feeders default to
+  broadcasting on `255.255.255.255:9999` — but operators couldn't
+  discover the override in their config without reading docs.
+
+  Fix: install.sh runs `/usr/local/bin/droneaware __migrate` after
+  `write_config` completes (new `migrate_config` step in the main
+  flow). `migrate_config_env` is now the single source of truth for
+  release keys; install.sh's `write_config` only writes the minimum
+  bootstrap config. Future release keys added to `migrate_config_env`
+  automatically reach fresh installs without install.sh updates.
+  Failure is non-fatal — every release key has a code-side default.
+
+### What v1.4.4 brings forward (cumulative since v1.3.0.2)
+
+Operators updating directly from v1.3.0.2 → v1.4.4 receive everything
+shipped in the v1.4.x prereleases:
+
+- **v1.4.0:** Local Web UI (Pi-local detection viewer) + HTTP API + configurable LocalPublisher UDP targets
+- **v1.4.1:** Web UI polish — day-mode tile swap, sidebar sort, Detection Details panel stability, opt-in flight paths
+- **v1.4.2:** Web UI close-zoom render perf (Canvas + ring hiding), web_ui version stamping (build side), install-webui config migration
+- **v1.4.3:** web_ui version-file path lookup (Python side)
+- **v1.4.4:** install.sh release-config migration (this release)
+
+See individual prerelease entries below for full per-version detail.
+
+---
+
 ## [1.4.3] — Unreleased
 
 One-line follow-up to v1.4.2's `.ver` stamping work. The v1.4.2 build
