@@ -58,6 +58,7 @@ import json
 import logging
 import os
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -125,6 +126,18 @@ PRUNE_INTERVAL_SEC = 1.0
 # SSE per-client queue depth — slow clients drop events rather than
 # blocking the publisher. 100 events buffered per client is comfortable.
 SSE_CLIENT_QUEUE_MAX = 100
+
+# Bundled world-overview tiles for offline operation. Generated once with
+# tilemaker against an OSM extract using the CartoDB Dark Matter style
+# (see docs/world-tiles-generation.md), shipped inside the web_ui binary
+# via web_static/. Covers zoom 0-6 (~5,461 tiles, ~15 MB) — recognizable
+# country / state / metro context worldwide. The Leaflet client uses
+# CartoDB's live tile server when online and falls back to this bundle
+# when the browser can't reach CartoDB. If the bundle is missing (e.g.,
+# dev runs without the file), the tile route returns 404 and the client
+# stays on CartoDB — graceful degradation either way.
+WORLD_TILES_FILENAME = "world-tiles.mbtiles"
+WORLD_TILES_MAX_ZOOM = 6
 
 START_TIME = time.time()
 
@@ -516,6 +529,46 @@ def get_home_location() -> dict | None:
         return None
 
 
+# ---- World-tile bundle (offline basemap) ------------------------------------
+
+# MBTiles is the de facto offline raster-tile container — a SQLite file
+# with a `tiles` table keyed by (zoom_level, tile_column, tile_row,
+# tile_data). The schema uses TMS row indexing (y-axis inverted from
+# Leaflet's XYZ scheme); the route below handles the conversion.
+# Connection is opened lazily once and shared across threads — SQLite
+# handles concurrent reads fine with check_same_thread=False; the lock
+# is belt-and-suspenders for sqlite3 module-version variance.
+
+_mbtiles_path = None
+_mbtiles_conn = None
+_mbtiles_lock = threading.Lock()
+
+
+def _mbtiles_init():
+    """Resolve the MBTiles path from the bundled web_static dir and open
+    a shared read-only connection. Called once at app startup."""
+    global _mbtiles_path, _mbtiles_conn
+    candidate = os.path.join(_static_root(), WORLD_TILES_FILENAME)
+    if os.path.isfile(candidate):
+        try:
+            _mbtiles_conn = sqlite3.connect(
+                f"file:{candidate}?mode=ro", uri=True, check_same_thread=False,
+            )
+            _mbtiles_path = candidate
+            log.info(
+                f"World-tile bundle loaded: {candidate} "
+                f"(offline basemap available up to zoom {WORLD_TILES_MAX_ZOOM})"
+            )
+        except Exception as e:
+            log.warning(f"Failed to open world-tile bundle at {candidate}: {e}")
+    else:
+        log.info(
+            f"No world-tile bundle at {candidate} — offline basemap unavailable. "
+            f"Browser will stay on CartoDB; if CartoDB is unreachable the map "
+            f"will render without a basemap (drone markers still position correctly)."
+        )
+
+
 # ---- Flask app --------------------------------------------------------------
 
 app = Flask(
@@ -636,8 +689,55 @@ def api_status():
         "sse_clients": broker.subscriber_count(),
         "home":        get_home_location(),  # {lat, lon, source} or null
         "node_id":     _read_config_env("NODE_ID") or "this-node",
+        # Whether the bundled world-tile MBTiles is available for offline
+        # basemap rendering. Frontend uses this to know whether the
+        # /tiles/{z}/{x}/{y}.png fallback layer will return real tiles
+        # or 404s if CartoDB is unreachable.
+        "tiles_local": _mbtiles_conn is not None,
+        "tiles_local_max_zoom": WORLD_TILES_MAX_ZOOM if _mbtiles_conn else None,
     })
     return jsonify(s)
+
+
+@app.route("/tiles/<int:z>/<int:x>/<int:y>.png")
+def tile(z, x, y):
+    """Serve a single PNG tile from the bundled world-tile MBTiles file.
+    Used by the Leaflet client as the offline basemap fallback when the
+    browser can't reach CartoDB. Out-of-range zooms (z > WORLD_TILES_MAX_ZOOM)
+    and unknown tile coords both return 404 — Leaflet's tileerror handler
+    treats those as missing-tile placeholders, which is the correct UX
+    (operator zoomed past where the bundle has data)."""
+    if _mbtiles_conn is None:
+        # No bundle loaded — return 404 so the Leaflet client falls back
+        # gracefully (the dual-layer config keeps CartoDB as the primary
+        # source; this route is only hit when CartoDB has failed).
+        return Response(status=404)
+    if z > WORLD_TILES_MAX_ZOOM:
+        # Bundle doesn't include high zoom; client should be using
+        # maxNativeZoom on the layer to upscale lower zooms rather than
+        # request these — but if the request lands here anyway, 404 is
+        # the honest answer.
+        return Response(status=404)
+    # MBTiles stores tile_row in TMS scheme (origin = bottom-left);
+    # Leaflet/XYZ uses origin = top-left. Convert: tms_y = 2^z - 1 - y.
+    tms_y = (1 << z) - 1 - y
+    with _mbtiles_lock:
+        cur = _mbtiles_conn.execute(
+            "SELECT tile_data FROM tiles "
+            "WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?",
+            (z, x, tms_y),
+        )
+        row = cur.fetchone()
+    if row is None or not row[0]:
+        return Response(status=404)
+    # Cache aggressively in the browser — tile content for a given (z,x,y)
+    # never changes within a release (the MBTiles file is immutable;
+    # operators get fresh tiles by upgrading the web_ui binary).
+    return Response(
+        row[0],
+        mimetype="image/png",
+        headers={"Cache-Control": "public, max-age=86400, immutable"},
+    )
 
 
 @app.route("/events")
@@ -684,6 +784,8 @@ def main():
     log.info(f"Buffer cap: {store._max_bytes // 1_000_000} MB  "
              f"Stale threshold: {STALE_AGE_SEC}s")
     log.info(f"Data source: tail {LOCAL_RING_PATH} every {TAIL_POLL_SEC}s")
+
+    _mbtiles_init()
 
     threading.Thread(target=consumer_thread, daemon=True).start()
     threading.Thread(target=prune_thread, daemon=True).start()
