@@ -172,6 +172,41 @@ EOF
         info "Added v1.4.0 LocalPublisher UDP targets option to config.env"
     fi
 
+    # v1.4.6 — configurable dual-band dwell times
+    # NOTE: this migration is documentation-only; wifi_feeder uses env-var
+    # defaults when the keys are absent. Writing the keys here surfaces
+    # the knobs in config.env so operators can discover + tune them.
+    if ! grep -q '^WIFI_DWELL_2G_SEC=' "$cfg"; then
+        [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+        cat >> "$cfg" <<'EOF'
+
+# ─── Dual-band dwell times (added by droneaware update for v1.4.6+) ───
+# Applies only when a dual-band adapter is in use (WIFI_5G_ENABLED=auto
+# and adapter supports 5 GHz, OR WIFI_5G_ENABLED=true). Ignored on
+# single-band setups. The feeder cycles: WIFI_DWELL_2G_SEC on ch6 →
+# WIFI_DWELL_5G_SEC on ch149 → repeat. Total cycle = sum of the two.
+#
+# v1.4.6 slashed defaults from 20s / 10s (30s cycle) to 3s / 2s
+# (5s cycle) after operator feedback: a drone at 20 m/s cruise covers
+# 400m in 20s, exceeding typical 100-300m urban RID detection range.
+# The old defaults let drones fly through detection range on the
+# "wrong" band and never be seen. Channel-switch overhead is
+# milliseconds; more-frequent switching is the better trade.
+#
+# Tune the split to weight toward one band. Examples:
+#   Skydio-DFR-heavy area (weight toward 5 GHz):
+#     WIFI_DWELL_2G_SEC=1  WIFI_DWELL_5G_SEC=4
+#   DJI-heavy area (weight toward 2.4 GHz, still fast cycle):
+#     WIFI_DWELL_2G_SEC=4  WIFI_DWELL_5G_SEC=1
+#   Fastest reasonable cycle (~2 broadcasts per band per cycle):
+#     WIFI_DWELL_2G_SEC=2  WIFI_DWELL_5G_SEC=2
+# For 100% lock to one band, use FIXED_CHANNEL=6 or FIXED_CHANNEL=149.
+WIFI_DWELL_2G_SEC=3
+WIFI_DWELL_5G_SEC=2
+EOF
+        info "Added v1.4.6 dual-band dwell time options to config.env"
+    fi
+
     # Future release migration blocks go here.
     # Pattern:
     #   if ! grep -q '^NEW_FIELD=' "$cfg"; then
@@ -245,10 +280,33 @@ cmd_update() {
     systemctl stop droneaware-ble droneaware-wifi 2>/dev/null || true
     [[ "$update_webui" == "1" ]] && systemctl stop droneaware-web 2>/dev/null || true
 
-    # Also update the droneaware CLI itself
-    curl -fsSL --retry 3 "${BASE}/droneaware" -o /tmp/da_cli || true
-    if [[ -s /tmp/da_cli ]]; then
+    # Also update the droneaware CLI itself. NON-SILENT — earlier
+    # versions swallowed curl failures with `|| true` and gated the
+    # install on `-s /tmp/da_cli` with no diagnostic. Result: some
+    # operators (surfaced 2026-06-30 via NBG / Kbrooks Discord) ended
+    # up with feeders on v1.4.5 but their CLI silently stuck at
+    # pre-v1.4.0 → `install-webui` returned "unknown command" with no
+    # explanation. v1.4.6 makes every failure mode print a warning
+    # plus the exact manual-fix command so the next operator to hit
+    # this sees the fix in their own update output.
+    cli_download_ok=1
+    echo "  Downloading CLI..."
+    if ! curl -fSL --retry 6 "${BASE}/droneaware" -o /tmp/da_cli; then
+        warn "CLI download from ${BASE}/droneaware failed."
+        cli_download_ok=0
+    elif [[ ! -s /tmp/da_cli ]]; then
+        warn "CLI download produced empty /tmp/da_cli — treating as failed."
+        cli_download_ok=0
+    elif ! head -1 /tmp/da_cli | grep -q '^#!'; then
+        warn "Downloaded CLI has no shebang — likely captive-portal HTML or corrupt asset. Refusing to install."
+        cli_download_ok=0
+    else
         chmod +x /tmp/da_cli
+    fi
+    if [[ "$cli_download_ok" == "0" ]]; then
+        warn "Your CLI at /usr/local/bin/droneaware will remain at the previous version."
+        warn "Fix manually with:"
+        warn "  sudo curl -fsSL ${BASE}/droneaware -o /usr/local/bin/droneaware && sudo chmod +x /usr/local/bin/droneaware"
     fi
 
     cp /tmp/da_ble_feeder  "${INSTALL_DIR}/ble_feeder"
@@ -267,10 +325,17 @@ cmd_update() {
     # bytes in the new (different-sized) file → garbage parsing at script
     # end (the v1.2.0 "line 426: syntax error" bug). Atomic rename keeps
     # the open file descriptor pointed at the old inode until bash exits.
-    if [[ -s /tmp/da_cli ]]; then
-        cp /tmp/da_cli /usr/local/bin/droneaware.new
-        chmod +x /usr/local/bin/droneaware.new
-        mv /usr/local/bin/droneaware.new /usr/local/bin/droneaware
+    if [[ "$cli_download_ok" == "1" ]]; then
+        if cp /tmp/da_cli /usr/local/bin/droneaware.new \
+           && chmod +x /usr/local/bin/droneaware.new \
+           && mv /usr/local/bin/droneaware.new /usr/local/bin/droneaware; then
+            info "CLI updated to ${LATEST}."
+        else
+            warn "CLI install to /usr/local/bin failed (disk full? read-only fs?). Old CLI remains."
+            warn "Fix manually with:"
+            warn "  sudo curl -fsSL ${BASE}/droneaware -o /usr/local/bin/droneaware && sudo chmod +x /usr/local/bin/droneaware"
+            rm -f /usr/local/bin/droneaware.new 2>/dev/null || true
+        fi
     fi
     rm -f /tmp/da_ble_feeder /tmp/da_wifi_feeder /tmp/da_web_ui /tmp/da_cli
     echo "$LATEST" > "$VERSION_FILE"

@@ -10,6 +10,78 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.4.6] — Unreleased
+
+Two independent issues surfaced during the v1.4.4 / v1.4.5 rollout. Both
+fixed here so the fleet gets both improvements in one `sudo droneaware
+update` hop.
+
+### Fixed
+
+- **`droneaware update` no longer silently fails to update the CLI
+  itself.** Previously, `cmd_update` fetched the new `droneaware` CLI
+  script via `curl -fsSL ... || true` and gated the install on
+  `[[ -s /tmp/da_cli ]]`. If the download hit any transient network or
+  HTTP error, both guards silently swallowed the failure — operators
+  ended up with new feeder binaries but a stale CLI, with no message.
+  Only became painful in v1.4.0 when `install-webui` was added as the
+  first subcommand that requires a fresh CLI (previously every
+  subcommand existed in every CLI version, so a stale CLI worked fine).
+
+  `cmd_update` now:
+  - Prints an explicit `Downloading CLI...` line at the step
+  - Checks the download succeeded AND the file is non-empty AND has a
+    shebang (catches captive-portal HTML / corrupt asset responses)
+  - Warns loudly on any failure and prints the manual-fix one-liner so
+    the next operator to hit this sees the fix in their own update output
+  - Prints `CLI updated to vX.Y.Z.` on success so operators can verify
+
+  Companion feeder-side warning: `ble_feeder` and `wifi_feeder` now
+  grep `/usr/local/bin/droneaware` at service startup for a v1.4.0+
+  marker (`install-webui`) and log a WARN to `journalctl` if missing —
+  surfaces any operator who's already stuck on a stale CLI without
+  needing them to try `install-webui` to find out.
+
+- **Dual-band WiFi hopper now cycles ~10× faster + is fully tunable.**
+  Previous defaults were 20s on ch6 (2.4 GHz) → 10s on ch149 (5 GHz),
+  a 30-second cycle. Community feedback (Qerolt 2026-07-01 re: Skydio
+  DFR coverage) made clear these dwells are way too long in the drone
+  context: at typical cruise speed (~20 m/s), a drone flies 400 meters
+  in 20 seconds — exceeding the typical 100–300m urban RID detection
+  range. Drones could transit through a node's entire range on the
+  "wrong" band without ever being seen. Channel-switch overhead is
+  milliseconds; the old defaults optimized for the wrong side of that
+  trade.
+
+  New defaults: **3s ch6 + 2s ch149 (5s cycle)**. Both tunable via new
+  config.env keys:
+  - `WIFI_DWELL_2G_SEC=3` — 2.4 GHz dwell per cycle (default 3)
+  - `WIFI_DWELL_5G_SEC=2` — 5 GHz dwell per cycle (default 2)
+
+  Operators can weight toward one band without going all-in. Examples
+  in the config.env comment block:
+  - Skydio-DFR area (weight to 5 GHz): `WIFI_DWELL_2G_SEC=1
+    WIFI_DWELL_5G_SEC=4`
+  - DJI-heavy area: `WIFI_DWELL_2G_SEC=4  WIFI_DWELL_5G_SEC=1`
+  - `FIXED_CHANNEL=149` still available for 100% lock to one band
+
+  Single-band adapters unaffected (they use the SingleBandHopper class
+  with its own separate DWELL_CH6_MS knob for sub-second sweep dwell).
+
+### Behavior change to expect
+
+- **Existing dual-band nodes will see substantially faster hopping**
+  after `sudo droneaware update`. Expect slightly higher CPU usage
+  (more channel switches per second) and correspondingly better catch
+  rate for fast-moving drones. If the new default doesn't suit your
+  deployment, revert or tune via the new env vars — see the config.env
+  comment block for examples.
+- Nodes that had previously customized the hardcoded class constants
+  by editing `wifi_feeder.py` will lose those customizations on
+  update. Move to the env-var config instead.
+
+---
+
 ## [1.4.5] — Unreleased
 
 Delivers the offline operability the v1.4.0 Local Web UI release

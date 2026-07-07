@@ -44,6 +44,29 @@ logging.basicConfig(
 )
 log = logging.getLogger("droneaware.ble")
 
+
+def _check_cli_freshness():
+    """Warn if /usr/local/bin/droneaware appears older than the feeder binaries.
+    See wifi_feeder.py:_check_cli_freshness for the rationale — same check,
+    same message, mirrored here so operators see the warning regardless of
+    which feeder starts first in their journalctl."""
+    cli_path = "/usr/local/bin/droneaware"
+    try:
+        with open(cli_path) as f:
+            content = f.read()
+    except Exception:
+        return
+    if "install-webui" not in content:
+        log.warning(
+            f"{cli_path} appears older than the installed feeders "
+            "(missing v1.4.0+ install-webui subcommand). A previous "
+            "`droneaware update` likely failed silently to update the CLI. "
+            "Fix with: sudo curl -fsSL "
+            "https://github.com/fduflyer/DroneAware-Node-Releases/releases/latest/download/droneaware "
+            "-o /usr/local/bin/droneaware && sudo chmod +x /usr/local/bin/droneaware"
+        )
+
+
 def _read_fw_version(fallback: str) -> str:
     try:
         with open("/opt/droneaware/version") as f:
@@ -840,6 +863,7 @@ class BLEFeeder:
 
     async def run(self):
         log.info(f"DroneAware BLE Feeder - Node: {self.node_id}  Adapter: {self.adapter}")
+        _check_cli_freshness()
 
         # Adapter not healthy at startup — try the standard recovery sequence
         # before declaring FAULT. Auto-heals the Pi onboard BT UART sync issue

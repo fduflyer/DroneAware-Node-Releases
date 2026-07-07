@@ -46,6 +46,36 @@ logging.basicConfig(
 )
 log = logging.getLogger("droneaware.wifi")
 
+
+def _check_cli_freshness():
+    """Warn if /usr/local/bin/droneaware appears older than the feeder binaries.
+    Surfaces the silent CLI-update failure mode where `droneaware update` runs
+    the CLI-download step, hits a transient error, swallows it with `|| true`,
+    and leaves the operator with new feeders + stale CLI. Silent since v1.1.1
+    when CLI self-update shipped; only became painful in v1.4.0 when
+    `install-webui` became the first subcommand that requires a fresh CLI.
+    v1.4.6 makes cmd_update's download failures loud AND surfaces already-stuck
+    CLIs here — this warning appears every service start until the operator
+    runs the manual-fix one-liner. Non-blocking; feeder still runs."""
+    cli_path = "/usr/local/bin/droneaware"
+    try:
+        with open(cli_path) as f:
+            content = f.read()
+    except Exception:
+        return  # CLI missing or unreadable — not our concern here
+    # `install-webui` was added in v1.4.0. If the CLI on-disk doesn't have it,
+    # the CLI is stale relative to a v1.4.0+ feeder binary.
+    if "install-webui" not in content:
+        log.warning(
+            f"{cli_path} appears older than the installed feeders "
+            "(missing v1.4.0+ install-webui subcommand). A previous "
+            "`droneaware update` likely failed silently to update the CLI. "
+            "Fix with: sudo curl -fsSL "
+            "https://github.com/fduflyer/DroneAware-Node-Releases/releases/latest/download/droneaware "
+            "-o /usr/local/bin/droneaware && sudo chmod +x /usr/local/bin/droneaware"
+        )
+
+
 def _read_fw_version(fallback: str) -> str:
     try:
         with open("/opt/droneaware/version") as f:
@@ -800,16 +830,26 @@ class AdaptiveChannelHopper(threading.Thread):
 
 class DualBandHopper(threading.Thread):
     """
-    30s cycle hopper for dual-band adapters (2.4 GHz + 5 GHz).
+    Fast-cycle hopper for dual-band adapters (2.4 GHz + 5 GHz).
 
     Sweep mode default (WIFI_OFF_CHANNEL_SWEEP=false):
-        20s ch6 → 10s ch149  (1 band switch per cycle, ASTM-compliant channels only)
+        WIFI_DWELL_2G_SEC ch6 → WIFI_DWELL_5G_SEC ch149
+        Defaults: 3s + 2s = 5s cycle.
 
     Sweep mode with off-channel canary (WIFI_OFF_CHANNEL_SWEEP=true, advanced):
-        18s ch6 → 1s ch1 → 1s ch11 → 10s ch149
+        (WIFI_DWELL_2G_SEC - 2) ch6 → 1s ch1 → 1s ch11 → WIFI_DWELL_5G_SEC ch149
 
     Sticky mode (detection within ACTIVE_WINDOW): hold on the detected channel.
     Periodic peek at the other band's primary every STICKY_PEEK_INTERVAL cycles.
+
+    v1.4.6 slashed default dwell times from 20s / 10s (30s cycle) to 3s / 2s
+    (5s cycle) after operator feedback that the old defaults let drones fly
+    through detection range unseen — a drone at 20 m/s cruise covers 400m in
+    20 seconds, exceeding typical 100-300m urban RID detection range on the
+    "wrong" band. Channel-switch overhead is milliseconds; sitting on one
+    band for 20s to avoid it was clearly the wrong trade. Both defaults are
+    tunable now via env vars for operators who want to weight toward one
+    band (e.g., Skydio-DFR hunting on 5 GHz).
 
     Empirical data (project_detection_data memory): ch1/ch11 carry zero unique
     drones — all off-band captures are ch6 drift. Default is compliant-only;
@@ -822,9 +862,9 @@ class DualBandHopper(threading.Thread):
     PEEK_CHANNELS_2G      = [1, 11]
     ACTIVE_WINDOW         = 3.0
 
-    DWELL_CH6_S           = 18.0
-    DWELL_CH6_FULL_S      = 20.0
-    DWELL_CH149_S         = 10.0
+    # Fallback constants used when env vars unset or invalid.
+    DEFAULT_DWELL_2G_S    = 3.0
+    DEFAULT_DWELL_5G_S    = 2.0
     PEEK_S                = 1.0
 
     STICKY_DWELL_MS       = 950
@@ -849,6 +889,38 @@ class DualBandHopper(threading.Thread):
         except ValueError:
             log.warning(f"FIXED_CHANNEL={raw!r} is not an integer — ignoring")
             self.fixed_channel = None
+
+        # v1.4.6: WIFI_DWELL_2G_SEC / WIFI_DWELL_5G_SEC override the class
+        # defaults so operators can weight toward one band. Skydio-DFR
+        # areas might want WIFI_DWELL_5G_SEC=5 WIFI_DWELL_2G_SEC=1;
+        # DJI-heavy areas might want the reverse.
+        self.dwell_2g_s = self._parse_dwell("WIFI_DWELL_2G_SEC", self.DEFAULT_DWELL_2G_S)
+        self.dwell_5g_s = self._parse_dwell("WIFI_DWELL_5G_SEC", self.DEFAULT_DWELL_5G_S)
+
+        # If off-channel sweep is enabled but 2G budget can't accommodate
+        # the 2×PEEK_S reserved for ch1+ch11, disable sweep rather than
+        # produce a nonsensical schedule.
+        if self.off_channel_sweep and self.dwell_2g_s <= 2 * self.PEEK_S:
+            log.warning(
+                f"WIFI_DWELL_2G_SEC={self.dwell_2g_s}s is too small for "
+                f"off-channel peeks ({2 * self.PEEK_S}s reserved for ch1+ch11). "
+                "Disabling WIFI_OFF_CHANNEL_SWEEP for this run."
+            )
+            self.off_channel_sweep = False
+
+    @staticmethod
+    def _parse_dwell(var: str, default: float) -> float:
+        raw = os.environ.get(var, "").strip()
+        if not raw:
+            return default
+        try:
+            val = float(raw)
+            if val <= 0:
+                raise ValueError("must be positive")
+            return val
+        except ValueError as e:
+            log.warning(f"{var}={raw!r} invalid ({e}) — using default {default}s")
+            return default
 
     def notify_detection(self, channel: int | None):
         self.last_detection_time = time.time()
@@ -879,10 +951,12 @@ class DualBandHopper(threading.Thread):
             return
 
         canary = "enabled" if self.off_channel_sweep else "disabled"
+        cycle_s = self.dwell_2g_s + self.dwell_5g_s
         log.info(
-            f"Dual-band hopper started: 30s cycle "
-            f"(ch{self.PRIMARY_CHANNEL_2G} + ch{self.PRIMARY_CHANNEL_5G}), "
-            f"off-channel canary {canary}"
+            f"Dual-band hopper started: "
+            f"{self.dwell_2g_s}s ch{self.PRIMARY_CHANNEL_2G} + "
+            f"{self.dwell_5g_s}s ch{self.PRIMARY_CHANNEL_5G} "
+            f"({cycle_s}s cycle), off-channel canary {canary}"
         )
         prev_mode = "sweep"
 
@@ -911,8 +985,10 @@ class DualBandHopper(threading.Thread):
                         return
             else:
                 if self.off_channel_sweep:
+                    # 2G budget minus 2×PEEK_S reserved for ch1+ch11
+                    primary_2g_s = self.dwell_2g_s - 2 * self.PEEK_S
                     self._set(self.PRIMARY_CHANNEL_2G)
-                    if self._sleep_s(self.DWELL_CH6_S):
+                    if self._sleep_s(primary_2g_s):
                         break
                     for ch in self.PEEK_CHANNELS_2G:
                         self._set(ch)
@@ -920,11 +996,11 @@ class DualBandHopper(threading.Thread):
                             return
                 else:
                     self._set(self.PRIMARY_CHANNEL_2G)
-                    if self._sleep_s(self.DWELL_CH6_FULL_S):
+                    if self._sleep_s(self.dwell_2g_s):
                         break
 
                 self._set(self.PRIMARY_CHANNEL_5G)
-                if self._sleep_s(self.DWELL_CH149_S):
+                if self._sleep_s(self.dwell_5g_s):
                     break
 
     def stop(self):
@@ -1665,6 +1741,7 @@ class WiFiFeeder:
 
     def run(self):
         log.info(f"DroneAware WiFi Feeder - Node: {self.node_id}")
+        _check_cli_freshness()
         target = self.hopper.target_channels
         log.info(f"Interface: {self.iface or '<not configured>'}  |  Hopper channels: {target}")
 
