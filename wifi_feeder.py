@@ -47,33 +47,142 @@ logging.basicConfig(
 log = logging.getLogger("droneaware.wifi")
 
 
+CLI_PATH = "/usr/local/bin/droneaware"
+CLI_LATEST_URL = (
+    "https://github.com/fduflyer/DroneAware-Node-Releases/"
+    "releases/latest/download/droneaware"
+)
+
+
 def _check_cli_freshness():
-    """Warn if /usr/local/bin/droneaware appears older than the feeder binaries.
-    Surfaces the silent CLI-update failure mode where `droneaware update` runs
-    the CLI-download step, hits a transient error, swallows it with `|| true`,
-    and leaves the operator with new feeders + stale CLI. Silent since v1.1.1
-    when CLI self-update shipped; only became painful in v1.4.0 when
-    `install-webui` became the first subcommand that requires a fresh CLI.
-    v1.4.6 makes cmd_update's download failures loud AND surfaces already-stuck
-    CLIs here — this warning appears every service start until the operator
-    runs the manual-fix one-liner. Non-blocking; feeder still runs."""
-    cli_path = "/usr/local/bin/droneaware"
+    """Detect + auto-heal a stale /usr/local/bin/droneaware CLI at feeder
+    startup. Surfaces the silent CLI-update failure mode where `droneaware
+    update` runs the CLI-download step, hits a transient error, swallows it
+    with `|| true`, and leaves the operator with new feeders + stale CLI.
+
+    Silent since v1.1.1 when CLI self-update shipped; only became painful in
+    v1.4.0 when `install-webui` became the first subcommand that requires a
+    fresh CLI. v1.4.6 made cmd_update's download failures loud AND warned on
+    stale CLIs here — but that WARN required the operator to run a manual
+    curl one-liner to fix.
+
+    v1.4.7 turns the warning into an auto-heal: if the CLI is stale, the
+    feeder itself downloads the current CLI from /releases/latest and
+    atomic-mv's it into place. Why this works despite the chicken-and-egg:
+    feeder BINARIES update reliably (only the CLI-update step in cmd_update
+    silently fails). So operators already stuck get auto-fixed on their
+    NEXT `droneaware update` — no user action, no Discord archaeology.
+
+    Non-blocking. If the auto-heal fetch fails (offline, GitHub unreachable),
+    falls back to the v1.4.6 WARN with manual-fix instructions."""
     try:
-        with open(cli_path) as f:
+        with open(CLI_PATH) as f:
             content = f.read()
     except Exception:
-        return  # CLI missing or unreadable — not our concern here
-    # `install-webui` was added in v1.4.0. If the CLI on-disk doesn't have it,
-    # the CLI is stale relative to a v1.4.0+ feeder binary.
-    if "install-webui" not in content:
-        log.warning(
-            f"{cli_path} appears older than the installed feeders "
-            "(missing v1.4.0+ install-webui subcommand). A previous "
-            "`droneaware update` likely failed silently to update the CLI. "
-            "Fix with: sudo curl -fsSL "
-            "https://github.com/fduflyer/DroneAware-Node-Releases/releases/latest/download/droneaware "
-            "-o /usr/local/bin/droneaware && sudo chmod +x /usr/local/bin/droneaware"
+        return  # CLI missing/unreadable — bigger problem, not our fix
+    # `install-webui` was added in v1.4.0. If it's absent, the CLI on-disk
+    # is stale relative to a v1.4.0+ feeder binary.
+    if "install-webui" in content:
+        return  # CLI is fresh, nothing to do
+
+    log.warning(
+        f"{CLI_PATH} appears stale (missing v1.4.0+ install-webui marker). "
+        f"Attempting auto-heal from {CLI_LATEST_URL} ..."
+    )
+    if _try_heal_cli():
+        log.info(f"Auto-healed stale CLI at {CLI_PATH}")
+        return
+
+    # Auto-heal failed — fall back to the v1.4.6 WARN + manual-fix path.
+    log.warning(
+        f"Auto-heal failed — {CLI_PATH} remains stale. Fix manually: "
+        f"sudo curl -fsSL {CLI_LATEST_URL} -o {CLI_PATH} && "
+        f"sudo chmod +x {CLI_PATH}"
+    )
+
+
+def _try_heal_cli() -> bool:
+    """Download the current CLI from /releases/latest, sanity-check it,
+    atomic-mv into CLI_PATH. Returns True on success, False on any failure.
+    Uses only stdlib to avoid adding dependencies for a code path that
+    should almost never fire (needs both the stuck-CLI condition and a
+    feeder restart to trigger)."""
+    import shutil
+    import urllib.request
+
+    tmp_path = f"/tmp/da_cli_selfheal_{os.getpid()}"
+    try:
+        req = urllib.request.Request(
+            CLI_LATEST_URL,
+            headers={"User-Agent": f"DroneAware-Feeder-SelfHeal/{FW_VERSION}"},
         )
+        # 10s timeout keeps feeder startup bounded even on flaky networks.
+        with urllib.request.urlopen(req, timeout=10) as response:
+            if response.status != 200:
+                log.warning(f"Auto-heal fetch: HTTP {response.status}")
+                return False
+            with open(tmp_path, "wb") as out:
+                shutil.copyfileobj(response, out)
+    except Exception as e:
+        log.warning(f"Auto-heal fetch failed: {e}")
+        return False
+
+    # Shebang sanity check — catches captive-portal HTML, corrupt asset, etc.
+    # Same defensive posture v1.4.6's cmd_update uses.
+    try:
+        with open(tmp_path, "rb") as f:
+            first_line = f.readline()
+        if not first_line.startswith(b"#!"):
+            log.warning("Auto-heal: downloaded CLI has no shebang — refusing to install")
+            try: os.unlink(tmp_path)
+            except Exception: pass
+            return False
+    except Exception as e:
+        log.warning(f"Auto-heal sanity check failed: {e}")
+        return False
+
+    # Also require the marker we look for — if the downloaded file itself is
+    # missing install-webui, either GitHub is serving something weird or the
+    # download got interrupted. Refuse to overwrite the on-disk CLI with
+    # something that would leave the operator in the same stuck state.
+    try:
+        with open(tmp_path) as f:
+            fresh_content = f.read()
+        if "install-webui" not in fresh_content:
+            log.warning(
+                "Auto-heal: downloaded CLI is itself missing install-webui — "
+                "not overwriting on-disk CLI"
+            )
+            try: os.unlink(tmp_path)
+            except Exception: pass
+            return False
+    except Exception as e:
+        log.warning(f"Auto-heal marker check failed: {e}")
+        return False
+
+    # Atomic mv via .new intermediate — matches cmd_update's pattern for
+    # safely replacing a bash script that could be concurrently executing.
+    try:
+        new_path = CLI_PATH + ".new"
+        shutil.copy(tmp_path, new_path)
+        os.chmod(new_path, 0o755)
+        os.rename(new_path, CLI_PATH)
+        try: os.unlink(tmp_path)
+        except Exception: pass
+        return True
+    except PermissionError:
+        log.warning(
+            f"Auto-heal: insufficient permissions to write {CLI_PATH} "
+            "(feeder should run as root — check the systemd unit)"
+        )
+    except Exception as e:
+        log.warning(f"Auto-heal install failed: {e}")
+
+    # Cleanup on any failure path
+    for p in (tmp_path, CLI_PATH + ".new"):
+        try: os.unlink(p)
+        except Exception: pass
+    return False
 
 
 def _read_fw_version(fallback: str) -> str:
