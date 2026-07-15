@@ -10,6 +10,82 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.4.7] — Unreleased
+
+Closes the last mile of the silent-CLI-update saga from v1.4.5 / v1.4.6.
+v1.4.6 made `cmd_update` non-silent (any future CLI download failure prints
+loudly + gives the fix command) and added feeder-side WARN detection of
+stuck CLIs — but operators **already** stuck on a pre-v1.4.6 CLI couldn't
+get the fix via `sudo droneaware update`, because their old (silent-failure)
+`cmd_update` is what runs during the update. Kbrooks confirmed this on
+2026-07-13: after updating to v1.4.6, his CLI mtime was still 2026-05-10
+(pre-v1.4.0) with zero `install-webui` occurrences — the v1.4.6 update
+had bumped his feeder binaries but silently failed to update the CLI,
+just like every prior update had.
+
+v1.4.7 fixes this by putting the auto-heal in the FEEDER binaries — the
+one part of the update path that reliably succeeds even for stuck
+operators. On next `droneaware update`, stuck operators get:
+
+1. New v1.4.7 feeder binaries download → ✅ (feeder updates always work)
+2. CLI download silently fails → CLI stays stuck (same as always)
+3. Feeders restart with the new v1.4.7 code
+4. **Feeder's `_check_cli_freshness()` runs at startup, detects stale CLI,
+   downloads current CLI from `/releases/latest/download/droneaware`,
+   sanity-checks it, atomic-mv's it into `/usr/local/bin/droneaware`, and
+   logs `Auto-healed stale CLI`.**
+5. Operator's next `sudo droneaware install-webui` works — with no manual
+   command, no Discord archaeology, no awareness that anything was
+   ever broken.
+
+### Added
+
+- **Feeder-side CLI auto-heal.** `ble_feeder` and `wifi_feeder` now
+  actively repair a stale `/usr/local/bin/droneaware` at startup, not
+  just warn about it. Behavior:
+  - Grep the CLI for the v1.4.0+ `install-webui` marker (unchanged
+    from v1.4.6)
+  - If missing: fetch the current CLI from
+    `/releases/latest/download/droneaware` via `urllib` with a 10s
+    timeout
+  - Sanity-check the download: HTTP 200, non-empty, has a shebang,
+    contains `install-webui` itself (refuses to install a download
+    that would leave the operator in the same stuck state)
+  - Atomic-mv into `/usr/local/bin/droneaware` via `.new` intermediate
+  - Log `Auto-healed stale CLI at /usr/local/bin/droneaware` on success
+  - On any failure (offline, GitHub unreachable, download corrupt,
+    permissions): fall back to the v1.4.6 WARN with the manual-fix
+    one-liner
+  - **Non-blocking** — feeder startup is bounded to 10s of extra
+    latency in the worst case; healthy nodes (fresh CLI) skip the
+    heal path entirely and see no delay
+
+### Why the auto-heal was needed even after v1.4.6
+
+The v1.4.6 fix prevented the silent-failure trap from claiming NEW
+victims — any operator whose CLI already had v1.4.6's loud-error
+`cmd_update` would see any future CLI-download failure loudly, plus
+the manual-fix command in-terminal. But it did nothing for the
+operators who had already fallen into the trap in a pre-v1.4.6 update.
+Two field-confirmed cases at time of v1.4.7 (Kbrooks, Warbird/NBG),
+plus an unknown-but-nonzero silent tail across the fleet who haven't
+tried `install-webui` yet.
+
+v1.4.7 closes this by making the fix delivery channel be the FEEDER,
+not the CLI. Feeder-binary updates work reliably even for stuck-CLI
+operators; the auto-heal ships to them there.
+
+### Not changed
+
+- `cmd_update`'s loud-error CLI download from v1.4.6 stays. It's the
+  first line of defense (prevents new stuck cases). The feeder
+  auto-heal is the second line (unsticks anyone who's already stuck).
+- Dual-band dwell defaults from v1.4.6 (3s ch6 / 2s ch149) unchanged.
+- No config.env keys added.
+- No new server-side dependencies. Auto-heal uses stdlib only.
+
+---
+
 ## [1.4.6] — Unreleased
 
 Two independent issues surfaced during the v1.4.4 / v1.4.5 rollout. Both

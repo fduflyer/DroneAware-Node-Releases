@@ -45,26 +45,111 @@ logging.basicConfig(
 log = logging.getLogger("droneaware.ble")
 
 
+CLI_PATH = "/usr/local/bin/droneaware"
+CLI_LATEST_URL = (
+    "https://github.com/fduflyer/DroneAware-Node-Releases/"
+    "releases/latest/download/droneaware"
+)
+
+
 def _check_cli_freshness():
-    """Warn if /usr/local/bin/droneaware appears older than the feeder binaries.
-    See wifi_feeder.py:_check_cli_freshness for the rationale — same check,
-    same message, mirrored here so operators see the warning regardless of
-    which feeder starts first in their journalctl."""
-    cli_path = "/usr/local/bin/droneaware"
+    """Detect + auto-heal a stale /usr/local/bin/droneaware CLI at feeder
+    startup. Mirror of wifi_feeder.py:_check_cli_freshness — see there for
+    the full rationale. Mirrored here so operators see the auto-heal
+    regardless of which feeder starts first in their journalctl. v1.4.7
+    added the auto-heal behavior; v1.4.6 was WARN-only."""
     try:
-        with open(cli_path) as f:
+        with open(CLI_PATH) as f:
             content = f.read()
     except Exception:
         return
-    if "install-webui" not in content:
-        log.warning(
-            f"{cli_path} appears older than the installed feeders "
-            "(missing v1.4.0+ install-webui subcommand). A previous "
-            "`droneaware update` likely failed silently to update the CLI. "
-            "Fix with: sudo curl -fsSL "
-            "https://github.com/fduflyer/DroneAware-Node-Releases/releases/latest/download/droneaware "
-            "-o /usr/local/bin/droneaware && sudo chmod +x /usr/local/bin/droneaware"
+    if "install-webui" in content:
+        return
+
+    log.warning(
+        f"{CLI_PATH} appears stale (missing v1.4.0+ install-webui marker). "
+        f"Attempting auto-heal from {CLI_LATEST_URL} ..."
+    )
+    if _try_heal_cli():
+        log.info(f"Auto-healed stale CLI at {CLI_PATH}")
+        return
+
+    log.warning(
+        f"Auto-heal failed — {CLI_PATH} remains stale. Fix manually: "
+        f"sudo curl -fsSL {CLI_LATEST_URL} -o {CLI_PATH} && "
+        f"sudo chmod +x {CLI_PATH}"
+    )
+
+
+def _try_heal_cli() -> bool:
+    """Download the current CLI from /releases/latest, sanity-check it,
+    atomic-mv into CLI_PATH. Mirror of wifi_feeder.py:_try_heal_cli."""
+    import shutil
+    import urllib.request
+
+    tmp_path = f"/tmp/da_cli_selfheal_{os.getpid()}"
+    try:
+        req = urllib.request.Request(
+            CLI_LATEST_URL,
+            headers={"User-Agent": f"DroneAware-Feeder-SelfHeal/{FW_VERSION}"},
         )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            if response.status != 200:
+                log.warning(f"Auto-heal fetch: HTTP {response.status}")
+                return False
+            with open(tmp_path, "wb") as out:
+                shutil.copyfileobj(response, out)
+    except Exception as e:
+        log.warning(f"Auto-heal fetch failed: {e}")
+        return False
+
+    try:
+        with open(tmp_path, "rb") as f:
+            first_line = f.readline()
+        if not first_line.startswith(b"#!"):
+            log.warning("Auto-heal: downloaded CLI has no shebang — refusing to install")
+            try: os.unlink(tmp_path)
+            except Exception: pass
+            return False
+    except Exception as e:
+        log.warning(f"Auto-heal sanity check failed: {e}")
+        return False
+
+    try:
+        with open(tmp_path) as f:
+            fresh_content = f.read()
+        if "install-webui" not in fresh_content:
+            log.warning(
+                "Auto-heal: downloaded CLI is itself missing install-webui — "
+                "not overwriting on-disk CLI"
+            )
+            try: os.unlink(tmp_path)
+            except Exception: pass
+            return False
+    except Exception as e:
+        log.warning(f"Auto-heal marker check failed: {e}")
+        return False
+
+    try:
+        new_path = CLI_PATH + ".new"
+        shutil.copy(tmp_path, new_path)
+        os.chmod(new_path, 0o755)
+        os.rename(new_path, CLI_PATH)
+        try: os.unlink(tmp_path)
+        except Exception: pass
+        return True
+    except PermissionError:
+        log.warning(
+            f"Auto-heal: insufficient permissions to write {CLI_PATH} "
+            "(feeder should run as root — check the systemd unit)"
+        )
+    except Exception as e:
+        log.warning(f"Auto-heal install failed: {e}")
+
+    for p in (tmp_path, CLI_PATH + ".new"):
+        try: os.unlink(p)
+        except Exception: pass
+    return False
 
 
 def _read_fw_version(fallback: str) -> str:
