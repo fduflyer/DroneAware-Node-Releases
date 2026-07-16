@@ -10,6 +10,130 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.4.8] — Unreleased
+
+Node-side response to the **phillyrox saturation incident** (2026-07-16).
+A node parked next to a single continuous BLE Remote ID beacon (Potensic
+RID-916, ~9 broadcasts/sec sustained) went from 12% CPU / 0.15 load to
+70% CPU / load 4.4 in ~90 seconds, and stayed there for **14+ hours**.
+BLE detection dropped to ~17% of pre-onset rate. The BLE feeder's
+heartbeat went silent — but the process was still alive, its uptime
+counter still advancing, still processing (some) advertisements. The
+server had zero signal that anything was wrong.
+
+Full incident forensics in `phillyrox-forensics/` and
+`node-saturation-continuous-broadcaster.md` (server session, 2026-07-16).
+
+### Root cause
+
+The BLE feeder's async architecture puts the scanner-callback dispatch,
+the periodic forwarder flush (`Forwarder._flush()`), and the periodic
+heartbeat all on the **same asyncio event loop**, in the same coroutine
+task. Under sustained high-rate BLE traffic:
+
+- `on_advertisement` is invoked frequently by `bleak`
+- Each call runs through decode + 5 sub-message publishes for a
+  Message Pack (Potensic sends all 5 ASTM types packed)
+- `Forwarder._flush()` uses a **synchronous** `requests.post` with a
+  5s timeout, called from `add()` when the buffer reaches batch size —
+  blocking the entire event loop for the duration of every POST
+- If any flush hits its timeout / server slowness, the batch is
+  re-queued at the front of the buffer, growing the payload, extending
+  the next POST duration, etc. — a positive feedback loop
+- Once entered, the heartbeat coroutine (which shares the same task
+  as the scanner loop) can't get a slot on the event loop to fire its
+  POST. The process is alive but the server sees silence.
+
+### Fixed
+
+- **BLE feeder heartbeat now runs in its own asyncio task**
+  (`_heartbeat_loop`), scheduled via `asyncio.create_task()` in
+  `BLEFeeder.run()`. Even if the scanner loop is saturated, the
+  heartbeat coroutine gets its own turn on the loop.
+
+- **BLE feeder flush no longer blocks the event loop.**
+  `Forwarder.add()` no longer triggers a synchronous flush when the
+  buffer hits batch size. Instead the main scanner loop calls
+  `Forwarder.should_flush()` each tick, and when true awaits
+  `asyncio.to_thread(Forwarder._flush)` — the sync `requests.post`
+  runs on a worker thread and can't block advertisement dispatch or
+  heartbeat scheduling.
+
+- **BLE feeder heartbeat POST also runs via `asyncio.to_thread`.**
+  Removes the last remaining sync-request-in-event-loop pattern.
+
+### Added — telemetry the server didn't have on 2026-07-16
+
+Both feeders now include these fields in every heartbeat POST payload:
+
+- `buffered` — current forwarder buffer length (events)
+- `buffered_bytes` — current forwarder buffer size
+- `dropped_total` — cumulative events dropped from the byte-bounded
+  buffer (was in the `[Heartbeat]` log line but never in the POST
+  payload; Filer #24 requested this exact field)
+- `sent_total` — cumulative events successfully forwarded
+- `restarts_since_boot` — feeder restart counter, persisted at
+  `/run/droneaware/{ble,wifi}_feeder_restarts_since_boot` (tmpfs;
+  naturally resets on Pi boot). Surfaces crash-loop patterns the
+  server can't distinguish from healthy uptime today. phillyrox
+  bounced twice per feeder in its first 45 minutes of deployment
+  — invisible in the server heartbeat stream until we noticed the
+  cumulative uptime_s ratio didn't match wall clock.
+
+BLE feeder additionally sends:
+
+- `event_loop_max_lag_ms` — max delay between scheduled and actual
+  scanner-loop ticks since the last heartbeat. Under healthy load
+  this is 0–20ms; under saturation (phillyrox-style) it climbs into
+  the thousands. **Direct saturation signal**: server can now
+  alert on `event_loop_max_lag_ms > 500` fleet-wide instead of
+  reasoning about symptoms.
+
+`[Heartbeat]` log lines also gain the new counters so operators
+tailing `journalctl` see the same story the server does.
+
+### Also fixed
+
+- **WiFi feeder's leftover "30s cycle" hardcoded log line.**
+  v1.4.6 made the dwell times configurable but a stale log message
+  at `WifiFeeder.__init__` still printed "30s cycle" regardless of
+  actual `WIFI_DWELL_2G_SEC` / `WIFI_DWELL_5G_SEC`. Now says just
+  `Hopper mode: dual-band (ch6 + ch149)` and lets the
+  `DualBandHopper`'s own startup log (which reports the real
+  timing) speak for itself.
+
+- **WiFi feeder `Forwarder` — same class of fix, different mechanism.**
+  Initial v1.4.8 draft only fixed BLE, on the theory that "WiFi's
+  threading model is less exposed." Re-examination during PR review
+  proved that wrong: WiFi's `Forwarder._flush_locked()` held
+  `self._lock` **across** the 5s `requests.post`. The packet-capture
+  main thread's `add()` would sit blocked on that lock during every
+  slow POST — same functional outcome as the BLE async starvation
+  (packet loss + delayed heartbeat), just via lock contention instead
+  of event-loop starvation. We haven't observed it in the field only
+  because most aftermarket RID modules default to BLE and typical
+  WiFi RID sources are moving drones, not fixed beacons. A stationary
+  WiFi RID source (Skydio DFR ground node, someone's aftermarket
+  module set to WiFi) would trigger it.
+
+  Fix mirrors the BLE side: `Forwarder.add()` no longer triggers
+  sync flush at `batch_size`; new `Forwarder.should_flush()` +
+  `Forwarder.flush()`; `flush()` grabs the batch under lock, releases
+  the lock, does the network POST with no lock held, reacquires
+  briefly to re-queue on failure. Background `_flush_loop` thread
+  handles all flushing.
+
+### Not fixed here (deferred to v1.4.9)
+
+- **Full Forwarder decoupling — sync `add()` still touches the buffer.**
+  Even with the new pattern, the packet-capture threads hold
+  `self._lock` briefly to append to the buffer. Under extreme rates
+  this could add microsecond-level tail latency. Not observed today;
+  would need `asyncio.Queue` or an equivalent to fully decouple.
+  Waiting for evidence before restructuring.
+
+---
+
 ## [1.4.7] — Unreleased
 
 Closes the last mile of the silent-CLI-update saga from v1.4.5 / v1.4.6.
