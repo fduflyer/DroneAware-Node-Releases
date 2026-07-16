@@ -1292,14 +1292,68 @@ class Forwarder:
             self.buffer.append((event, size))
             self.buffer_bytes += size
             self._evict_to_cap_locked()
+            # v1.4.8: no more sync _flush_locked here. Previously this held
+            # self._lock across a 5s requests.post — under sustained WiFi
+            # RID traffic the packet-capture main thread would sit blocked
+            # in add() while the kernel socket buffer overflowed and
+            # dropped packets silently. Mirrors the phillyrox failure
+            # mode we observed on the BLE side 2026-07-16. Flushing is
+            # now handled entirely by the background _flush_loop thread
+            # via should_flush() + flush().
+
+    def should_flush(self) -> bool:
+        """Advisory: True if a flush is due. Called from background thread."""
+        with self._lock:
+            if not self.buffer:
+                return False
             if len(self.buffer) >= self.batch_size:
-                self._flush_locked()
+                return True
+            return time.time() - self.last_flush >= self.flush_interval
 
     def tick(self):
+        """v1.4.8: kept for API compatibility, delegates to flush() which
+        takes the lock only for the batch-swap, NOT for the network POST."""
+        if self.should_flush():
+            self.flush()
+
+    def flush(self):
+        """Take a batch under lock, release lock during network POST, then
+        reacquire briefly to re-queue on failure. Critical: never hold
+        self._lock across the requests.post — that's what caused the
+        BLE-side analog of the phillyrox saturation and would do the
+        same here under a fixed WiFi RID source."""
         with self._lock:
-            if time.time() - self.last_flush >= self.flush_interval:
-                self._flush_locked()
-                self.last_flush = time.time()
+            if not self.buffer:
+                return
+            batch = list(self.buffer)
+            self.buffer.clear()
+            self.buffer_bytes = 0
+            self.last_flush = time.time()
+
+        # Network POST OUTSIDE the lock — main thread's add() can keep
+        # accepting new events during the (potentially 5s) request.
+        events = [e for e, _ in batch]
+        payload = {"node_id": self.node_id, "events": events}
+        try:
+            headers = {"X-Node-Token": self.token} if self.token else {}
+            r = requests.post(self.url, json=payload, headers=headers, timeout=5)
+            r.raise_for_status()
+            self.sent_total += len(events)
+            log.debug(f"Forwarded {len(events)} events ({self.sent_total} total)")
+        except requests.RequestException as e:
+            with self._lock:
+                for event, size in reversed(batch):
+                    self.buffer.appendleft((event, size))
+                    self.buffer_bytes += size
+                self.failed_total += len(events)
+                self._evict_to_cap_locked()
+            log.warning(
+                f"Forward failed: {e}  "
+                f"(buffered={len(self.buffer)}, "
+                f"buffer_bytes={self.buffer_bytes}, "
+                f"failed_total={self.failed_total}, "
+                f"dropped_total={self.dropped_total})"
+            )
 
     def _evict_to_cap_locked(self):
         """Drop oldest events until buffer_bytes <= max_buffer_bytes. Logs
@@ -1319,34 +1373,12 @@ class Forwarder:
             log.info(f"Forwarder buffer drained to {pct}% — caught up")
             self._warned_high = False
 
-    def _flush_locked(self):
-        if not self.buffer:
-            return
-        batch = list(self.buffer)
-        self.buffer.clear()
-        self.buffer_bytes = 0
-        events = [e for e, _ in batch]
-        payload = {"node_id": self.node_id, "events": events}
-        try:
-            headers = {"X-Node-Token": self.token} if self.token else {}
-            r = requests.post(self.url, json=payload, headers=headers, timeout=5)
-            r.raise_for_status()
-            self.sent_total += len(events)
-            log.debug(f"Forwarded {len(events)} events ({self.sent_total} total)")
-        except requests.RequestException as e:
-            # Re-queue failed events at the front. Any that no longer fit
-            # under the byte cap get evicted via _evict_to_cap_locked below.
-            for event, size in reversed(batch):
-                self.buffer.appendleft((event, size))
-                self.buffer_bytes += size
-            self.failed_total += len(events)
-            self._evict_to_cap_locked()
-            log.warning(
-                f"Forward failed: {e}  "
-                f"(buffered={len(self.buffer)}, "
-                f"buffer_bytes={self.buffer_bytes}, "
-                f"dropped_total={self.dropped_total})"
-            )
+    # v1.4.8: _flush_locked removed. Its logic was inlined into flush()
+    # above with a critical fix: the network POST now runs OUTSIDE the
+    # buffer lock. The old pattern held self._lock across a 5s request
+    # timeout, blocking the packet-capture main thread's add() calls and
+    # causing kernel socket buffer overflow under sustained WiFi RID
+    # traffic — the same failure mode we observed on BLE at phillyrox.
 
 
 # -- GPS Reader ----------------------------------------------------------------

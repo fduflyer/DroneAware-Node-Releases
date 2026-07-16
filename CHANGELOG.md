@@ -102,21 +102,35 @@ tailing `journalctl` see the same story the server does.
   `DualBandHopper`'s own startup log (which reports the real
   timing) speak for itself.
 
+- **WiFi feeder `Forwarder` — same class of fix, different mechanism.**
+  Initial v1.4.8 draft only fixed BLE, on the theory that "WiFi's
+  threading model is less exposed." Re-examination during PR review
+  proved that wrong: WiFi's `Forwarder._flush_locked()` held
+  `self._lock` **across** the 5s `requests.post`. The packet-capture
+  main thread's `add()` would sit blocked on that lock during every
+  slow POST — same functional outcome as the BLE async starvation
+  (packet loss + delayed heartbeat), just via lock contention instead
+  of event-loop starvation. We haven't observed it in the field only
+  because most aftermarket RID modules default to BLE and typical
+  WiFi RID sources are moving drones, not fixed beacons. A stationary
+  WiFi RID source (Skydio DFR ground node, someone's aftermarket
+  module set to WiFi) would trigger it.
+
+  Fix mirrors the BLE side: `Forwarder.add()` no longer triggers
+  sync flush at `batch_size`; new `Forwarder.should_flush()` +
+  `Forwarder.flush()`; `flush()` grabs the batch under lock, releases
+  the lock, does the network POST with no lock held, reacquires
+  briefly to re-queue on failure. Background `_flush_loop` thread
+  handles all flushing.
+
 ### Not fixed here (deferred to v1.4.9)
 
-- **WiFi feeder async model.** WiFi is threading-based, not asyncio,
-  so it's architecturally less exposed to the starvation pattern —
-  its packet handler runs in a different thread than the heartbeat.
-  The `Forwarder._flush()` sync-request-blocking pattern still
-  exists there but only stalls the heartbeat-tick thread, not the
-  packet capture. Left as-is; can revisit if we see similar signals
-  from WiFi-heavy nodes.
-
-- **Forwarder decoupling — sync `add()` still touches the buffer.**
-  Under extreme rates a lock on `self.buffer` between the scanner
-  thread and flush thread could add tail latency. Not observed
-  today; would need `asyncio.Queue` or an equivalent to fully
-  decouple. Waiting for evidence before restructuring.
+- **Full Forwarder decoupling — sync `add()` still touches the buffer.**
+  Even with the new pattern, the packet-capture threads hold
+  `self._lock` briefly to append to the buffer. Under extreme rates
+  this could add microsecond-level tail latency. Not observed today;
+  would need `asyncio.Queue` or an equivalent to fully decouple.
+  Waiting for evidence before restructuring.
 
 ---
 
