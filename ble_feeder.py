@@ -51,6 +51,36 @@ CLI_LATEST_URL = (
     "releases/latest/download/droneaware"
 )
 
+# v1.4.8: per-feeder restart counter, since last Pi reboot.
+# Written to tmpfs so a Pi reboot naturally resets it. Server aggregates
+# "restarts_since_boot" alongside uptime and can detect crash-loop patterns
+# (feeder restarting every few minutes) that a raw fw_version + uptime don't
+# surface. Surfaced 2026-07-16 during the phillyrox saturation investigation:
+# the WiFi + BLE feeders had bounced twice each in the first 45 min of
+# deployment, which was invisible in the server's heartbeat stream.
+RESTART_COUNTER_PATH = "/run/droneaware/ble_feeder_restarts_since_boot"
+
+
+def _get_restart_count() -> int:
+    """Read + increment /run/droneaware/ble_feeder_restarts_since_boot.
+    Returns the post-increment value (1 for the first-ever start after
+    boot; 2+ for subsequent restarts). Any error → returns 0; telemetry
+    failures never block feeder startup."""
+    try:
+        os.makedirs("/run/droneaware", exist_ok=True)
+        try:
+            with open(RESTART_COUNTER_PATH) as f:
+                current = int(f.read().strip() or "0")
+        except (FileNotFoundError, ValueError):
+            current = 0
+        new_val = current + 1
+        with open(RESTART_COUNTER_PATH, "w") as f:
+            f.write(str(new_val))
+        return new_val
+    except Exception as e:
+        log.warning(f"Failed to update restart counter: {e}")
+        return 0
+
 
 def _check_cli_freshness():
     """Detect + auto-heal a stale /usr/local/bin/droneaware CLI at feeder
@@ -756,11 +786,26 @@ class Forwarder:
         self.buffer.append((event, size))
         self.buffer_bytes += size
         self._evict_to_cap()
+        # v1.4.8: batch-size trigger no longer flushes here. Under the async
+        # BLE architecture, on_advertisement runs on the event loop thread —
+        # a sync requests.post from here would block advertisement dispatch,
+        # heartbeat, and every other coroutine until the POST returns. The
+        # main scanner loop calls should_flush() and awaits an
+        # asyncio.to_thread(_flush) instead. See BLEFeeder.run() and
+        # phillyrox forensics (2026-07-16) for the full story.
+
+    def should_flush(self) -> bool:
+        """Advisory: True if buffer has reached batch_size OR flush_interval
+        elapsed since last flush. Cheap; safe to call every tick."""
+        if not self.buffer:
+            return False
         if len(self.buffer) >= self.batch_size:
-            self._flush()
+            return True
+        return time.monotonic() - self.last_flush >= self.flush_interval
 
     def tick(self):
-        """Time-based flush — call once per second from the main loop."""
+        """Time-based flush — call once per second from a NON-async context
+        (kept for callers that don't have an event loop, e.g., unit tests)."""
         if time.monotonic() - self.last_flush >= self.flush_interval:
             self._flush()
             self.last_flush = time.monotonic()
@@ -784,6 +829,12 @@ class Forwarder:
             self._warned_high = False
 
     def _flush(self):
+        # v1.4.8: always update last_flush at entry so should_flush() paces
+        # correctly even when the buffer is empty (previously would starve
+        # the timer if buffer was momentarily drained). Also runs from
+        # asyncio.to_thread() now, so this executes on a worker thread and
+        # never blocks the async event loop.
+        self.last_flush = time.monotonic()
         if not self.buffer:
             return
 
@@ -836,6 +887,13 @@ class BLEFeeder:
         self.forwarder    = Forwarder(server_url, node_id, batch_size, flush_interval, token)
         self.publisher    = LocalPublisher()
         self.count        = 0
+        # v1.4.8 telemetry: restart count (see phillyrox incident) + event
+        # loop lag tracker (max delay between scheduled and actual scanner
+        # loop ticks, reset every heartbeat). Under healthy load lag is
+        # 0-20ms; a lag of thousands of ms is the direct signature of the
+        # phillyrox saturation state.
+        self.restart_count           = _get_restart_count()
+        self.max_lag_ms_this_interval = 0
 
     def on_advertisement(self, device: BLEDevice, adv: AdvertisementData):
         """Callback for every BLE advertisement containing UUID 0xFFFA service data."""
@@ -937,6 +995,9 @@ class BLEFeeder:
                         "ble_ok":       False,
                         "ble_adapter":  self.adapter,
                         "ble_fault":    reason,
+                        # v1.4.8: restart count meaningful even in FAULT
+                        # (a crash-looping FAULT feeder should be visible).
+                        "restarts_since_boot": self.restart_count,
                     },
                     headers={"X-Node-Token": self.token},
                     timeout=5,
@@ -979,58 +1040,126 @@ class BLEFeeder:
             adapter=self.adapter,
         )
 
-        async with scanner:
-            ticker = 0
-            while True:
-                await asyncio.sleep(1.0)
-                self.forwarder.tick()
-                ticker += 1
+        # v1.4.8: heartbeat runs in its own asyncio task, independent of
+        # the scanner loop. Even if the scanner loop is saturated processing
+        # advertisement callbacks (as phillyrox was 2026-07-16), the
+        # heartbeat coroutine still gets its own turn on the event loop.
+        # Scanner-loop flushes go through asyncio.to_thread so the sync
+        # requests.post inside Forwarder._flush never blocks the loop
+        # dispatch. Both changes together should make it impossible for
+        # a single burst of BLE traffic to make a node go silent from
+        # the server's perspective.
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        try:
+            async with scanner:
+                last_tick_time = time.monotonic()
+                while True:
+                    await asyncio.sleep(1.0)
 
-                if ticker % 60 == 0:
-                    cpu_temp        = get_cpu_temp()
-                    cpu_pct         = get_cpu_percent()
-                    load_1m, load_5m, load_15m = get_cpu_load()
-                    ble_ok, ble_adp = get_ble_health(self.adapter)
-                    temp_str    = f"{cpu_temp}°C" if cpu_temp is not None else "n/a"
-                    cpu_pct_str = f"{cpu_pct:.1f}%" if cpu_pct is not None else "n/a"
-                    load_str    = f"{load_1m:.2f}" if load_1m is not None else "n/a"
+                    # Measure event loop lag: how much MORE than 1.0s the
+                    # scheduled sleep actually took. Under healthy load
+                    # this is 0-20ms. Under saturation (phillyrox-style)
+                    # this climbs into the thousands of ms.
+                    now = time.monotonic()
+                    lag_ms = max(0, int((now - last_tick_time - 1.0) * 1000))
+                    if lag_ms > self.max_lag_ms_this_interval:
+                        self.max_lag_ms_this_interval = lag_ms
+                    last_tick_time = now
 
-                    log.info(
-                        f"[Heartbeat] seen={self.count}  "
-                        f"sent={self.forwarder.sent_total}  "
-                        f"dropped={self.forwarder.dropped_total}  "
-                        f"buffered={len(self.forwarder.buffer)}  "
-                        f"temp={temp_str}  cpu={cpu_pct_str}  load={load_str}  ble={ble_ok}"
-                    )
-                    if self.token:
+                    # Flush via a worker thread — sync requests.post inside
+                    # Forwarder._flush no longer blocks the async loop.
+                    if self.forwarder.should_flush():
                         try:
-                            requests.post(
-                                "https://api.droneaware.io/api/node/heartbeat",
-                                json={
-                                    # Per-feeder heartbeat: ble_* fields only.
-                                    # Do NOT include wifi_ok or wifi_fault — the
-                                    # server uses presence of an ok-field to
-                                    # route the heartbeat to that feeder's
-                                    # status row. WiFi status comes from
-                                    # wifi_feeder's own heartbeat.
-                                    "node_id":      self.node_id,
-                                    "uptime_s":     int(time.monotonic() - self.start_time),
-                                    "fw_version":   FW_VERSION,
-                                    "cpu_count":    os.cpu_count(),
-                                    "cpu_temp_c":   cpu_temp,
-                                    "cpu_percent":  cpu_pct,
-                                    "load_1m":      load_1m,
-                                    "load_5m":      load_5m,
-                                    "load_15m":     load_15m,
-                                    "ble_ok":       ble_ok,
-                                    "ble_adapter":  ble_adp,
-                                },
-                                headers={"X-Node-Token": self.token},
-                                timeout=5,
-                            )
-                            log.debug("Heartbeat sent to droneaware.io")
-                        except requests.RequestException as e:
-                            log.warning(f"Heartbeat failed: {e}")
+                            await asyncio.to_thread(self.forwarder._flush)
+                        except Exception as e:
+                            log.warning(f"Forwarder flush task failed: {e}")
+        finally:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _heartbeat_loop(self):
+        """v1.4.8: heartbeat runs here, in a dedicated asyncio task, so it
+        cannot be starved by scanner-callback processing. Sends the same
+        payload as pre-v1.4.8 plus new telemetry fields:
+          - dropped_total, buffered, buffered_bytes: forwarder backlog
+            state (Filer #24)
+          - restart_count: feeder restarts since Pi boot
+          - event_loop_lag_ms: max scanner-loop tick lag since last
+            heartbeat (direct saturation indicator)
+        POST goes via asyncio.to_thread so the 5s timeout can't block
+        the scanner loop even if this task shares the same worker pool."""
+        while True:
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                return
+
+            try:
+                cpu_temp        = get_cpu_temp()
+                cpu_pct         = get_cpu_percent()
+                load_1m, load_5m, load_15m = get_cpu_load()
+                ble_ok, ble_adp = get_ble_health(self.adapter)
+                temp_str    = f"{cpu_temp}°C" if cpu_temp is not None else "n/a"
+                cpu_pct_str = f"{cpu_pct:.1f}%" if cpu_pct is not None else "n/a"
+                load_str    = f"{load_1m:.2f}" if load_1m is not None else "n/a"
+
+                # Snapshot lag for this interval, then reset for next.
+                lag_ms = self.max_lag_ms_this_interval
+                self.max_lag_ms_this_interval = 0
+
+                log.info(
+                    f"[Heartbeat] seen={self.count}  "
+                    f"sent={self.forwarder.sent_total}  "
+                    f"dropped={self.forwarder.dropped_total}  "
+                    f"buffered={len(self.forwarder.buffer)}  "
+                    f"lag_ms={lag_ms}  "
+                    f"restarts={self.restart_count}  "
+                    f"temp={temp_str}  cpu={cpu_pct_str}  load={load_str}  ble={ble_ok}"
+                )
+                if self.token:
+                    try:
+                        await asyncio.to_thread(
+                            requests.post,
+                            "https://api.droneaware.io/api/node/heartbeat",
+                            json={
+                                # Per-feeder heartbeat: ble_* fields only.
+                                # Do NOT include wifi_ok or wifi_fault — the
+                                # server uses presence of an ok-field to
+                                # route the heartbeat to that feeder's
+                                # status row.
+                                "node_id":                    self.node_id,
+                                "uptime_s":                   int(time.monotonic() - self.start_time),
+                                "fw_version":                 FW_VERSION,
+                                "cpu_count":                  os.cpu_count(),
+                                "cpu_temp_c":                 cpu_temp,
+                                "cpu_percent":                cpu_pct,
+                                "load_1m":                    load_1m,
+                                "load_5m":                    load_5m,
+                                "load_15m":                   load_15m,
+                                "ble_ok":                     ble_ok,
+                                "ble_adapter":                ble_adp,
+                                # v1.4.8 telemetry additions:
+                                "buffered":                   len(self.forwarder.buffer),
+                                "buffered_bytes":             self.forwarder.buffer_bytes,
+                                "dropped_total":              self.forwarder.dropped_total,
+                                "sent_total":                 self.forwarder.sent_total,
+                                "restarts_since_boot":        self.restart_count,
+                                "event_loop_max_lag_ms":      lag_ms,
+                            },
+                            headers={"X-Node-Token": self.token},
+                            timeout=5,
+                        )
+                        log.debug("Heartbeat sent to droneaware.io")
+                    except requests.RequestException as e:
+                        log.warning(f"Heartbeat failed: {e}")
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                # Catch-all — never let a heartbeat exception kill the task.
+                log.warning(f"Heartbeat loop error (continuing): {e}")
 
 
 # -- Enrollment ----------------------------------------------------------------

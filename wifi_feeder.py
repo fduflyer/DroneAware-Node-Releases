@@ -53,6 +53,29 @@ CLI_LATEST_URL = (
     "releases/latest/download/droneaware"
 )
 
+# v1.4.8: per-feeder restart counter, since last Pi reboot.
+# See ble_feeder.py for the full rationale.
+RESTART_COUNTER_PATH = "/run/droneaware/wifi_feeder_restarts_since_boot"
+
+
+def _get_restart_count() -> int:
+    """Read + increment /run/droneaware/wifi_feeder_restarts_since_boot.
+    See ble_feeder.py:_get_restart_count for details."""
+    try:
+        os.makedirs("/run/droneaware", exist_ok=True)
+        try:
+            with open(RESTART_COUNTER_PATH) as f:
+                current = int(f.read().strip() or "0")
+        except (FileNotFoundError, ValueError):
+            current = 0
+        new_val = current + 1
+        with open(RESTART_COUNTER_PATH, "w") as f:
+            f.write(str(new_val))
+        return new_val
+    except Exception as e:
+        log.warning(f"Failed to update restart counter: {e}")
+        return 0
+
 
 def _check_cli_freshness():
     """Detect + auto-heal a stale /usr/local/bin/droneaware CLI at feeder
@@ -1750,7 +1773,10 @@ class WiFiFeeder:
                     log.info(f"Single-band adapter on {iface} — 2.4 GHz only")
 
             if enable_5g:
-                log.info("Hopper mode: dual-band (ch6 + ch149, 30s cycle)")
+                # Cycle length is per-instance (dwell env vars, v1.4.6+) so
+                # DON'T hardcode it here — the DualBandHopper's own startup
+                # log reports the actual timing after __init__ parses env.
+                log.info("Hopper mode: dual-band (ch6 + ch149)")
                 self.hopper = DualBandHopper(iface)
             else:
                 log.info("Hopper mode: adaptive (sweep + sticky, channel-6 biased)")
@@ -1758,6 +1784,8 @@ class WiFiFeeder:
         self.count       = 0
         self.nan_count   = 0
         self._scanning   = False
+        # v1.4.8: restart count since Pi boot (see phillyrox incident memo).
+        self.restart_count = _get_restart_count()
 
     def _on_packet(self, data: bytes):
         # Parse RadioTap header to get RSSI, channel, and skip to 802.11 MAC header
@@ -1956,6 +1984,11 @@ class WiFiFeeder:
                         "has_gps":      has_gps,
                         "lat":          lat,
                         "lon":          lon,
+                        # v1.4.8 telemetry — restart count is meaningful
+                        # even in FAULT loop (a crash-looping FAULT feeder
+                        # is worth surfacing). No forwarder in FAULT mode,
+                        # so no buffered/dropped fields.
+                        "restarts_since_boot": self.restart_count,
                     },
                     headers={"X-Node-Token": self.token},
                     timeout=5,
@@ -1981,6 +2014,8 @@ class WiFiFeeder:
                     f"[Heartbeat] Beacon RID={self.count}  NAN={self.nan_count}  "
                     f"sent={self.forwarder.sent_total}  failed={self.forwarder.failed_total}  "
                     f"dropped={self.forwarder.dropped_total}  "
+                    f"buffered={len(self.forwarder.buffer)}  "
+                    f"restarts={self.restart_count}  "
                     f"cpu={cpu_pct_str}  load={load_str}"
                 )
                 if self.token:
@@ -2014,6 +2049,14 @@ class WiFiFeeder:
                                 "has_gps":      has_gps,
                                 "lat":          lat,
                                 "lon":          lon,
+                                # v1.4.8 telemetry additions — mirror BLE.
+                                "buffered":            len(self.forwarder.buffer),
+                                "buffered_bytes":      self.forwarder.buffer_bytes,
+                                "dropped_total":       self.forwarder.dropped_total,
+                                "sent_total":          self.forwarder.sent_total,
+                                "restarts_since_boot": self.restart_count,
+                                # WiFi feeder is threading-based — no
+                                # equivalent event_loop_max_lag_ms metric.
                             },
                             headers={"X-Node-Token": self.token},
                             timeout=5,
