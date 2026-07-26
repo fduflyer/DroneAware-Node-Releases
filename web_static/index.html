@@ -693,6 +693,7 @@
       </span>
     </div>
     <div class="header-right">
+      <button class="icon-btn" id="btn-units" title="Toggle units (imperial / metric)" aria-label="Toggle units" style="font-size: 12px; font-weight: 700; letter-spacing: 0.5px;">ft</button>
       <button class="icon-btn" id="btn-theme" title="Toggle theme" aria-label="Toggle theme">◐</button>
     </div>
   </div>
@@ -823,6 +824,15 @@
       // bundle that doesn't exist on this node.
       tileSource: (typeof navigator !== "undefined" && navigator.onLine === false) ? "local" : "cartocdn",
       tilesLocalAvailable: false,
+      // Display units: "imperial" (ft AGL / mph / mi rings) or "metric"
+      // (m AGL / km/h / km rings). Persisted per-browser in localStorage.
+      // Default imperial — matches US operator majority; international
+      // operators can flip via the header toggle and the choice sticks.
+      units: (typeof localStorage !== "undefined" && localStorage.getItem("da_units") === "metric") ? "metric" : "imperial",
+      // Cached home location so we can re-draw distance rings when the
+      // unit toggle flips between miles and kilometers without waiting
+      // for the next /api/status refresh.
+      home: null,
     };
 
     /* ----- Helpers ----- */
@@ -964,12 +974,14 @@
     }
 
     /* ----- Home location + distance rings ----- */
-    // 10 concentric rings at 1-mile intervals around the node's home
-    // location. No offset applied — offline view is inherently private
-    // (LAN-only, no internet exposure), so showing the actual node
-    // location is fine. Rings give the operator instant range context
-    // for any detection on the map.
+    // 10 concentric rings around the node's home location — 1 mi steps
+    // in imperial mode, 1 km steps in metric mode (chosen at render
+    // time from state.units). No offset applied — offline view is
+    // inherently private (LAN-only, no internet exposure), so showing
+    // the actual node location is fine. Rings give the operator instant
+    // range context for any detection on the map.
     const MILE_METERS = 1609.344;
+    const KM_METERS = 1000;
     const RING_COUNT = 10;
 
     function drawHomeView(home) {
@@ -979,17 +991,25 @@
         // no GPS fix yet.
         return;
       }
+      const isFirstDraw = state.home == null;
+      state.home = home;
       state.homeLayer.clearLayers();
       const center = [home.lat, home.lon];
 
-      // Recenter the map on home. Zoom 11 gives a ~15-mile-wide view,
-      // comfortable for showing all 10 rings on a typical display.
-      state.map.setView(center, 11);
+      // Recenter + zoom the map on the FIRST home draw only. On mobile
+      // nodes the GPS fix updates every ~2s and re-calling setView here
+      // would wipe out any manual pan/zoom the operator has done. The
+      // rings/marker below still redraw at the new position, so the map
+      // stays accurate — the user's chosen view just isn't blown away.
+      if (isFirstDraw) state.map.setView(center, 11);
 
-      // Concentric distance rings: 1mi through 10mi, dashed cyan.
+      const stepMeters = state.units === "metric" ? KM_METERS : MILE_METERS;
+      const unitLabel  = state.units === "metric" ? "km" : "mi";
+
+      // Concentric distance rings, dashed cyan.
       for (let i = 1; i <= RING_COUNT; i++) {
         L.circle(center, {
-          radius: i * MILE_METERS,
+          radius: i * stepMeters,
           color: "#00E5FF",
           weight: 1,
           opacity: 0.22,
@@ -999,11 +1019,11 @@
         }).addTo(state.homeLayer);
 
         // Distance label at the 12 o'clock position of each ring.
-        const labelLat = home.lat + (i * MILE_METERS) / 111320;  // meters → degrees lat
+        const labelLat = home.lat + (i * stepMeters) / 111320;  // meters → degrees lat
         L.marker([labelLat, home.lon], {
           icon: L.divIcon({
             className: "ring-label",
-            html: `${i} mi`,
+            html: `${i} ${unitLabel}`,
             iconSize: [40, 12],
             iconAnchor: [20, 6],
           }),
@@ -1196,9 +1216,8 @@
 
       // Stats row: altitude · speed · node-id. Skip components that don't
       // have data so we don't render dangling '·' separators.
-      const altFt = metersToFtAGL(evt.alt ?? evt.altitude_geo);
-      const altText = altFt != null ? `${altFt} ft AGL` : null;
-      const spdText = speedLabel(evt.speed);
+      const altText = formatAltitude(evt);
+      const spdText = formatSpeed(evt.speed);
       const nodeText = state.nodeId || "this-node";
       const statsParts = [altText, spdText, nodeText].filter(Boolean);
       const statsHTML = statsParts.length
@@ -1414,11 +1433,18 @@
         }
 
         // Home location may change on mobile nodes as the GPS fix moves.
-        // Only redraw if the location actually changed (avoids tearing down
-        // the rings every 2 seconds for static nodes).
+        // Static nodes: strict equality is fine (config-file source, never
+        // wobbles). Mobile nodes: even a stationary GPS drifts ±3-10 m
+        // every poll, so we ignore movement smaller than ~10 m to keep
+        // the rings from tearing down twice per second. Anything larger
+        // than the threshold is a real move worth redrawing.
         if (s.home) {
           const cur = state.lastHome;
-          if (!cur || cur.lat !== s.home.lat || cur.lon !== s.home.lon) {
+          const HOME_MOVE_THRESHOLD_DEG = 0.0001;   // ~11 m at mid-latitude
+          const moved = !cur
+            || Math.abs(cur.lat - s.home.lat) > HOME_MOVE_THRESHOLD_DEG
+            || Math.abs(cur.lon - s.home.lon) > HOME_MOVE_THRESHOLD_DEG;
+          if (moved) {
             drawHomeView(s.home);
             state.lastHome = { lat: s.home.lat, lon: s.home.lon };
           }
@@ -1484,14 +1510,29 @@
       12: "Rocket",    13: "Tethered Powered", 14: "Ground Obstacle",
     };
 
-    function metersToFtAGL(meters) {
-      if (typeof meters !== "number") return null;
-      return Math.round(meters * 3.28084);
+    // Altitude — prefer height_agl (ASTM RID Location bytes 17-18, real AGL
+    // or above-takeoff depending on the drone's height_type flag) over the
+    // geometric MSL/WGS84 altitude that was previously used and mislabeled.
+    // Silent fallback: if height_agl is absent we still label "AGL" — a
+    // small minority of drones only broadcast geometric altitude, and the
+    // current behavior is preserved for them.
+    function altitudeSource(evt) {
+      if (typeof evt.height_agl === "number") return evt.height_agl;
+      if (typeof evt.alt === "number") return evt.alt;
+      if (typeof evt.altitude_geo === "number") return evt.altitude_geo;
+      return null;
     }
-    function speedLabel(mps) {
+    function formatAltitude(evt) {
+      const m = altitudeSource(evt);
+      if (m == null) return null;
+      if (state.units === "metric") return `${Math.round(m)} m AGL`;
+      return `${Math.round(m * 3.28084)} ft AGL`;
+    }
+    function formatSpeed(mps) {
       if (typeof mps !== "number") return null;
       if (mps < 1.0) return "Hovering";
-      return `${(mps * 3.6).toFixed(1)} km/h`;
+      if (state.units === "metric") return `${(mps * 3.6).toFixed(1)} km/h`;
+      return `${(mps * 2.23694).toFixed(1)} mph`;
     }
 
     function buildPopupHTML(mac) {
@@ -1513,8 +1554,8 @@
           ${evt.faa_documented ? '<span class="da-popup-badge">FAA DOC</span>' : ""}
         </div>` : "";
 
-      const altFt = metersToFtAGL(evt.alt ?? evt.altitude_geo);
-      const speedTxt = speedLabel(evt.speed);
+      const altTxt = formatAltitude(evt);
+      const speedTxt = formatSpeed(evt.speed);
       const typeTxt = UA_TYPES[evt.ua_type] || evt.type || "—";
       const headingTxt = (evt.hdg != null) ? `${evt.hdg}°`
                        : (evt.heading != null) ? `${evt.heading}°`
@@ -1542,7 +1583,7 @@
             <div class="da-popup-label">Type</div>
             <div class="da-popup-value">${escapeHtml(typeTxt)}</div>
             <div class="da-popup-label">Altitude</div>
-            <div class="da-popup-value">${altFt != null ? altFt + " ft AGL" : "—"}</div>
+            <div class="da-popup-value">${altTxt || "—"}</div>
             <div class="da-popup-label">Speed</div>
             <div class="da-popup-value">${speedTxt || "—"}</div>
           </div>
@@ -1585,15 +1626,20 @@
       state.map.closePopup();
     }
 
-    function renderTrailPolyline(entry, color) {
+    // Flight-path trail — fixed bright yellow, decoupled from the
+    // drone's freshness tier. Freshness is already communicated by the
+    // marker color; the trail's job is to be visually distinct against
+    // any basemap so the operator can trace the full flight at a glance.
+    // Ignores the `color` argument passed by callers (kept for compat).
+    const TRAIL_COLOR = "#FFD400";
+    function renderTrailPolyline(entry, _color) {
       if (!entry.trail || entry.trail.length < 2) return;
       if (!entry.polyline) {
         entry.polyline = L.polyline(entry.trail, {
-          color, weight: 2, opacity: 0.75, interactive: false,
+          color: TRAIL_COLOR, weight: 4, opacity: 1.0, interactive: false,
         }).addTo(state.map);
       } else {
         entry.polyline.setLatLngs(entry.trail);
-        entry.polyline.setStyle({ color });
       }
     }
 
@@ -1658,6 +1704,31 @@
       applyMapTheme();
     }
 
+    /* ----- Units toggle (imperial / metric) ----- */
+    function updateUnitsButton() {
+      const btn = document.getElementById("btn-units");
+      if (!btn) return;
+      btn.textContent = state.units === "metric" ? "m" : "ft";
+      btn.title = `Units: ${state.units} — click to switch`;
+    }
+    function applyUnits() {
+      // Rebuild every sidebar card so altitude/speed swap units.
+      for (const mac of state.macs.keys()) renderCard(mac);
+      applyFilters();
+      // Redraw home rings so 1mi → 1km (or vice versa).
+      if (state.home) drawHomeView(state.home);
+      // If a popup is open, close and reopen so the new units show in it.
+      // Popup content is generated inline at open time — closing is enough
+      // for a subsequent click to render with the new units.
+      if (state.map) state.map.closePopup();
+    }
+    function toggleUnits() {
+      state.units = state.units === "imperial" ? "metric" : "imperial";
+      try { localStorage.setItem("da_units", state.units); } catch (_) {}
+      updateUnitsButton();
+      applyUnits();
+    }
+
     /* ----- Filter chip wiring ----- */
     function initFilters() {
       document.querySelectorAll(".chip").forEach(chip => {
@@ -1685,7 +1756,9 @@
       loadTheme();
       initMap();
       initFilters();
+      updateUnitsButton();
       document.getElementById("btn-theme").addEventListener("click", toggleTheme);
+      document.getElementById("btn-units").addEventListener("click", toggleUnits);
 
       // Network transitions → swap the basemap source. CartoDB if we're
       // online (full street-level detail), bundled local tiles when

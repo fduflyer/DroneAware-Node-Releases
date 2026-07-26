@@ -12,46 +12,109 @@ Full release artifacts and discussion notes live at the
 
 ## [1.4.9] — Unreleased
 
-Local Web UI trail truncation fix. Operators reported flight-path
-polylines that appeared to "only show the last few seconds" of a
-sortie, even when the drone was still overhead. Two independent nodes
-reproduced the same behavior on the same operator's flights.
+Local Web UI polish release: five operator-reported issues addressed
+in one pass. All changes are frontend or in-memory store bounds — no
+feeder, protocol, or server contract changes.
 
-### Root cause
+### 1. Trail truncation — flight path only showed the last minute
 
-`web_ui.py`'s `Store.snapshot()` derived a chronological list of unique
-lat/lon positions from each MAC's event deque, then capped the returned
-list at the last 60 entries (`trail[-60:]`). ASTM RID drones broadcast
-Location messages at ~1 Hz, so 60 unique positions ≈ 60 seconds of
-visible trail. Anything longer scrolled the polyline forward — the
-head of the flight dropped off silently. The 60-cap predated the
-current byte-cap deque (50 MB across all MACs) and the 12h stale-prune
-sweep, both of which already bound memory. The trail cap was doing no
-additional bounding work — just losing data.
+Two independent nodes reproduced the same complaint: flight-path
+polylines "only show the last few seconds" of a sortie, even with the
+drone still overhead.
 
-### Fix
+Root cause: `web_ui.py`'s `Store.snapshot()` derived a chronological
+list of unique lat/lon positions from each MAC's event deque, then
+capped the returned list at the last 60 entries (`trail[-60:]`). ASTM
+RID drones broadcast Location messages at ~1 Hz, so 60 unique
+positions ≈ 60 seconds of visible trail. Anything longer scrolled the
+polyline forward — the head of the flight dropped off silently. The
+60-cap predated the current byte-cap deque (50 MB across all MACs)
+and the 12h stale-prune sweep, both of which already bound memory.
 
-- Bump per-MAC trail cap from **60 → 10,000 unique positions**.
-  At 1 Hz that's ~2.8 hours of visible flight — comfortably beyond
-  any single sortie and inside the 12h stale window that already
-  ages events out of the deque.
-- Snapshot payload per MAC stays under ~150 KB even at the new
-  ceiling; deque byte-cap and stale prune remain the actual memory
-  bounds.
+Fix: per-MAC trail cap **60 → 10,000 unique positions**. At 1 Hz
+that's ~2.8h of visible flight — comfortably beyond any single sortie
+and inside the 12h stale window. Snapshot payload per MAC stays under
+~150 KB at the new ceiling.
+
+### 2. Altitude label lied about what it was showing
+
+The popup and sidebar card labeled altitude "ft AGL" but were reading
+`altitude_geo` (ASTM F3411 geometric altitude = WGS84 ellipsoid MSL).
+Real AGL travels on a separate ODID field (`height_agl`, Location
+bytes 17-18). For a drone flying near sea level the numbers happen to
+match; for anyone flying at meaningful ground elevation the "AGL"
+label was showing MSL. Verified on live tmpfs data with a grounded
+drone: `alt: -14.0` (MSL) vs `height_agl: 0.0` (correct AGL) —
+frontend was rendering "-46 ft AGL" for a drone on the ground.
+
+Fix: prefer `evt.height_agl` when the drone broadcasts it; fall back
+to `evt.alt`/`evt.altitude_geo` for the small minority of drones that
+only send geometric altitude (silent fallback, current behavior for
+those cases).
+
+### 3. Metric / imperial unit toggle
+
+Prior release displayed altitude in feet ("ft AGL") but speed in km/h
+— an imperial/metric mix that confused US operators reading a card
+labeled "ft" alongside a number that "seemed like meters." Rather than
+just flip speed to mph, this release adds a header toggle (**ft** ↔
+**m** button next to the theme toggle) that switches every unit in
+the UI at once. Default is imperial; the preference is remembered
+per-browser via `localStorage`.
+
+Affected displays:
+- Altitude: `ft AGL` ↔ `m AGL`
+- Speed: `mph` ↔ `km/h` (`Hovering` unchanged when < 1 m/s)
+- Home rings: `1 mi..10 mi` ↔ `1 km..10 km` (redrawn on toggle)
+
+### 4. Flight-path trail — bright yellow, wider
+
+Operators reported the trail polyline was easy to miss during a
+flight. Previous trail took the current freshness-tier color (cyan /
+orange / red) at weight 2 opacity 0.75 — fine on a dark basemap, but
+freshness is already communicated by the drone marker. Trail now
+renders in fixed bright yellow (`#FFD400`), weight 4, opacity 1.0 —
+decoupled from freshness so the two visual signals don't overload
+each other.
+
+### 5. Mobile Web UI jitter — map recentered every 2s
+
+On mobile nodes (`NODE_MOBILE=true`), the status poll pulls a fresh
+GPS fix every 2 seconds. Even a stationary GPS drifts ±3-10 m each
+poll, and the frontend's old strict-equality guard (`cur.lat !==
+s.home.lat`) treated every micro-drift as a real move. That triggered
+`drawHomeView()`, which called `state.map.setView(center, 11)` — wiping
+out any manual pan/zoom the operator had done. Result: the map
+recentered and reset to zoom 11 twice per second, which operators
+correctly described as "the zoom level resets every 2 seconds."
+
+Fix: two guards.
+- Ignore GPS movement smaller than ~11 m (`0.0001°`) at the status-
+  poll layer — that's above typical stationary drift but well below
+  any meaningful travel.
+- Only call `setView(center, 11)` on the **first** home draw. Later
+  redraws update the marker and rings at the new position without
+  touching the map view, so the operator's pan/zoom sticks.
 
 ### Files changed
 
-- `web_ui.py`: `snapshot()` trail slice `[-60:]` → `[-10000:]` plus
-  updated docstring.
+- `web_ui.py` — `snapshot()` trail cap `[-60:]` → `[-10000:]` + doc.
+- `web_static/index.html` — altitude/speed helpers refactored around a
+  `state.units` flag with `height_agl` preferred over `altitude_geo`;
+  header units button + toggle handler; home-ring step and label made
+  unit-aware; trail polyline color/weight/opacity fixed;
+  `drawHomeView()` skips `setView` after the first draw and the
+  status-refresh guard adds a ~11 m movement threshold.
 
 ### Not in this release
 
-- Mobile Web UI jitter (map recenters every 2s from GPS noise) —
-  scoped for v1.5.0 alongside the multi-radio work.
 - Server-side CSV export dropping data (operator report, same day)
   — server session territory, tracked separately.
 - Alert cooldown reset-on-inactivity + fleet allowlist — server
   session feature backlog.
+- WiFi adapter identification fragility (Chris's backhaul-swap
+  incident) + dual-adapter dual-band scanning — the full v1.5.0
+  scope.
 
 ---
 
