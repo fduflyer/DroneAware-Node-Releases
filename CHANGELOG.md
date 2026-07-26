@@ -10,6 +10,31 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.4.10] — Unreleased
+
+Hotfix for v1.4.9's trail-truncation fix. Same-day operator test flight
+still showed only ~60 trail points after installing v1.4.9.
+
+Root cause: v1.4.9 raised the **server-side** cap in `web_ui.py`'s
+`Store.snapshot()` from `[-60:]` → `[-10000:]`, but the frontend has
+an **independent** `TRAIL_MAX = 60` in `web_static/index.html`. On
+initial page load the client hydrates `entry.trail` from the server
+snapshot (up to 10,000 points) — but every subsequent SSE event calls
+`appendTrail()`, which trims the array back down to 60. Within a few
+seconds of live flight, only the last 60 positions remained.
+
+Fix: raise `TRAIL_MAX` to `10000` to match the server-side cap.
+Comment updated to note that the two caps must stay in sync — a
+browser refresh should not show a longer trail than the live stream
+will maintain.
+
+### Files changed
+
+- `web_static/index.html` — `TRAIL_MAX = 60` → `10000` plus comment
+  noting the server-side cap it must track.
+
+---
+
 ## [1.4.9] — Unreleased
 
 Local Web UI polish release: five operator-reported issues addressed

@@ -1063,8 +1063,11 @@
 
     // Per-MAC position history for flight-path rendering. Capped at
     // TRAIL_MAX positions to keep memory bounded; older positions drop
-    // off the back of the trail as the drone moves.
-    const TRAIL_MAX = 60;
+    // off the back of the trail as the drone moves. Must match (or be
+    // ≤) the server-side `snapshot()` cap in web_ui.py so a browser
+    // refresh doesn't show a longer trail than the live stream will
+    // maintain — currently 10,000 (~2.8h of visible flight at 1 Hz).
+    const TRAIL_MAX = 10000;
 
     function appendTrail(entry, lat, lon) {
       if (!entry.trail) entry.trail = [];
