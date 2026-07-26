@@ -10,6 +10,51 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.4.9] — Unreleased
+
+Local Web UI trail truncation fix. Operators reported flight-path
+polylines that appeared to "only show the last few seconds" of a
+sortie, even when the drone was still overhead. Two independent nodes
+reproduced the same behavior on the same operator's flights.
+
+### Root cause
+
+`web_ui.py`'s `Store.snapshot()` derived a chronological list of unique
+lat/lon positions from each MAC's event deque, then capped the returned
+list at the last 60 entries (`trail[-60:]`). ASTM RID drones broadcast
+Location messages at ~1 Hz, so 60 unique positions ≈ 60 seconds of
+visible trail. Anything longer scrolled the polyline forward — the
+head of the flight dropped off silently. The 60-cap predated the
+current byte-cap deque (50 MB across all MACs) and the 12h stale-prune
+sweep, both of which already bound memory. The trail cap was doing no
+additional bounding work — just losing data.
+
+### Fix
+
+- Bump per-MAC trail cap from **60 → 10,000 unique positions**.
+  At 1 Hz that's ~2.8 hours of visible flight — comfortably beyond
+  any single sortie and inside the 12h stale window that already
+  ages events out of the deque.
+- Snapshot payload per MAC stays under ~150 KB even at the new
+  ceiling; deque byte-cap and stale prune remain the actual memory
+  bounds.
+
+### Files changed
+
+- `web_ui.py`: `snapshot()` trail slice `[-60:]` → `[-10000:]` plus
+  updated docstring.
+
+### Not in this release
+
+- Mobile Web UI jitter (map recenters every 2s from GPS noise) —
+  scoped for v1.5.0 alongside the multi-radio work.
+- Server-side CSV export dropping data (operator report, same day)
+  — server session territory, tracked separately.
+- Alert cooldown reset-on-inactivity + fleet allowlist — server
+  session feature backlog.
+
+---
+
 ## [1.4.8] — Unreleased
 
 Node-side response to the **phillyrox saturation incident** (2026-07-16).

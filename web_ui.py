@@ -272,7 +272,9 @@ class DetectionStore:
                 merged: dict = {}
                 # Trail: chronological list of unique lat/lon positions
                 # across this MAC's retained events. Capped at the last
-                # 60 unique positions. Lets the frontend reconstruct
+                # 10,000 unique positions (~2.8h at 1Hz Location broadcasts,
+                # comfortably beyond any single-sortie flight and within
+                # the 12h stale window). Lets the frontend reconstruct
                 # the flight-path polyline immediately on snapshot load
                 # — without this, trails are client-only state that
                 # gets lost on web_ui restart or browser reload.
@@ -297,7 +299,7 @@ class DetectionStore:
                     "last_seen":    latest_ts,
                     "age_sec":      now - latest_ts,
                     "event_count":  len(dq),
-                    "trail":        trail[-60:],
+                    "trail":        trail[-10000:],
                 })
             total_events = sum(len(dq) for dq in self._by_mac.values())
             return {
