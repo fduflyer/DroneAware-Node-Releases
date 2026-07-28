@@ -721,6 +721,46 @@ migrate_config() {
 # ---------------------------------------------------------------------------
 # 10. Enroll node — requires a logged-in DroneAware account
 # ---------------------------------------------------------------------------
+
+# Serialize the enrollment request body via python3's json.dumps. Callers
+# hand in string values; this converts them to correctly-typed JSON. Values
+# arrive via argv (never interpolated into the Python source), so shell
+# metacharacters in node_id/token cannot affect the code. Fails loudly on
+# unexpected inputs — a bug elsewhere that leaves a variable empty should
+# surface as an install failure, not a silently-malformed request.
+#
+# Args (positional):
+#   $1  node_id           — arbitrary string
+#   $2  enrollment_token  — arbitrary string
+#   $3  mobile            — "true" | "false"
+#   $4  has_gps           — "true" | "false"
+#   $5  lat               — decimal number as string, or "null" for absent
+#   $6  lon               — decimal number as string, or "null" for absent
+#
+# Prints the JSON body to stdout. Exits nonzero (under set -e propagates up)
+# if python3 is missing, an argument has the wrong shape, or json.dumps fails.
+_build_enroll_body() {
+    python3 -c '
+import json, sys
+node_id, token, mobile, has_gps, lat, lon = sys.argv[1:7]
+def _num(s):
+    if s in ("null", ""): return None
+    return float(s)
+def _bool(name, s):
+    if s == "true":  return True
+    if s == "false": return False
+    raise SystemExit(f"_build_enroll_body: {name} must be \"true\" or \"false\", got {s!r}")
+sys.stdout.write(json.dumps({
+    "node_id":          node_id,
+    "enrollment_token": token,
+    "mobile":           _bool("mobile", mobile),
+    "has_gps":          _bool("has_gps", has_gps),
+    "lat":              _num(lat),
+    "lon":              _num(lon),
+}, separators=(",", ":")))
+' "$@"
+}
+
 enroll_node() {
     heading "Node Enrollment"
     echo ""
@@ -741,7 +781,11 @@ enroll_node() {
         warn "Enrollment token cannot be empty."
     done
 
-    # Build JSON-safe values for optional numeric/boolean fields
+    # Build JSON-safe values for optional numeric/boolean fields.
+    # These strings are handed to _build_enroll_body (python3 + json.dumps),
+    # which converts them to real typed JSON values. Lat/lon use the literal
+    # string "null" as a sentinel for "not set"; booleans are literal
+    # "true"/"false" strings that _build_enroll_body converts to real bool.
     local lat_json lon_json has_gps_json
     if [[ -n "${NODE_LAT:-}" ]]; then
         lat_json="${NODE_LAT}"
@@ -752,6 +796,20 @@ enroll_node() {
     fi
     [[ -n "${GPS_DEVICE:-}" ]] && has_gps_json="true" || has_gps_json="false"
 
+    # Serialize the request body via python3's json.dumps. Never hand-roll
+    # JSON in bash — string interpolation can silently produce malformed
+    # output when a variable is empty (e.g. `"has_gps":,`) and can't safely
+    # escape arbitrary characters in node_id or the enrollment token.
+    # Values are passed via argv so shell metacharacters can't affect the
+    # Python code itself. If this ever fails (python3 missing, json module
+    # missing) the script exits under `set -e` rather than sending garbage.
+    local body
+    if ! body=$(_build_enroll_body \
+        "$NODE_ID" "$enrollment_token" "$NODE_MOBILE" \
+        "$has_gps_json" "$lat_json" "$lon_json"); then
+        fatal "Failed to serialize enrollment body. Confirm python3 is installed: 'sudo apt install python3'"
+    fi
+
     while true; do
         echo ""
         echo "  Contacting DroneAware network..."
@@ -761,7 +819,7 @@ enroll_node() {
             -o /tmp/droneaware_enroll.json \
             -w "%{http_code}" \
             -H "Content-Type: application/json" \
-            -d "{\"node_id\":\"${NODE_ID}\",\"enrollment_token\":\"${enrollment_token}\",\"mobile\":${NODE_MOBILE},\"has_gps\":${has_gps_json},\"lat\":${lat_json},\"lon\":${lon_json}}" \
+            --data-binary "$body" \
             "${SERVER_URL}/node/enroll" 2>/dev/null) || true
         response=$(cat /tmp/droneaware_enroll.json 2>/dev/null || true)
 

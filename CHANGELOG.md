@@ -10,6 +10,80 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.4.11] — Unreleased
+
+Installer hardening: `install.sh` no longer builds the enrollment request
+body via bash string interpolation. Zero change to what gets sent on the
+wire on nominal input — byte-for-byte identical body — but a whole class
+of "silently-malformed request" bugs is now eliminated.
+
+### Why
+
+Discovered 2026-07-28 during a cross-session audit of a user enrollment
+failure. Server-side observed 39 rejected `POST /api/node/enroll`
+attempts from a single user with 5 distinct malformed body shapes,
+including `{"has_gps":,...}` (empty value — invalid JSON). Server
+correctly concluded the requests were hand-rolled clients missing
+`Content-Type: application/json` (verified empirically via the Pydantic
+`model_attributes_type` vs `json_invalid` error split). The official
+installer was **not** the source of that user's failure.
+
+But the audit surfaced that the installer had been building the body via
+bash template — `curl -d "{\"node_id\":\"${NODE_ID}\",...}"` — since
+v1.0.19. Under defensive coding in enroll_node() no shipped path leaves
+a variable empty, but that guarantee is one careless future edit away
+from producing exactly the malformed JSON shape the incident report
+showed. Replacing the template with a real serializer removes the
+whole bug class permanently.
+
+### What changed
+
+- New `_build_enroll_body()` helper — uses `python3 -c` + `json.dumps`
+  with values passed via `sys.argv` (never interpolated into the Python
+  source, so shell metacharacters in `node_id`/`enrollment_token`
+  can't affect the code).
+- Explicit type conversion: `mobile`/`has_gps` become real booleans
+  (not `"true"`/`"false"` strings — old bash could not have emitted
+  strings either, but the new code fails loudly if a caller passes
+  anything other than the literal `"true"`/`"false"`).
+- `lat`/`lon` become real JSON numbers, or `null` for absent — same
+  sentinel string convention (`"null"`) as before, converted inside
+  the helper.
+- `curl -d` → `curl --data-binary` so no whitespace stripping is applied
+  to the serialized body.
+- Uses `json.dumps(..., separators=(",", ":"))` so the compact
+  format matches what the old bash template produced byte-for-byte
+  on valid input — server logs see no shape change.
+
+### Verified
+
+Standalone tests confirm the helper:
+- Byte-for-byte-matches the pre-fix installer output for valid input.
+- Correctly escapes `"`, `;`, `--`, and other shell metacharacters
+  that would have broken the old template.
+- Handles unicode in `node_id` without ceremony.
+- **Fails loudly** on empty/malformed booleans and non-numeric coords
+  — previously these would have produced silently-malformed JSON.
+
+### Not in this release (still queued for v1.5.0)
+
+- `agreement_version` missing from enrollment body — every version
+  since v1.0.19. Server defaults it to `"1.0"` and records that in
+  the audit trail regardless of what the operator actually accepted.
+  Compliance-adjacent; needs coordination with server-side session
+  and legal input before shipping.
+- `elevation_agl_m` missing — data-completeness gap only.
+- Broader installer overhaul (multi-radio adapter identification,
+  pre-flight hardware/OS checks, uninstall command) — see
+  pending-changes memory.
+
+### Files changed
+
+- `install.sh` — new `_build_enroll_body()` helper; `enroll_node()`
+  refactored to call it and use `curl --data-binary`.
+
+---
+
 ## [1.4.10] — Unreleased
 
 Hotfix for v1.4.9's trail-truncation fix. Same-day operator test flight
