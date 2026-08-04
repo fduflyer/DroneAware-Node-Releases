@@ -218,6 +218,149 @@ EOF
     #   fi
 }
 
+# ---------------------------------------------------------------------------
+# GPS sanity check helpers (v1.4.12+)
+# ---------------------------------------------------------------------------
+# Mirrored from install.sh so cmd_update and cmd_gps_diagnose can run the
+# same remediation on already-installed nodes. KEEP IN SYNC with the
+# `_sniff_gps_protocol` / `_check_gpsd_conflict` / `_check_gps_protocol` /
+# `_print_protocol_manual_fix` functions in install.sh — any edit to one
+# must be applied to the other or the two paths will drift.
+
+_sniff_gps_protocol() {
+    local device="$1"
+    local proto="unknown" hit_baud=""
+    for baud in 4800 9600 38400; do
+        stty -F "$device" $baud raw 2>/dev/null || continue
+        local hex
+        hex=$(timeout 2 head -c 256 "$device" 2>/dev/null | xxd -p -c 256 | tr -d '\n')
+        [[ -z "$hex" ]] && continue
+        if [[ "$hex" =~ 2447[45][0-9a-f] ]]; then
+            proto="nmea"; hit_baud=$baud; break
+        elif [[ "$hex" =~ a0a2 ]]; then
+            proto="sirf"; hit_baud=$baud; break
+        elif [[ "$hex" =~ b562 ]]; then
+            proto="ubx"; hit_baud=$baud; break
+        fi
+    done
+    echo "$proto $hit_baud"
+}
+
+_print_protocol_manual_fix() {
+    local proto="$1" device="$2"
+    echo ""
+    echo "  Manual remediation:"
+    echo "    1. sudo gpsctl -f -n $device       # tells the chip to switch to NMEA"
+    echo "    2. sudo systemctl restart droneaware-wifi"
+    echo "    3. sudo droneaware status          # verify GPS shows NMEA"
+    echo ""
+    echo "  If gpsctl doesn't work for your chip, use the manufacturer's utility"
+    echo "  (SiRFDemo for SiRF, u-center for u-blox) to switch the chip to NMEA."
+    echo ""
+}
+
+_check_gpsd_conflict() {
+    local gpsd_present=no
+    if systemctl is-enabled gpsd.socket >/dev/null 2>&1 || \
+       systemctl is-active gpsd >/dev/null 2>&1 || \
+       systemctl is-active gpsd.socket >/dev/null 2>&1 || \
+       dpkg -l gpsd 2>/dev/null | grep -q '^ii'; then
+        gpsd_present=yes
+    fi
+    if [[ "$gpsd_present" == "no" ]]; then
+        info "gpsd not present — no conflict."
+        return 0
+    fi
+    echo ""
+    echo "  gpsd is installed on this system. gpsd would seize the GPS serial"
+    echo "  port, preventing DroneAware from reading GPS data. DroneAware reads"
+    echo "  /dev/tty* directly and does not need gpsd."
+    echo ""
+    local resp
+    read -rp "  Disable gpsd? [Y/n]: " resp </dev/tty
+    if [[ "${resp,,}" == "n" || "${resp,,}" == "no" ]]; then
+        warn "gpsd left running — GPS may not work in DroneAware."
+        return 0
+    fi
+    systemctl stop gpsd gpsd.socket 2>/dev/null || true
+    systemctl disable gpsd gpsd.socket 2>/dev/null || true
+    systemctl mask gpsd gpsd.socket 2>/dev/null || true
+    pkill -x gpsd 2>/dev/null || true
+    info "gpsd stopped, disabled, and masked."
+}
+
+_check_gps_protocol() {
+    local device="$1"
+    if [[ -z "$device" ]]; then
+        return 0
+    fi
+    if [[ ! -e "$device" ]]; then
+        warn "$device not present — skipping GPS protocol check."
+        return 0
+    fi
+
+    local sniff proto baud
+    sniff=$(_sniff_gps_protocol "$device")
+    proto=$(echo "$sniff" | awk '{print $1}')
+    baud=$(echo "$sniff" | awk '{print $2}')
+
+    if [[ "$proto" == "nmea" ]]; then
+        info "GPS protocol: NMEA at $baud baud — good."
+        return 0
+    fi
+    if [[ "$proto" == "unknown" ]]; then
+        warn "Could not identify GPS protocol on $device. Check wiring/power."
+        warn "GPS may not work — try 'sudo droneaware gps-diagnose' for more detail."
+        return 0
+    fi
+
+    echo ""
+    echo "  GPS on $device is speaking '$proto' binary protocol, not NMEA."
+    echo "  DroneAware requires NMEA output."
+    echo ""
+    local resp
+    read -rp "  Attempt to switch the chip to NMEA now? [Y/n]: " resp </dev/tty
+    if [[ "${resp,,}" == "n" || "${resp,,}" == "no" ]]; then
+        _print_protocol_manual_fix "$proto" "$device"
+        return 0
+    fi
+
+    info "Running: gpsctl -f -n $device"
+    if command -v gpsctl >/dev/null 2>&1 && gpsctl -f -n "$device" 2>/dev/null; then
+        sleep 3
+        local reverify rproto rbaud
+        reverify=$(_sniff_gps_protocol "$device")
+        rproto=$(echo "$reverify" | awk '{print $1}')
+        rbaud=$(echo "$reverify" | awk '{print $2}')
+        if [[ "$rproto" == "nmea" ]]; then
+            info "GPS switched to NMEA at $rbaud baud."
+            return 0
+        fi
+        warn "gpsctl completed but chip still not in NMEA mode."
+    else
+        if ! command -v gpsctl >/dev/null 2>&1; then
+            warn "gpsctl not found — install gpsd-clients: sudo apt install -y --no-install-recommends gpsd-clients"
+        else
+            warn "gpsctl auto-fix failed (gpsctl exited non-zero)."
+        fi
+    fi
+    _print_protocol_manual_fix "$proto" "$device"
+}
+
+# Called from cmd_update after binaries are staged but before services
+# start. Reads GPS_DEVICE from config.env; skips cleanly when not set.
+_gps_sanity_check_update() {
+    local cfg="${INSTALL_DIR}/config.env"
+    local gps_dev
+    gps_dev=$(grep '^GPS_DEVICE=' "$cfg" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+    if [[ -z "$gps_dev" ]]; then
+        return 0
+    fi
+    heading "GPS Configuration Check"
+    _check_gpsd_conflict
+    _check_gps_protocol "$gps_dev"
+}
+
 cmd_update() {
     require_root "update"
     echo ""
@@ -375,6 +518,11 @@ cmd_update() {
         migrate_config_env
     fi
 
+    # v1.4.12+: run GPS sanity check (gpsd conflict + protocol mode) NOW,
+    # while feeder services are still stopped (so nothing is holding the
+    # port). Skips cleanly on nodes without GPS_DEVICE configured.
+    _gps_sanity_check_update
+
     systemctl daemon-reload
     systemctl start droneaware-wifi
     if hciconfig 2>/dev/null | grep -q "hci"; then
@@ -451,13 +599,23 @@ except Exception as e:
     print(f"  GPS      : state file unreadable ({e})")
     sys.exit(0)
 
-status     = s.get("status", "unknown")
-device     = s.get("device")
-baud       = s.get("baud")
-lat        = s.get("lat")
-lon        = s.get("lon")
-updated_at = s.get("updated_at") or 0
-age        = time.time() - updated_at
+status      = s.get("status", "unknown")
+device      = s.get("device")
+baud        = s.get("baud")
+lat         = s.get("lat")
+lon         = s.get("lon")
+protocol    = s.get("protocol")     # v1.4.12+: nmea|sirf|ubx|unknown
+fix_quality = s.get("fix_quality")  # v1.4.12+: from $GxGGA field 6
+sats        = s.get("sats_in_use")  # v1.4.12+: from $GxGGA field 7
+updated_at  = s.get("updated_at") or 0
+age         = time.time() - updated_at
+
+def dev_prefix():
+    return f"{device} @ {baud} baud" if baud is not None else f"{device}"
+
+def sats_phrase():
+    # "N sats" only when we have a GGA-derived count; empty otherwise.
+    return f", {sats} sats" if sats is not None else ""
 
 if status == "not_configured":
     # Terminal state — wifi_feeder writes this once at startup (when
@@ -472,20 +630,25 @@ elif age > 120:
     print(f"  GPS      : state stale ({int(age)}s old — wifi_feeder may have stopped)")
 elif status == "device_missing":
     print(f"  GPS      : {device} — configured but device not present")
+elif status == "wrong_protocol":
+    # v1.4.12+: chip is speaking SiRF binary / UBX / something we can't
+    # parse. Refresh every 30s in the reader thread. Point the operator
+    # at gps-diagnose which knows how to auto-fix common cases.
+    proto_name = {"sirf": "SiRF binary", "ubx": "u-blox UBX",
+                  "unknown": "unknown binary protocol"}.get(protocol, protocol or "unknown")
+    print(f"  GPS      : {device} — {proto_name} detected, DroneAware needs NMEA")
+    print(f"             run 'sudo droneaware gps-diagnose' for remediation")
 elif status == "detecting_baud":
     print(f"  GPS      : {device} — detecting baud rate...")
 elif status == "no_nmea":
     print(f"  GPS      : {device} — device exists but no valid NMEA detected")
 elif status == "reading":
-    if baud is not None:
-        print(f"  GPS      : {device} @ {baud} baud — reading NMEA, no fix yet")
-    else:
-        print(f"  GPS      : {device} — reading NMEA, no fix yet")
+    # No fix yet. Show sats-in-use if we've seen a GGA, else fall back
+    # to the pre-v1.4.12 wording.
+    print(f"  GPS      : {dev_prefix()} — NMEA{sats_phrase()}, no fix yet")
 elif status == "fix":
-    if baud is not None:
-        print(f"  GPS      : {device} @ {baud} baud — fix acquired (lat={lat}, lon={lon})")
-    else:
-        print(f"  GPS      : {device} — fix acquired (lat={lat}, lon={lon})")
+    # Have a fix. Sats + lat/lon on one line.
+    print(f"  GPS      : {dev_prefix()} — NMEA{sats_phrase()}, fix (lat={lat}, lon={lon})")
 else:
     print(f"  GPS      : {status}")
 PYEOF
@@ -956,12 +1119,146 @@ cmd_install_webui() {
     fi
 }
 
+cmd_gps_diagnose() {
+    require_root "gps-diagnose"
+    echo ""
+    echo -e "${BOLD}DroneAware GPS Diagnostic${NC}"
+    echo ""
+
+    local cfg="${INSTALL_DIR}/config.env"
+    local gps_dev gps_baud node_mobile
+    gps_dev=$(grep '^GPS_DEVICE='   "$cfg" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+    gps_baud=$(grep '^GPS_BAUD='    "$cfg" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+    node_mobile=$(grep '^NODE_MOBILE=' "$cfg" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+
+    echo "  Config (${cfg}):"
+    printf  "    GPS_DEVICE   = %s\n" "${gps_dev:-<empty>}"
+    printf  "    GPS_BAUD     = %s\n" "${gps_baud:-<empty — will auto-detect>}"
+    printf  "    NODE_MOBILE  = %s\n" "${node_mobile:-<empty>}"
+    echo ""
+
+    if [[ -z "$gps_dev" ]]; then
+        warn "GPS_DEVICE not set — this is a static node without GPS, or GPS auto-discovery hasn't run yet."
+        warn "Nothing to diagnose. Re-run install.sh to configure GPS, or set GPS_DEVICE in ${cfg} manually."
+        echo ""
+        return 0
+    fi
+
+    echo "  Device:"
+    if [[ -e "$gps_dev" ]]; then
+        info "$gps_dev exists"
+    else
+        echo -e "    ${RED}✗${NC}  $gps_dev does NOT exist — puck unplugged? kernel driver missing?"
+        echo "    Recent USB messages: sudo dmesg | tail -20"
+        echo ""
+        return 0
+    fi
+    # Permissions — droneaware user needs dialout group to read /dev/tty*
+    if [[ -r "$gps_dev" ]]; then
+        info "readable"
+    else
+        warn "not readable by current user (this shouldn't matter — droneaware user access is what counts)"
+    fi
+    # Driver hint from dmesg (best effort)
+    local drv
+    drv=$(dmesg 2>/dev/null | grep -iE "ch341|pl2303|cp210|ftdi|cdc_acm" | tail -1)
+    [[ -n "$drv" ]] && echo "    kernel: $drv" | cut -c1-140
+    echo ""
+
+    echo "  Port ownership (fuser):"
+    local owners
+    owners=$(fuser -v "$gps_dev" 2>&1 | tail -n +2)
+    if [[ -z "$owners" ]]; then
+        info "no process holds the port"
+    else
+        # Look for gpsd or wifi_feeder in the ownership list
+        if echo "$owners" | grep -q gpsd; then
+            echo -e "    ${RED}✗${NC}  gpsd holds the port — DroneAware cannot read GPS"
+            echo "$owners" | sed 's/^/      /'
+            echo ""
+            echo "  Remediation:"
+            echo "    sudo systemctl stop gpsd gpsd.socket"
+            echo "    sudo systemctl mask gpsd gpsd.socket"
+            echo "    sudo pkill -x gpsd"
+            echo "    # then re-run this command"
+            echo ""
+            return 0
+        elif echo "$owners" | grep -qE "wifi_feeder|python"; then
+            info "held by wifi_feeder (expected)"
+            echo "$owners" | sed 's/^/      /'
+        else
+            warn "held by unknown process"
+            echo "$owners" | sed 's/^/      /'
+        fi
+    fi
+    echo ""
+
+    echo "  Protocol detection:"
+    # If wifi_feeder holds the port, skip live sniffing (would fail) and
+    # report from the state file instead. Otherwise probe fresh.
+    local proto="" baud=""
+    if echo "$owners" | grep -qE "wifi_feeder|python"; then
+        echo "    (port held by wifi_feeder — reporting from state file, not re-sniffing)"
+    else
+        local sniff
+        sniff=$(_sniff_gps_protocol "$gps_dev")
+        proto=$(echo "$sniff" | awk '{print $1}')
+        baud=$(echo "$sniff" | awk '{print $2}')
+        case "$proto" in
+            nmea)    info "NMEA detected at $baud baud" ;;
+            sirf)    warn "SiRF binary detected at $baud baud — DroneAware needs NMEA" ;;
+            ubx)     warn "u-blox UBX detected at $baud baud — DroneAware needs NMEA" ;;
+            unknown) warn "no known protocol detected at any baud (4800/9600/38400)" ;;
+        esac
+    fi
+    echo ""
+
+    echo "  Recent GPS state (/run/droneaware/gps_state.json):"
+    python3 - <<'PY'
+import json, time, sys
+try:
+    with open("/run/droneaware/gps_state.json") as f:
+        s = json.load(f)
+except FileNotFoundError:
+    print("    state file missing — wifi_feeder not running, or hasn't written yet")
+    sys.exit(0)
+except Exception as e:
+    print(f"    state file unreadable: {e}")
+    sys.exit(0)
+age = int(time.time() - (s.get("updated_at") or 0))
+print(f"    age:          {age}s")
+print(f"    status:       {s.get('status')}")
+print(f"    protocol:     {s.get('protocol')}")
+print(f"    baud:         {s.get('baud')}")
+print(f"    fix_quality:  {s.get('fix_quality')}")
+print(f"    sats_in_use:  {s.get('sats_in_use')}")
+print(f"    lat, lon:     {s.get('lat')}, {s.get('lon')}")
+PY
+    echo ""
+
+    # Verdict: quick reading of protocol + state.
+    echo "  Verdict:"
+    case "$proto" in
+        nmea)    echo -e "    ${GREEN}GPS looks healthy.${NC} If sats_in_use is 0, wait for sky view + satellite lock." ;;
+        sirf|ubx)
+            echo "    Puck is in binary mode — auto-fix with:"
+            echo "      sudo gpsctl -f -n $gps_dev"
+            echo "      sudo systemctl restart droneaware-wifi"
+            echo "      sudo droneaware gps-diagnose   # to re-verify"
+            ;;
+        unknown) echo "    Could not identify protocol. Check the puck's power/wiring and try 'sudo dmesg | tail -20'." ;;
+        "")      echo "    (protocol detection skipped — see above)" ;;
+    esac
+    echo ""
+}
+
 case "$1" in
     update)         cmd_update ;;
     status)         cmd_status ;;
     logs)           cmd_logs "$@" ;;
     test)           cmd_test "$@" ;;
     install-webui)  cmd_install_webui ;;
+    gps-diagnose)   cmd_gps_diagnose ;;
     __migrate)
         # Internal subcommand used by cmd_update for post-install config
         # migration. The double-underscore prefix is a convention signaling
@@ -987,6 +1284,7 @@ case "$1" in
         echo "    test            Transmit a 60-second test flight and verify detection"
         echo "    test --dry-run  Check rate-limit availability without transmitting"
         echo "    install-webui   Install the optional local Web UI (LAN dashboard)"
+        echo "    gps-diagnose    Read-only GPS health check (device, port, protocol, state)"
         echo ""
         ;;
 esac

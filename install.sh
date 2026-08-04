@@ -528,8 +528,13 @@ EOF
 install_packages() {
     heading "Installing System Packages"
     apt-get update -qq
+    # gpsd-clients gives us `gpsctl` for the GPS protocol auto-fix
+    # (SiRF/UBX → NMEA). --no-install-recommends is important: without it
+    # apt pulls gpsd itself, which would seize the GPS port and prevent
+    # DroneAware from reading it. gpsd-clients works standalone in the
+    # `gpsctl -f -n /dev/xxx` direct-to-device mode we use.
     apt-get install -y --no-install-recommends \
-        bluez bluetooth iw rfkill curl \
+        bluez bluetooth iw rfkill curl gpsd-clients \
         > /dev/null 2>&1
     systemctl enable bluetooth > /dev/null 2>&1
     systemctl start bluetooth  > /dev/null 2>&1
@@ -542,6 +547,158 @@ install_packages() {
     # Allow feeder to read GPS serial device without root
     usermod -aG dialout "$SUDO_USER" 2>/dev/null || true
     info "System packages ready."
+}
+
+# ---------------------------------------------------------------------------
+# 6.5. GPS sanity check (v1.4.12+)
+# ---------------------------------------------------------------------------
+# Runs after install_packages (so gpsctl is available) and before we start
+# services. Two independent checks — both skip cleanly if there's no GPS
+# device to configure (static nodes, mobile nodes without a puck yet):
+#
+#   1. gpsd detection: gpsd would seize the serial port and block
+#      DroneAware from reading GPS. Prompt to mask + kill it.
+#   2. Protocol check: puck may be in SiRF/UBX binary mode (common gotcha
+#      with BU-353S4 and similar). DroneAware needs NMEA. Attempt an
+#      auto-fix via `gpsctl -f -n`; print manual instructions if that
+#      doesn't take.
+#
+# Mirrored in the `droneaware` CLI's cmd_update path so existing operators
+# get the same remediation on their next update. Keep the logic in sync
+# between install.sh and the CLI.
+
+# Sniff the GPS device to identify its output protocol. Prints "proto baud"
+# on stdout (proto ∈ nmea|sirf|ubx|unknown; baud is empty on unknown).
+_sniff_gps_protocol() {
+    local device="$1"
+    local proto="unknown" hit_baud=""
+    for baud in 4800 9600 38400; do
+        stty -F "$device" $baud raw 2>/dev/null || continue
+        # Read up to 256 bytes with a 2s wall clock cap, hex-encode.
+        local hex
+        hex=$(timeout 2 head -c 256 "$device" 2>/dev/null | xxd -p -c 256 | tr -d '\n')
+        [[ -z "$hex" ]] && continue
+        # $G followed by an ASCII uppercase letter (0x40–0x5F).
+        if [[ "$hex" =~ 2447[45][0-9a-f] ]]; then
+            proto="nmea"; hit_baud=$baud; break
+        elif [[ "$hex" =~ a0a2 ]]; then
+            proto="sirf"; hit_baud=$baud; break
+        elif [[ "$hex" =~ b562 ]]; then
+            proto="ubx"; hit_baud=$baud; break
+        fi
+    done
+    echo "$proto $hit_baud"
+}
+
+_print_protocol_manual_fix() {
+    local proto="$1" device="$2"
+    echo ""
+    echo "  Manual remediation:"
+    echo "    1. sudo gpsctl -f -n $device       # tells the chip to switch to NMEA"
+    echo "    2. sudo systemctl restart droneaware-wifi"
+    echo "    3. sudo droneaware status          # verify GPS shows NMEA"
+    echo ""
+    echo "  If gpsctl doesn't work for your chip, use the manufacturer's utility"
+    echo "  (SiRFDemo for SiRF, u-center for u-blox) to switch the chip to NMEA."
+    echo ""
+}
+
+_check_gpsd_conflict() {
+    local gpsd_present=no
+    if systemctl is-enabled gpsd.socket >/dev/null 2>&1 || \
+       systemctl is-active gpsd >/dev/null 2>&1 || \
+       systemctl is-active gpsd.socket >/dev/null 2>&1 || \
+       dpkg -l gpsd 2>/dev/null | grep -q '^ii'; then
+        gpsd_present=yes
+    fi
+    if [[ "$gpsd_present" == "no" ]]; then
+        info "gpsd not present — no conflict."
+        return 0
+    fi
+    echo ""
+    echo "  gpsd is installed on this system. gpsd would seize the GPS serial"
+    echo "  port, preventing DroneAware from reading GPS data. DroneAware reads"
+    echo "  /dev/tty* directly and does not need gpsd."
+    echo ""
+    local resp
+    read -rp "  Disable gpsd? [Y/n]: " resp </dev/tty
+    if [[ "${resp,,}" == "n" || "${resp,,}" == "no" ]]; then
+        warn "gpsd left running — GPS may not work in DroneAware."
+        return 0
+    fi
+    systemctl stop gpsd gpsd.socket 2>/dev/null || true
+    systemctl disable gpsd gpsd.socket 2>/dev/null || true
+    systemctl mask gpsd gpsd.socket 2>/dev/null || true
+    pkill -x gpsd 2>/dev/null || true
+    info "gpsd stopped, disabled, and masked."
+}
+
+_check_gps_protocol() {
+    local device="${GPS_DEVICE:-}"
+    if [[ -z "$device" ]]; then
+        return 0
+    fi
+    if [[ ! -e "$device" ]]; then
+        warn "$device not present — skipping GPS protocol check."
+        return 0
+    fi
+
+    local sniff proto baud
+    sniff=$(_sniff_gps_protocol "$device")
+    proto=$(echo "$sniff" | awk '{print $1}')
+    baud=$(echo "$sniff" | awk '{print $2}')
+
+    if [[ "$proto" == "nmea" ]]; then
+        info "GPS protocol: NMEA at $baud baud — good."
+        return 0
+    fi
+    if [[ "$proto" == "unknown" ]]; then
+        warn "Could not identify GPS protocol on $device. Check wiring/power."
+        warn "GPS may not work — try 'sudo droneaware gps-diagnose' after install."
+        return 0
+    fi
+
+    # SiRF or UBX — offer auto-fix.
+    echo ""
+    echo "  GPS on $device is speaking '$proto' binary protocol, not NMEA."
+    echo "  DroneAware requires NMEA output."
+    echo ""
+    local resp
+    read -rp "  Attempt to switch the chip to NMEA now? [Y/n]: " resp </dev/tty
+    if [[ "${resp,,}" == "n" || "${resp,,}" == "no" ]]; then
+        _print_protocol_manual_fix "$proto" "$device"
+        return 0
+    fi
+
+    info "Running: gpsctl -f -n $device"
+    if gpsctl -f -n "$device" 2>/dev/null; then
+        # Chip may need a moment to switch modes; re-sniff to verify.
+        sleep 3
+        local reverify
+        reverify=$(_sniff_gps_protocol "$device")
+        local rproto rbaud
+        rproto=$(echo "$reverify" | awk '{print $1}')
+        rbaud=$(echo "$reverify" | awk '{print $2}')
+        if [[ "$rproto" == "nmea" ]]; then
+            info "GPS switched to NMEA at $rbaud baud."
+            return 0
+        fi
+        warn "gpsctl completed but chip still not in NMEA mode."
+    else
+        warn "gpsctl auto-fix failed (gpsctl exited non-zero)."
+    fi
+    _print_protocol_manual_fix "$proto" "$device"
+}
+
+gps_sanity_check() {
+    # No GPS device configured (static without GPS, or mobile with no puck
+    # plugged in yet) → nothing to check.
+    if [[ -z "${GPS_DEVICE:-}" ]]; then
+        return 0
+    fi
+    heading "GPS Configuration Check"
+    _check_gpsd_conflict
+    _check_gps_protocol
 }
 
 # ---------------------------------------------------------------------------
@@ -1042,6 +1199,7 @@ pin_wifi_unmanaged
 prompt_node_id
 prompt_location
 install_packages
+gps_sanity_check
 download_binaries
 install_services
 write_config

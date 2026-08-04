@@ -1405,7 +1405,10 @@ _GPS_STATE_PATH = "/run/droneaware/gps_state.json"
 
 def _write_gps_state(*, device: str | None = None, baud: int | None = None,
                      status: str = "unknown", last_nmea_at: float | None = None,
-                     lat: float | None = None, lon: float | None = None) -> None:
+                     lat: float | None = None, lon: float | None = None,
+                     protocol: str | None = None,
+                     fix_quality: int | None = None,
+                     sats_in_use: int | None = None) -> None:
     """Atomically write the current GPS state for the CLI to read.
     Soft-fails on any I/O error — state-file display is informational,
     feeder operation continues regardless of whether this succeeds.
@@ -1413,10 +1416,20 @@ def _write_gps_state(*, device: str | None = None, baud: int | None = None,
     Status values:
       not_configured  — no GPS device path found / configured
       device_missing  — configured/found device path does not exist on disk
+      wrong_protocol  — device speaks a non-NMEA protocol (SiRF, UBX) that
+                        DroneAware can't parse; protocol field carries which
       detecting_baud  — probing baud rates against the device
       no_nmea         — device opened but no valid NMEA sentences received
       reading         — serial port open, NMEA flowing, awaiting first fix
       fix             — most recent $GPRMC was "A" (active/valid); lat/lon populated
+
+    Extended fields (v1.4.12+):
+      protocol        — "nmea" | "sirf" | "ubx" | "unknown"; whatever the
+                        startup sniff identified. None until sniff has run.
+      fix_quality     — GGA field 6: 0=no fix, 1=GPS SPS, 2=DGPS, 4=RTK fixed,
+                        5=RTK float, 6=estimated. None if no GGA seen yet.
+      sats_in_use     — GGA field 7: satellites contributing to the fix.
+                        None if no GGA seen yet.
     """
     try:
         os.makedirs(os.path.dirname(_GPS_STATE_PATH), exist_ok=True)
@@ -1427,6 +1440,9 @@ def _write_gps_state(*, device: str | None = None, baud: int | None = None,
             "last_nmea_at": last_nmea_at,
             "lat":          lat,
             "lon":          lon,
+            "protocol":     protocol,
+            "fix_quality":  fix_quality,
+            "sats_in_use":  sats_in_use,
             "updated_at":   time.time(),
         }
         tmp = _GPS_STATE_PATH + ".tmp"
@@ -1435,6 +1451,49 @@ def _write_gps_state(*, device: str | None = None, baud: int | None = None,
         os.replace(tmp, _GPS_STATE_PATH)
     except Exception:
         pass
+
+
+# Non-NMEA GPS protocol magic bytes. These are the two most common
+# "not NMEA" cases we see in the fleet: SiRF binary (Star III/IV chipset,
+# e.g. BU-353S4) and u-blox UBX (NEO-6/7/8). Detection is best-effort —
+# other exotic protocols land in the "unknown" bucket, still surfacing
+# a diagnostic to the operator.
+_SIRF_SYNC = b"\xa0\xa2"    # SiRF binary frame start
+_UBX_SYNC  = b"\xb5\x62"    # u-blox UBX frame start
+
+
+def detect_gps_protocol(device: str) -> tuple[str, int | None]:
+    """Sniff the GPS device to identify its output protocol.
+
+    Returns (protocol, baud) where protocol is one of "nmea"/"sirf"/"ubx"/"unknown"
+    and baud is the rate at which the protocol was recognized (None on "unknown").
+
+    Runs before baud detection so the state file distinguishes "wrong
+    protocol" (SiRF/UBX — puck needs re-flashing back to NMEA) from "wrong
+    baud" from "no signal." NMEA is our only supported input — SiRF/UBX
+    pucks are auto-fixed by install.sh / cmd_update / gps-diagnose, but
+    the runtime just reports the state and lets those paths handle it.
+    Log-only at feeder startup: we never modify the chip from the reader.
+    """
+    for baud in GPS_BAUD_RATES:
+        try:
+            with serial.Serial(device, baudrate=baud, timeout=2) as ser:
+                sample = ser.read(512)
+                if not sample:
+                    continue
+                # NMEA sentences start with '$G' followed by two ASCII letters
+                # (GP, GN, GL, GA, GB — every talker prefix we care about).
+                # Any occurrence within the sample counts as a positive ID.
+                for i in range(len(sample) - 3):
+                    if sample[i:i+2] == b"$G" and sample[i+2:i+4].isalpha():
+                        return ("nmea", baud)
+                if _SIRF_SYNC in sample:
+                    return ("sirf", baud)
+                if _UBX_SYNC in sample:
+                    return ("ubx", baud)
+        except serial.SerialException:
+            continue
+    return ("unknown", None)
 
 
 def find_gps_device() -> str | None:
@@ -1536,9 +1595,30 @@ def gps_reader_thread(device: str):
                 time.sleep(10)
                 continue
 
-            _write_gps_state(device=device, status="detecting_baud")
+            # Protocol sniff BEFORE baud detection. Log-only — the reader
+            # never modifies the chip. If the puck is in SiRF/UBX mode we
+            # surface that in the state file so `droneaware status` /
+            # `droneaware gps-diagnose` can guide the operator to run the
+            # remediation path (installer / cmd_update / gps-diagnose --fix).
+            protocol, sniff_baud = detect_gps_protocol(device)
+            if protocol != "nmea":
+                _write_gps_state(device=device, status="wrong_protocol",
+                                 protocol=protocol, baud=sniff_baud)
+                log.warning(
+                    f"[GPS] Device {device} is in '{protocol}' mode, not NMEA — "
+                    "DroneAware cannot parse this. Run 'sudo droneaware gps-diagnose' "
+                    "for remediation. Retrying in 30s."
+                )
+                time.sleep(30)
+                continue
 
-            # Use GPS_BAUD from config.env if set, otherwise auto-detect
+            _write_gps_state(device=device, status="detecting_baud",
+                             protocol="nmea")
+
+            # Use GPS_BAUD from config.env if set, otherwise auto-detect.
+            # The protocol sniff already found the baud NMEA lives at, so
+            # prefer it when the config is empty (avoids a second full
+            # baud sweep for common cases).
             configured_baud = os.environ.get("GPS_BAUD", "").strip()
             if configured_baud:
                 try:
@@ -1546,21 +1626,44 @@ def gps_reader_thread(device: str):
                     log.info(f"[GPS] Using configured baud rate {baud}")
                 except ValueError:
                     log.warning(f"[GPS] Invalid GPS_BAUD value '{configured_baud}' — falling back to auto-detect")
-                    baud = detect_baud_rate(device)
+                    baud = sniff_baud or detect_baud_rate(device)
             else:
-                baud = detect_baud_rate(device)
+                baud = sniff_baud or detect_baud_rate(device)
 
             if baud is None:
-                _write_gps_state(device=device, status="no_nmea")
+                _write_gps_state(device=device, status="no_nmea",
+                                 protocol="nmea")
                 log.warning(f"[GPS] Could not detect baud rate on {device} — retrying in 10s")
                 time.sleep(10)
                 continue
+
+            # Latest GGA-derived metadata carried across every state write
+            # while the read loop is active. GGA sentences arrive at ~1 Hz
+            # alongside RMC; we store the most-recent values so status shows
+            # sats/fix quality even between RMC-triggered fix writes.
+            fix_quality: int | None = None
+            sats_in_use: int | None = None
+
             with serial.Serial(device, baudrate=baud, timeout=2) as ser:
                 log.info(f"[GPS] Reading from {device} at {baud} baud")
                 _write_gps_state(device=device, baud=baud, status="reading",
-                                 last_nmea_at=time.time())
+                                 last_nmea_at=time.time(), protocol="nmea")
                 while True:
                     line = ser.readline().decode('ascii', errors='ignore').strip()
+
+                    # GGA — fix quality + sats-in-use. Field layout:
+                    #   $GxGGA,time,lat,N,lon,W,fix_quality,sats,hdop,...
+                    #   0     1    2   3 4   5 6           7    8
+                    if line.startswith(('$GPGGA', '$GNGGA')):
+                        parts = line.split(',')
+                        if len(parts) >= 8:
+                            try:
+                                fix_quality = int(parts[6]) if parts[6] else 0
+                                sats_in_use = int(parts[7]) if parts[7] else 0
+                            except (ValueError, IndexError):
+                                pass
+                        continue
+
                     if not line.startswith(('$GPRMC', '$GNRMC')):
                         continue
                     parts = line.split(',')
@@ -1573,7 +1676,9 @@ def gps_reader_thread(device: str):
                             _gps_lat = lat
                             _gps_lon = lon
                         _write_gps_state(device=device, baud=baud, status="fix",
-                                         last_nmea_at=time.time(), lat=lat, lon=lon)
+                                         last_nmea_at=time.time(), lat=lat, lon=lon,
+                                         protocol="nmea", fix_quality=fix_quality,
+                                         sats_in_use=sats_in_use)
                     except (ValueError, IndexError):
                         continue
         except serial.SerialException as e:

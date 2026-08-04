@@ -10,6 +10,131 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.4.12] — Unreleased
+
+**GPS observability & auto-remediation release.** Two independent
+operator incidents in a week (BU-353S4 puck stuck in SiRF binary mode
+after gpsd probed it; second operator hit gpsd holding the port at
+install time) drove a coordinated fix across the runtime, installer,
+update path, and a new diagnostic command. All changes are additive —
+no protocol or server contract touches.
+
+**Note on v1.4.11:** shipped as its own tag but was installer-only
+(hardened the enrollment body via python3 `json.dumps`). Existing
+operators upgrading via `sudo droneaware update` see no runtime
+difference from v1.4.11 — the fix only affects fresh installs. v1.4.12
+is the first release since v1.4.10 that reaches existing operators
+via `droneaware update`.
+
+### 1. Runtime — richer GPS state + protocol detection
+
+`wifi_feeder.py` now:
+- **Sniffs the GPS device's output protocol at startup** before opening
+  the read loop. Log-only — never modifies the chip. Categorizes as
+  `nmea` / `sirf` / `ubx` / `unknown` and writes to
+  `/run/droneaware/gps_state.json` so `droneaware status` and
+  `droneaware gps-diagnose` can guide the operator to the fix.
+- **Parses `$GPGGA` / `$GNGGA`** for fix quality (field 6) and
+  satellites-in-use (field 7). Persists alongside every state write
+  during the read loop.
+- New state field: `wrong_protocol` — surfaced when the sniff finds
+  SiRF / UBX / unknown instead of NMEA. Reader backs off 30s between
+  attempts (vs 10s for other errors) since the puck won't recover
+  without an out-of-band chip-mode change.
+
+`gps_state.json` schema additions (all optional — old CLI reads
+without breaking): `protocol`, `fix_quality`, `sats_in_use`.
+
+### 2. `sudo droneaware status` — sats, fix, protocol on one line
+
+Previous format:
+```
+GPS : /dev/ttyUSB0 @ 4800 baud — reading NMEA, no fix yet
+GPS : /dev/ttyUSB0 @ 4800 baud — fix acquired (lat=..., lon=...)
+```
+
+New format (shows sat count from GGA, calls out non-NMEA protocols
+explicitly with a pointer to the remediation command):
+```
+GPS : /dev/ttyUSB0 @ 4800 baud — NMEA, 8 sats, fix (lat=..., lon=...)
+GPS : /dev/ttyUSB0 @ 4800 baud — NMEA, 3 sats, no fix yet
+GPS : /dev/ttyUSB0 — SiRF binary detected, DroneAware needs NMEA
+      run 'sudo droneaware gps-diagnose' for remediation
+```
+
+### 3. `install.sh` — gpsd conflict prompt + protocol auto-fix
+
+New `gps_sanity_check` phase runs after `install_packages` and before
+binaries are downloaded (so gpsctl is available and no feeder is yet
+holding the port). Two checks:
+
+- **gpsd detection** (three signals — `systemctl is-enabled gpsd.socket`,
+  `systemctl is-active`, and `dpkg -l gpsd`). If present, prompt to
+  stop + disable + mask (default: yes). Uses the same 4-command
+  remediation sequence Dan had been giving operators one-off on
+  Discord: `stop → disable → mask → pkill -x gpsd`.
+- **Protocol sniff at 4800 / 9600 / 38400 baud** against the discovered
+  `GPS_DEVICE`. If NMEA, all good. If SiRF or UBX, prompt to auto-fix
+  with `gpsctl -f -n` (direct-to-device mode, no gpsd needed), verify
+  by re-sniffing, print manual instructions on failure.
+
+`install_packages` now installs `gpsd-clients --no-install-recommends`
+so `gpsctl` is available for the auto-fix. The `--no-install-recommends`
+flag is critical: without it, apt pulls `gpsd` as a Recommends, which
+would defeat the whole point.
+
+Skips entirely when no GPS device is configured (static nodes / mobile
+without a puck plugged in).
+
+### 4. `sudo droneaware update` — same remediation on existing nodes
+
+Mirrored the sanity-check helpers into the CLI so operators already on
+v1.4.10 / v1.4.11 pick up gpsd + protocol remediation on their next
+update. Runs after config migration but before service restart
+(feeders are stopped at that point, port is free). Same prompt UX as
+the installer.
+
+Existing operators with a broken GPS puck get an in-band fix without
+having to re-run install.sh.
+
+### 5. New command: `sudo droneaware gps-diagnose`
+
+Read-only diagnostic — sections:
+- **Config** — `GPS_DEVICE`, `GPS_BAUD`, `NODE_MOBILE` from config.env
+- **Device** — existence, permissions, best-effort driver hint from
+  dmesg (`ch341` / `pl2303` / `cp210` / `ftdi` / `cdc_acm`)
+- **Port ownership** — `fuser -v $GPS_DEVICE`; explicit ✗ for gpsd,
+  ✓ for wifi_feeder
+- **Protocol detection** — live sniff if port is free, or read from
+  state file if wifi_feeder holds the port
+- **Recent GPS state** — full dump from `/run/droneaware/gps_state.json`
+  with age, status, protocol, baud, fix_quality, sats_in_use, lat/lon
+- **Verdict** — canned remediation for the detected failure mode
+
+Designed so a Discord helper can ask "paste `sudo droneaware
+gps-diagnose`" and immediately see the failure mode without back-and-
+forth.
+
+### Files changed
+
+- `wifi_feeder.py` — `_write_gps_state()` schema (+ `protocol` /
+  `fix_quality` / `sats_in_use`); new `detect_gps_protocol()` helper;
+  `gps_reader_thread()` runs protocol sniff before baud detection and
+  parses GGA alongside RMC.
+- `droneaware` (CLI) — updated `cmd_status` GPS block; new helper
+  functions `_sniff_gps_protocol`, `_check_gpsd_conflict`,
+  `_check_gps_protocol`, `_print_protocol_manual_fix`,
+  `_gps_sanity_check_update`; `cmd_update` runs sanity check before
+  service restart; new `cmd_gps_diagnose` + case-dispatch entry.
+- `install.sh` — `install_packages` adds `gpsd-clients`; new
+  `_sniff_gps_protocol`, `_check_gpsd_conflict`, `_check_gps_protocol`,
+  `_print_protocol_manual_fix`, `gps_sanity_check` (mirrors CLI
+  helpers — kept intentionally duplicated with "keep in sync"
+  comments in both files); `gps_sanity_check` added to main() between
+  `install_packages` and `download_binaries`.
+
+---
+
 ## [1.4.11] — Unreleased
 
 Installer hardening: `install.sh` no longer builds the enrollment request
