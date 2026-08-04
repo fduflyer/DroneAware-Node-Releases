@@ -10,6 +10,84 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.4.12.1] — Unreleased
+
+**Cosmetic hotfix for v1.4.12's `gps-diagnose` command** — six issues
+surfaced during njpi-120hotfix validation. None broke the core feature
+(gpsd conflict detection worked end-to-end), but the diagnostic output
+was misleading in enough places that operators would waste time on
+false trails.
+
+### Fixes
+
+1. **`gps-diagnose` now falls back to `/run/droneaware/gps_state.json`**
+   when `GPS_DEVICE=` is empty in config.env. This is the common case
+   for mobile nodes — install.sh writes GPS_DEVICE empty and lets the
+   feeder's `find_gps_device()` probe `/dev/ttyUSB*` at startup. Prior
+   behavior said "GPS_DEVICE not set — nothing to diagnose" even when
+   the feeder was actively reading from an auto-discovered device.
+   Now shows an explicit `Effective GPS device: /dev/ttyUSB0
+   (auto-discovered)` line and continues the diagnostic.
+
+2. **Duplicate config.env keys handled correctly.** All twelve
+   `grep '^KEY=' cfg | cut -d= -f2` sites in the CLI concatenated
+   values when a key appeared multiple times. Caught when an operator
+   ran `echo GPS_DEVICE=... | sudo tee -a config.env` (installer had
+   left an empty `GPS_DEVICE=` line, tee appended a second) — the
+   diagnostic rendered `/dev/ttyUSB0\n/dev/ttyUSB0` with the newline
+   as a real character in the value, which then broke every
+   downstream check. New `_cfg_get` helper uses `grep | tail -1 |
+   cut -d= -f2-` for last-wins semantics (matching systemd's
+   EnvironmentFile behavior) plus proper quote-stripping.
+
+3. **Refactor: 12 call sites** across `cmd_status`, `cmd_test`,
+   `cmd_gps_diagnose`, and `_gps_sanity_check_update` now use
+   `_cfg_get` instead of the fragile grep+cut pattern. Single point
+   of behavior for all config-file reads.
+
+4. **`_sniff_gps_protocol` uses `od -An -tx1` instead of `xxd -p`.**
+   `xxd` requires the `xxd` (or `vim-common`) package which isn't
+   installed by default on Pi OS Lite — v1.4.12's shell-side sniff
+   failed with `xxd: command not found` on fresh installs. `od` is
+   in coreutils, always present. Applied in both `install.sh` and
+   the CLI. Runtime protocol sniff in `wifi_feeder.py` was
+   unaffected (uses Python + pyserial, not xxd).
+
+5. **Verdict block reads state file when live sniff was skipped.**
+   Previously said `(protocol detection skipped — see above)` when
+   `wifi_feeder` held the port — misleading, since the state file
+   already contained the answer. Now falls back to the state file's
+   `protocol` field and reports "GPS looks healthy" / "Puck is in
+   binary mode" / etc. based on what the feeder is actually seeing.
+
+6. **`gps-diagnose` flags installed-but-idle gpsd as a latent risk.**
+   Previously only detected gpsd via `fuser` (which requires gpsd to
+   be actively holding the port). But gpsd's default is to open the
+   port on-demand when a client connects — meaning the port isn't
+   held until the operator runs `cgps` or `gpspipe`, at which point
+   it silently gets seized. New `gpsd status` section runs the same
+   `systemctl is-active` / `dpkg -l gpsd` checks that
+   `_check_gpsd_conflict` already uses in the installer/updater, and
+   warns proactively: "installed and enabled — will seize the port
+   on next cgps/gpspipe/gpsctl invocation."
+
+### Files changed
+
+- `droneaware` (CLI) — new `_cfg_get` helper; 12 call sites refactored;
+  `cmd_gps_diagnose` gains state-file fallback for GPS_DEVICE, a new
+  gpsd status section, and a verdict block that reads from state file
+  when the live sniff was skipped; `_sniff_gps_protocol` uses `od`.
+- `install.sh` — `_sniff_gps_protocol` uses `od` instead of `xxd`.
+
+### Note
+
+All six issues were caught by the njpi-120hotfix pre-release
+validation. Full v1.4.12 feature scope (gpsd remediation, protocol
+auto-fix, GGA sats/fix parsing, gps-diagnose command) is intact — this
+release polishes the UX; no feature changes.
+
+---
+
 ## [1.4.12] — Unreleased
 
 **GPS observability & auto-remediation release.** Two independent

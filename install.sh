@@ -575,8 +575,11 @@ _sniff_gps_protocol() {
     for baud in 4800 9600 38400; do
         stty -F "$device" $baud raw 2>/dev/null || continue
         # Read up to 256 bytes with a 2s wall clock cap, hex-encode.
+        # `od -An -tx1` uses coreutils (always present). Older versions of
+        # this file used `xxd -p` which requires xxd/vim-common — not
+        # installed by default on Pi OS Lite.
         local hex
-        hex=$(timeout 2 head -c 256 "$device" 2>/dev/null | xxd -p -c 256 | tr -d '\n')
+        hex=$(timeout 2 head -c 256 "$device" 2>/dev/null | od -An -tx1 | tr -d ' \n')
         [[ -z "$hex" ]] && continue
         # $G followed by an ASCII uppercase letter (0x40–0x5F).
         if [[ "$hex" =~ 2447[45][0-9a-f] ]]; then

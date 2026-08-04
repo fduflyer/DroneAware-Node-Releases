@@ -219,6 +219,40 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Config-file readers (v1.4.12.1+)
+# ---------------------------------------------------------------------------
+# Fetch a single value from config.env. Replaces the fragile
+# `grep '^KEY=' cfg | cut -d= -f2` pattern that was used in ~12 places
+# across the CLI. That pattern silently concatenated all matches when a
+# key appeared multiple times (bug caught during v1.4.12 njpi-120hotfix
+# testing: an operator's `echo KEY=... | tee -a` left two GPS_DEVICE
+# lines and the display rendered `<empty>\n/dev/ttyUSB0` — with the
+# newline as a real character in the value, which then broke every
+# downstream check).
+#
+# `tail -1` gives last-wins semantics (matches systemd's EnvironmentFile
+# behavior), `cut -d= -f2-` (note the trailing `-`) preserves everything
+# after the first `=` so values containing `=` don't get truncated, and
+# quote-stripping handles both `KEY=value` and `KEY="value"` /
+# `KEY='value'` forms without executing anything from config.env (no
+# `source`, no eval).
+#
+# Usage:  value=$(_cfg_get CONFIG_FILE VAR_NAME [DEFAULT])
+_cfg_get() {
+    local cfg="$1" name="$2" default="${3:-}"
+    local val
+    val=$(grep -E "^${name}=" "$cfg" 2>/dev/null | tail -1 | cut -d= -f2-)
+    if [[ -z "$val" ]]; then
+        printf '%s' "$default"
+        return
+    fi
+    # Strip surrounding quotes (only outermost pair)
+    val="${val%\"}"; val="${val#\"}"
+    val="${val%\'}"; val="${val#\'}"
+    printf '%s' "$val"
+}
+
+# ---------------------------------------------------------------------------
 # GPS sanity check helpers (v1.4.12+)
 # ---------------------------------------------------------------------------
 # Mirrored from install.sh so cmd_update and cmd_gps_diagnose can run the
@@ -233,7 +267,10 @@ _sniff_gps_protocol() {
     for baud in 4800 9600 38400; do
         stty -F "$device" $baud raw 2>/dev/null || continue
         local hex
-        hex=$(timeout 2 head -c 256 "$device" 2>/dev/null | xxd -p -c 256 | tr -d '\n')
+        # `od -An -tx1` is in coreutils (always present). xxd requires the
+        # xxd/vim-common package which isn't installed by default on Pi OS
+        # Lite. Both produce equivalent hex after whitespace-stripping.
+        hex=$(timeout 2 head -c 256 "$device" 2>/dev/null | od -An -tx1 | tr -d ' \n')
         [[ -z "$hex" ]] && continue
         if [[ "$hex" =~ 2447[45][0-9a-f] ]]; then
             proto="nmea"; hit_baud=$baud; break
@@ -352,7 +389,7 @@ _check_gps_protocol() {
 _gps_sanity_check_update() {
     local cfg="${INSTALL_DIR}/config.env"
     local gps_dev
-    gps_dev=$(grep '^GPS_DEVICE=' "$cfg" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+    gps_dev=$(_cfg_get "$cfg" GPS_DEVICE)
     if [[ -z "$gps_dev" ]]; then
         return 0
     fi
@@ -549,7 +586,7 @@ cmd_status() {
     local ver
     ver=$(cat "$VERSION_FILE" 2>/dev/null || echo "unknown")
     echo "  Firmware : ${ver}"
-    echo "  Node ID  : $(grep '^NODE_ID=' "${INSTALL_DIR}/config.env" 2>/dev/null | cut -d= -f2 || echo "unknown")"
+    echo "  Node ID  : $(_cfg_get "${INSTALL_DIR}/config.env" NODE_ID unknown)"
     echo ""
     for svc in droneaware-ble droneaware-wifi; do
         local state
@@ -577,7 +614,7 @@ cmd_status() {
     # know how to reach it from another device on the LAN.
     if systemctl is-active --quiet droneaware-web 2>/dev/null; then
         local web_port web_ip
-        web_port=$(grep '^DRONEAWARE_WEB_PORT=' "${INSTALL_DIR}/config.env" 2>/dev/null | cut -d= -f2)
+        web_port=$(_cfg_get "${INSTALL_DIR}/config.env" DRONEAWARE_WEB_PORT)
         [[ -z "$web_port" ]] && web_port="5000"
         web_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
         [[ -z "$web_ip" ]] && web_ip="<pi-ip>"
@@ -670,11 +707,11 @@ cmd_test() {
     # Read node config
     local cfg="${INSTALL_DIR}/config.env"
     local node_id lat lon iface server_url token
-    node_id=$(   grep '^NODE_ID='      "$cfg" 2>/dev/null | cut -d= -f2)
-    lat=$(       grep '^NODE_LAT='     "$cfg" 2>/dev/null | cut -d= -f2)
-    lon=$(       grep '^NODE_LON='     "$cfg" 2>/dev/null | cut -d= -f2)
-    iface=$(     grep '^WIFI_ADAPTER=' "$cfg" 2>/dev/null | cut -d= -f2)
-    server_url=$(grep '^SERVER_URL='   "$cfg" 2>/dev/null | cut -d= -f2)
+    node_id=$(   _cfg_get "$cfg" NODE_ID)
+    lat=$(       _cfg_get "$cfg" NODE_LAT)
+    lon=$(       _cfg_get "$cfg" NODE_LON)
+    iface=$(     _cfg_get "$cfg" WIFI_ADAPTER)
+    server_url=$(_cfg_get "$cfg" SERVER_URL)
     iface="${iface:-wlan1}"
     server_url="${server_url:-https://api.droneaware.io/api}"
     token=$(cat /etc/droneaware/token 2>/dev/null | tr -d '[:space:]')
@@ -698,7 +735,7 @@ cmd_test() {
     # Fall back to GPS fix if available and static coords are missing
     if [[ -z "$lat" || "$lat" == "0" || -z "$lon" || "$lon" == "0" ]]; then
         local gps_dev
-        gps_dev=$(grep '^GPS_DEVICE=' "$cfg" 2>/dev/null | cut -d= -f2)
+        gps_dev=$(_cfg_get "$cfg" GPS_DEVICE)
         if [[ -n "$gps_dev" && -e "$gps_dev" ]]; then
             local nmea
             nmea=$(stty -F "$gps_dev" 4800 2>/dev/null; timeout 8 cat "$gps_dev" 2>/dev/null \
@@ -1127,9 +1164,9 @@ cmd_gps_diagnose() {
 
     local cfg="${INSTALL_DIR}/config.env"
     local gps_dev gps_baud node_mobile
-    gps_dev=$(grep '^GPS_DEVICE='   "$cfg" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
-    gps_baud=$(grep '^GPS_BAUD='    "$cfg" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
-    node_mobile=$(grep '^NODE_MOBILE=' "$cfg" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+    gps_dev=$(_cfg_get "$cfg" GPS_DEVICE)
+    gps_baud=$(_cfg_get "$cfg" GPS_BAUD)
+    node_mobile=$(_cfg_get "$cfg" NODE_MOBILE)
 
     echo "  Config (${cfg}):"
     printf  "    GPS_DEVICE   = %s\n" "${gps_dev:-<empty>}"
@@ -1137,8 +1174,25 @@ cmd_gps_diagnose() {
     printf  "    NODE_MOBILE  = %s\n" "${node_mobile:-<empty>}"
     echo ""
 
+    # If GPS_DEVICE is empty in config.env but wifi_feeder auto-discovered
+    # a device, use the state file's device path so the diagnostic still
+    # shows something useful. This is the common case for mobile nodes
+    # since install.sh writes GPS_DEVICE= empty and lets find_gps_device()
+    # probe /dev/ttyUSB* at feeder startup. Track the source so the
+    # display makes the fallback visible.
+    local device_source="config.env"
+    if [[ -z "$gps_dev" ]] && [[ -r /run/droneaware/gps_state.json ]]; then
+        gps_dev=$(python3 -c 'import json; s=json.load(open("/run/droneaware/gps_state.json")); print(s.get("device") or "")' 2>/dev/null)
+        if [[ -n "$gps_dev" ]]; then
+            device_source="auto-discovered (from /run/droneaware/gps_state.json)"
+            echo "  Effective GPS device:"
+            printf  "    %s   (%s)\n" "$gps_dev" "$device_source"
+            echo ""
+        fi
+    fi
+
     if [[ -z "$gps_dev" ]]; then
-        warn "GPS_DEVICE not set — this is a static node without GPS, or GPS auto-discovery hasn't run yet."
+        warn "GPS_DEVICE not set and no wifi_feeder state file — this is a static node without GPS, or GPS auto-discovery hasn't run yet."
         warn "Nothing to diagnose. Re-run install.sh to configure GPS, or set GPS_DEVICE in ${cfg} manually."
         echo ""
         return 0
@@ -1193,6 +1247,33 @@ cmd_gps_diagnose() {
     fi
     echo ""
 
+    # gpsd latent-risk check: gpsd may be installed and enabled but not
+    # currently holding the port (its default behavior is to open the
+    # device on-demand when a client connects). fuser doesn't see this
+    # case, but the moment the operator runs cgps / gpspipe / etc., the
+    # port gets seized. Flag it proactively — same signals as the
+    # installer's _check_gpsd_conflict.
+    echo "  gpsd status:"
+    local gpsd_present=no
+    if systemctl is-enabled gpsd.socket >/dev/null 2>&1 || \
+       systemctl is-active gpsd >/dev/null 2>&1 || \
+       systemctl is-active gpsd.socket >/dev/null 2>&1 || \
+       dpkg -l gpsd 2>/dev/null | grep -q '^ii'; then
+        gpsd_present=yes
+    fi
+    if [[ "$gpsd_present" == "no" ]]; then
+        info "not installed — no latent conflict"
+    else
+        if echo "$owners" | grep -q gpsd; then
+            warn "actively holding the port (see above)"
+        else
+            warn "installed and enabled — will seize the port on next cgps / gpspipe / gpsctl invocation"
+            echo "    Recommended: sudo systemctl mask gpsd gpsd.socket"
+            echo "                 sudo apt purge gpsd    # keep gpsd-clients for the gpsctl utility"
+        fi
+    fi
+    echo ""
+
     echo "  Protocol detection:"
     # If wifi_feeder holds the port, skip live sniffing (would fail) and
     # report from the state file instead. Otherwise probe fresh.
@@ -1236,9 +1317,17 @@ print(f"    lat, lon:     {s.get('lat')}, {s.get('lon')}")
 PY
     echo ""
 
-    # Verdict: quick reading of protocol + state.
+    # Verdict: reads the effective protocol. If we did a live sniff, use
+    # that. If the sniff was skipped (wifi_feeder holds the port — the
+    # common case), fall back to the state file's protocol field so the
+    # verdict reflects what the feeder is actually seeing rather than
+    # printing an unhelpful "skipped" message.
     echo "  Verdict:"
-    case "$proto" in
+    local effective_proto="$proto"
+    if [[ -z "$effective_proto" ]] && [[ -r /run/droneaware/gps_state.json ]]; then
+        effective_proto=$(python3 -c 'import json; s=json.load(open("/run/droneaware/gps_state.json")); print(s.get("protocol") or "")' 2>/dev/null)
+    fi
+    case "$effective_proto" in
         nmea)    echo -e "    ${GREEN}GPS looks healthy.${NC} If sats_in_use is 0, wait for sky view + satellite lock." ;;
         sirf|ubx)
             echo "    Puck is in binary mode — auto-fix with:"
@@ -1247,7 +1336,7 @@ PY
             echo "      sudo droneaware gps-diagnose   # to re-verify"
             ;;
         unknown) echo "    Could not identify protocol. Check the puck's power/wiring and try 'sudo dmesg | tail -20'." ;;
-        "")      echo "    (protocol detection skipped — see above)" ;;
+        "")      echo "    Not enough data yet. Wait ~10s for wifi_feeder to detect and re-run." ;;
     esac
     echo ""
 }
