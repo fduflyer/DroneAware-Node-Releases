@@ -10,6 +10,51 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.4.12.2] — Unreleased
+
+Two small fixes for `_gps_sanity_check_update` (invoked from
+`cmd_update`), both surfaced during the v1.4.12.1 update on
+njpi-120hotfix.
+
+### Fixes
+
+1. **`heading: command not found` mid-update.** When
+   `_gps_sanity_check_update` was mirrored from install.sh into the
+   CLI, its call to `heading()` slipped through — that helper is
+   defined in install.sh but wasn't in the CLI. Update ran to
+   completion (the shell error didn't halt the sanity check) but
+   printed a misleading error line right where the section header
+   should have appeared. Fixed by adding a matching `heading()`
+   helper next to the CLI's existing `info` / `warn` / `fatal`.
+
+2. **Post-mask sleep before protocol sniff.** After
+   `_check_gpsd_conflict` stopped + masked + killed gpsd, the
+   immediately-following `_check_gps_protocol` sniff ran too fast:
+   the kernel hadn't fully released the tty, so the sniff saw an
+   empty/still-locked port and reported "unknown protocol." That
+   caused the diagnostic to falsely warn "GPS may not work" even
+   though the puck was healthy (verified by the very next
+   `gps-diagnose` run once the port had settled). Fixed by adding
+   a 3-second sleep between the pkill and the info line, in both
+   install.sh and the CLI's mirrored helper. 3s is empirically
+   enough for pl2303/ftdi/cdc-acm devices.
+
+### Note
+
+Full v1.4.12.1 feature scope confirmed working end-to-end during
+the same test run — every one of the six polish fixes was visible
+in the post-update `gps-diagnose` output. This release just cleans
+up the two rough edges observed during that validation.
+
+### Files changed
+
+- `droneaware` (CLI) — added `heading()` helper; 3-second sleep
+  after gpsd mask in `_check_gpsd_conflict`.
+- `install.sh` — same 3-second sleep after gpsd mask (keep-in-sync
+  pair with the CLI helper).
+
+---
+
 ## [1.4.12.1] — Unreleased
 
 **Cosmetic hotfix for v1.4.12's `gps-diagnose` command** — six issues

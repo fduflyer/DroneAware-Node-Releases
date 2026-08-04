@@ -7,9 +7,14 @@ INSTALL_DIR="/opt/droneaware"
 VERSION_FILE="${INSTALL_DIR}/version"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
-info()  { echo -e "  ${GREEN}✓${NC}  $*"; }
-warn()  { echo -e "  ${YELLOW}!${NC}  $*"; }
-fatal() { echo -e "\n  ${RED}✗  ERROR: $*${NC}\n"; exit 1; }
+info()    { echo -e "  ${GREEN}✓${NC}  $*"; }
+warn()    { echo -e "  ${YELLOW}!${NC}  $*"; }
+fatal()   { echo -e "\n  ${RED}✗  ERROR: $*${NC}\n"; exit 1; }
+# v1.4.12.2+: `heading` mirrors install.sh's helper — needed because
+# _gps_sanity_check_update was ported from install.sh and calls heading()
+# before its check runs. Missing definition previously threw
+# "heading: command not found" mid-update.
+heading() { echo -e "\n${BOLD}$*${NC}"; }
 
 require_root() { [[ $EUID -eq 0 ]] || fatal "Run with sudo: sudo droneaware $1"; }
 
@@ -323,6 +328,12 @@ _check_gpsd_conflict() {
     systemctl disable gpsd gpsd.socket 2>/dev/null || true
     systemctl mask gpsd gpsd.socket 2>/dev/null || true
     pkill -x gpsd 2>/dev/null || true
+    # v1.4.12.2+: give the kernel a moment to release the tty after
+    # gpsd's exit. Without this, the immediately-following protocol
+    # sniff sees an empty/still-locked port and misreports "unknown
+    # protocol" — surfaced during v1.4.12.1's cmd_update run on
+    # njpi-120hotfix. 3s is empirically enough for pl2303/ftdi/cdc-acm.
+    sleep 3
     info "gpsd stopped, disabled, and masked."
 }
 

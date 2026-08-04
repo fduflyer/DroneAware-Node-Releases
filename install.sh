@@ -633,6 +633,11 @@ _check_gpsd_conflict() {
     systemctl disable gpsd gpsd.socket 2>/dev/null || true
     systemctl mask gpsd gpsd.socket 2>/dev/null || true
     pkill -x gpsd 2>/dev/null || true
+    # v1.4.12.2+: give the kernel a moment to release the tty after
+    # gpsd's exit. Without this, the immediately-following protocol
+    # sniff sees an empty/still-locked port and misreports "unknown
+    # protocol". 3s is empirically enough for pl2303/ftdi/cdc-acm.
+    sleep 3
     info "gpsd stopped, disabled, and masked."
 }
 
