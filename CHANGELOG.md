@@ -10,6 +10,184 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.5.0] — Unreleased
+
+**Multi-radio milestone.** Adapter-identification fragility fixed for
+good, dual-adapter dual-band scanning shipped, per-band feeder
+visibility everywhere.
+
+### The headline change
+
+Nodes with **two USB monitor adapters** now scan **both bands
+continuously**, not alternately. One adapter locks to 2.4 GHz (channel
+hop), the other locks to 5 GHz channel 149. No dwelling, no context-
+switch latency, no missed drones flying through the "wrong" band during
+the switch window. Nodes with one adapter still work exactly as before
+(single-adapter dwell mode).
+
+### Adapter identification is now MAC-based
+
+Root cause of the adapter-fragility bug reported by an operator:
+`WIFI_ADAPTER=wlan1` in `config.env` broke every time USB enumeration
+reshuffled `wlanN` assignments (adding hardware, moving cables between
+ports, hot-plug). The Pi's onboard WiFi could end up at wlan1 and get
+seized as monitor, breaking SSH. v1.5.0 rebuilds this from the ground
+up:
+
+- **All adapter identification uses MAC**, not interface name. MAC is
+  a physical property; wlanN is a kernel-assignment artifact that
+  shuffles.
+- **Onboard is unpickable as monitor.** Hard filter via
+  driver (`brcmfmac`) + bus (`sdio`/`mmc`) blocks all resolution paths
+  from returning the Pi onboard, even if config explicitly points at
+  its MAC. Choosing onboard = self-inflicted SSH lockout, so we refuse.
+- **Classifier + role assignment** built into wifi_feeder. Enumerates
+  all wlan interfaces, filters to USB-only monitor-capable adapters,
+  assigns 5 GHz / 2.4 GHz roles under capability constraints (a
+  2.4-only adapter cannot take the 5 GHz role — this is a hard
+  constraint, not a preference).
+- **NetworkManager config auto-regenerated** from resolved MAC(s).
+  `/etc/NetworkManager/conf.d/droneaware.conf` no longer stales when
+  the operator swaps adapters — a subsequent `sudo droneaware refresh`
+  or `sudo droneaware update` rewrites it.
+
+### New: `sudo droneaware refresh`
+
+Operator-visible orchestration command. Re-detects hardware (WiFi
+adapters, GPS protocol/gpsd conflict), migrates config, regenerates NM
+config, and switches systemd unit topology if the number of monitor
+adapters changed. Idempotent — safe to run repeatedly. Doesn't require
+a new release (unlike `droneaware update`).
+
+Mental model:
+- **New release available** → `sudo droneaware update`
+- **Changed hardware or want to re-verify state** → `sudo droneaware refresh`
+
+Both call the same underlying migration logic; `update` adds the
+binary-download step.
+
+### New: dual-adapter systemd units
+
+Two new services ship alongside the existing `droneaware-wifi.service`:
+
+- `droneaware-wifi-2g.service` — dedicated 2.4 GHz feeder, hops
+  1/6/11, reads `WIFI_ADAPTER_2G_MAC`
+- `droneaware-wifi-5g.service` — dedicated 5 GHz feeder, locked to
+  channel 149, reads `WIFI_ADAPTER_5G_MAC`
+- `droneaware-wifi.service` — unchanged single-adapter unit for nodes
+  with only one monitor adapter (dwells across bands if capable)
+
+The three units are mutually exclusive (`Conflicts=` in unit files).
+Mode-switching is automatic: the classifier detects the number of
+monitor-capable USB adapters and enables the appropriate service(s).
+
+### Per-band heartbeat + dashboard visibility
+
+- Every v1.5.0+ node emits **three heartbeats per interval**: `ble`,
+  `wifi_2g`, `wifi_5g` (previously just two: `ble`, `wifi`).
+- New heartbeat fields: `feeder` (discriminator), `scan_mode`
+  (`lock` | `dwell` | `absent`), `wifi_adapter_mac`,
+  `wifi_adapter_id` (USB vendor:product).
+- **My Nodes dashboard renders three rows per node** — matches the
+  three heartbeat feeders, shows scan_mode per band. Operators see
+  immediately when 5 GHz coverage is absent (informational nudge on
+  first observation; no recurring alerts).
+- Single-adapter dwell mode still emits both heartbeats (with
+  `scan_mode=dwell`) so the dashboard shape is uniform across node
+  topologies.
+
+### Offline Web UI: Feeders panel
+
+The local `http://<pi-ip>:5000/` dashboard gains a three-row Feeders
+panel (BLE / 2.4 GHz / 5 GHz) mirroring the My Nodes layout. Data
+sourced from per-band state files
+(`/run/droneaware/wifi_state_{2g,5g}.json`) that each feeder process
+writes on every heartbeat cycle, plus a systemd active-check for BLE.
+
+### Unplug-safety in dual-adapter mode
+
+Real scenario: operator unplugs one of the two USB adapters mid-run.
+Without safety, the split feeder whose adapter went away would fall
+back to the classifier's only remaining monitor candidate — the peer
+adapter — and contend for the same physical device.
+
+v1.5.0 fix: when `--band` is set (dual-adapter mode) and the band-
+specific MAC becomes unresolvable, the feeder refuses to fall through
+to any other adapter. Enters FAULT cleanly, peer band's service keeps
+running, dashboard shows one row absent. Recovery: plug the adapter
+back in (service restarts automatically) or run `sudo droneaware
+refresh` to switch modes.
+
+### GPS ownership in dual-adapter mode
+
+Two wifi_feeder processes both trying to read `/dev/ttyUSB0` for GPS
+would corrupt the NMEA stream (Linux tty devices don't do exclusive
+locking by default). v1.5.0 assigns ownership: `--band=2g` and
+`--band=auto` (single-adapter) own the GPS reader; `--band=5g` skips
+it. Deterministic, no coordination protocol needed.
+
+### CLI additions
+
+- `sudo droneaware refresh` — new orchestration command (above)
+- `WIFI_ADAPTER_MAC` config key — MAC-based single-adapter identifier
+- `WIFI_ADAPTER_2G_MAC` + `WIFI_ADAPTER_5G_MAC` config keys — dual-adapter
+- `--band {auto|2g|5g}` argument on `wifi_feeder`
+
+### Backward compatibility
+
+- **Legacy `WIFI_ADAPTER=wlanN` config keys** honored as fallback when
+  MAC-based keys aren't set. `migrate_config_env` (run on every
+  `droneaware update`) reads the legacy wlanN, resolves it to a MAC,
+  writes the new `WIFI_ADAPTER_MAC` key. Legacy key retained for one
+  release cycle, dropped in v1.6.0.
+- **Single-adapter operators (existing fleet majority)** experience
+  zero functional changes on upgrade: mode-switch orchestration
+  detects 1 monitor adapter and keeps the existing single-service
+  topology. Adapter identification silently upgrades from wlanN to MAC.
+- **Pre-v1.5.0 heartbeat shape** continues to work — the legacy `wifi`
+  feeder heartbeat is accepted indefinitely.
+
+### Config.env changes
+
+- `WIFI_DWELL_2G_SEC` / `WIFI_DWELL_5G_SEC` documentation updated to
+  clarify these values apply only in single-adapter dwell mode.
+  Ignored (with no warning) in dual-adapter mode — each adapter is
+  locked to one band, no dwelling to schedule.
+
+### Files changed
+
+- `wifi_feeder.py` — classifier, role assignment, `--band` arg,
+  `LockedChannelHopper`, MAC-based iface resolution, hard-filter
+  onboard, unplug-safety, band-scoped heartbeat emit, per-band
+  state file writes, GPS ownership
+- `droneaware` (CLI) — `_orchestrate_wifi_mode`,
+  `_regenerate_nm_monitor_config`, `_classify_wifi_adapters`,
+  `cmd_refresh`, `_set_cfg_key`, config migration for MAC keys
+- `install.sh` — ships `droneaware-wifi-2g.service` +
+  `droneaware-wifi-5g.service`
+- `droneaware-wifi-2g.service` (new) — 2.4 GHz systemd unit
+- `droneaware-wifi-5g.service` (new) — 5 GHz systemd unit
+- `web_ui.py` — `_read_feeder_states`, `/api/status.feeders`
+- `web_static/index.html` — Feeders panel HTML/CSS/JS
+
+### Validated
+
+Real hardware: Pi 3B + dual-band USB adapter (MediaTek MT7612U) +
+2.4-only USB adapter (Ralink RT3070). Scenarios covered:
+
+- Single-adapter mode → dual-adapter mode via config edit
+- Dual-adapter mode → single-adapter mode via adapter unplug + refresh
+- MAC-based tracking survives USB port shuffle (adapters swapped
+  between ports, roles stay on same physical adapters)
+- Onboard-refusal fired for both explicit MAC config and legacy
+  `WIFI_ADAPTER=wlan0` — SSH stayed alive through both tests
+- Unplug-safety: one adapter removed mid-run, peer band unaffected,
+  dashboard shows one row FAULT
+- Refresh command idempotent — no-op when hardware unchanged, mode-
+  switches only when adapter count changes
+
+---
+
 ## [1.4.12.2] — Unreleased
 
 Two small fixes for `_gps_sanity_check_update` (invoked from

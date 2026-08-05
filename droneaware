@@ -186,10 +186,19 @@ EOF
         cat >> "$cfg" <<'EOF'
 
 # ─── Dual-band dwell times (added by droneaware update for v1.4.6+) ───
-# Applies only when a dual-band adapter is in use (WIFI_5G_ENABLED=auto
-# and adapter supports 5 GHz, OR WIFI_5G_ENABLED=true). Ignored on
-# single-band setups. The feeder cycles: WIFI_DWELL_2G_SEC on ch6 →
-# WIFI_DWELL_5G_SEC on ch149 → repeat. Total cycle = sum of the two.
+# Applies ONLY in single-adapter mode with a dual-band card (droneaware-
+# wifi.service, one physical adapter alternating between bands). The
+# feeder cycles: WIFI_DWELL_2G_SEC on ch6 → WIFI_DWELL_5G_SEC on ch149
+# → repeat. Total cycle = sum of the two.
+#
+# IGNORED in v1.5.0+ dual-adapter mode (droneaware-wifi-2g +
+# droneaware-wifi-5g services): each adapter is dedicated to one band
+# and locked to its channel — no dwelling, no hopping. Adjusting
+# these values does nothing when two monitor-capable USB adapters are
+# present. Run 'sudo droneaware refresh' to detect current mode.
+#
+# Also ignored on single-band-only setups (2.4-only adapter, no 5 GHz
+# card): feeder hops within 2.4 GHz, no dwell alternation to schedule.
 #
 # v1.4.6 slashed defaults from 20s / 10s (30s cycle) to 3s / 2s
 # (5s cycle) after operator feedback: a drone at 20 m/s cruise covers
@@ -212,6 +221,47 @@ EOF
         info "Added v1.4.6 dual-band dwell time options to config.env"
     fi
 
+    # ─── WIFI_ADAPTER_MAC (added by droneaware update for v1.5.0+) ───
+    # MAC-based adapter identification. WIFI_ADAPTER=wlanN is fragile:
+    # kernel enumeration reshuffles wlanN assignments when USB ports get
+    # reordered or hardware is added (this is the "Chris fragility bug"
+    # v1.5.0 fixes). MAC is stable across enumeration changes.
+    #
+    # Migration semantics:
+    #   - If WIFI_ADAPTER_MAC is already set → no-op (already migrated)
+    #   - If WIFI_ADAPTER=wlanN is set AND wlanN exists in /sys/class/net →
+    #     resolve wlanN to its current MAC and append WIFI_ADAPTER_MAC=<mac>
+    #   - If WIFI_ADAPTER is empty OR wlanN doesn't exist → skip; wifi_feeder's
+    #     runtime classifier (v1.5.0 step 3) will auto-discover at startup
+    #
+    # Both keys coexist during the transition. WIFI_ADAPTER_MAC takes
+    # precedence when both are present (per step 3 behavior). A future
+    # release drops the legacy WIFI_ADAPTER key.
+    if ! grep -q '^WIFI_ADAPTER_MAC=' "$cfg"; then
+        local legacy_iface legacy_mac
+        legacy_iface=$(_cfg_get "$cfg" WIFI_ADAPTER)
+        if [[ -n "$legacy_iface" && -e "/sys/class/net/${legacy_iface}/address" ]]; then
+            legacy_mac=$(cat "/sys/class/net/${legacy_iface}/address" 2>/dev/null | tr -d '[:space:]')
+        fi
+        if [[ -n "${legacy_mac:-}" ]]; then
+            [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+            cat >> "$cfg" <<EOF
+
+# ─── WIFI_ADAPTER_MAC (added by droneaware update for v1.5.0+) ───
+# MAC-based adapter identification. Survives kernel USB enumeration
+# reshuffling — WIFI_ADAPTER=wlanN can change if USB ports get reordered
+# or hardware is added. In v1.5.0+ this key takes precedence over
+# WIFI_ADAPTER; the legacy key is retained for backward compat.
+#
+# Auto-migrated from WIFI_ADAPTER=${legacy_iface} (MAC ${legacy_mac}).
+WIFI_ADAPTER_MAC=${legacy_mac}
+EOF
+            info "Added v1.5.0 WIFI_ADAPTER_MAC (migrated ${legacy_iface} → ${legacy_mac})"
+        else
+            info "v1.5.0 WIFI_ADAPTER_MAC not migrated — no resolvable legacy wlanN; feeder classifier will auto-discover at startup"
+        fi
+    fi
+
     # Future release migration blocks go here.
     # Pattern:
     #   if ! grep -q '^NEW_FIELD=' "$cfg"; then
@@ -221,6 +271,89 @@ EOF
     # EOF
     #       info "Added vX.Y.Z options to config.env"
     #   fi
+
+    # v1.5.0+ — detect present monitor-capable USB adapters and set the
+    # right adapter mode (single vs dual). Populates the appropriate
+    # WIFI_ADAPTER_MAC / WIFI_ADAPTER_2G_MAC / WIFI_ADAPTER_5G_MAC keys,
+    # enables/disables the corresponding systemd units. Idempotent —
+    # safe to call repeatedly, only takes action when actual state
+    # differs from desired.
+    _orchestrate_wifi_mode "$cfg"
+
+    # v1.5.0+ — regenerate the NetworkManager monitor-adapter config
+    # (/etc/NetworkManager/conf.d/droneaware.conf) from whichever MAC
+    # keys are currently in config.env. Idempotent: no rewrite if the
+    # generated content matches what's already on disk. Runs AFTER
+    # _orchestrate_wifi_mode so it picks up any freshly-populated MAC keys.
+    _regenerate_nm_monitor_config "$cfg"
+}
+
+# ---------------------------------------------------------------------------
+# NM monitor-adapter config regenerator (v1.5.0+)
+# ---------------------------------------------------------------------------
+# Writes /etc/NetworkManager/conf.d/droneaware.conf with unmanaged-devices
+# listing whichever adapter MAC(s) are currently configured as the
+# monitor role(s). Rewrites on every `droneaware update` so a changed
+# WIFI_ADAPTER_MAC in config.env is reflected in NM's view of the world
+# on the next update run.
+#
+# Precedence (matches wifi_feeder's resolve_monitor_iface logic):
+#   1. Dual-adapter mode: WIFI_ADAPTER_2G_MAC + WIFI_ADAPTER_5G_MAC
+#      both set → unmanage both
+#   2. Single-adapter mode: WIFI_ADAPTER_MAC set → unmanage it
+#   3. Neither set → skip regen (don't wipe an operator's manual overrides;
+#      wifi_feeder's runtime `nmcli device set unmanaged no` still works
+#      as belt-and-suspenders when the feeder starts)
+#
+# Idempotent: writes only if generated content differs from what's on
+# disk. Prevents mtime churn on every update.
+_regenerate_nm_monitor_config() {
+    local cfg="$1"
+    local nm_conf="/etc/NetworkManager/conf.d/droneaware.conf"
+    local mac_single mac_2g mac_5g macs_spec
+
+    mac_single=$(_cfg_get "$cfg" WIFI_ADAPTER_MAC)
+    mac_2g=$(_cfg_get "$cfg" WIFI_ADAPTER_2G_MAC)
+    mac_5g=$(_cfg_get "$cfg" WIFI_ADAPTER_5G_MAC)
+
+    if [[ -n "$mac_2g" && -n "$mac_5g" ]]; then
+        macs_spec="mac:${mac_2g};mac:${mac_5g}"
+    elif [[ -n "$mac_single" ]]; then
+        macs_spec="mac:${mac_single}"
+    else
+        # Nothing to write. Leave whatever's on disk alone.
+        return 0
+    fi
+
+    local desired="# DroneAware — prevent NetworkManager from managing the monitor
+# adapter(s). Auto-regenerated by 'droneaware update' from the
+# WIFI_ADAPTER_MAC / WIFI_ADAPTER_2G_MAC / WIFI_ADAPTER_5G_MAC keys
+# in /opt/droneaware/config.env. Do not edit by hand — your changes
+# will be overwritten on the next update.
+#
+# If NM manages a monitor interface it fights the feeder's monitor
+# mode setup, causing zero packet capture and intermittent SSH
+# instability. Managed adapters (Pi onboard for backhaul, etc.) are
+# left alone.
+[keyfile]
+unmanaged-devices=${macs_spec}
+"
+
+    # Idempotency: skip write if content already matches byte-for-byte.
+    # Note: `$(cat file)` strips trailing newlines in bash, which would
+    # cause false diffs against $desired (which ends in a newline). Use
+    # `cmp -s` for byte-exact comparison via stdin instead.
+    if [[ -r "$nm_conf" ]] && printf '%s' "$desired" | cmp -s - "$nm_conf"; then
+        return 0
+    fi
+
+    printf '%s' "$desired" > "$nm_conf"
+    chmod 644 "$nm_conf"
+    # Reload NM to pick up the new rule. Doesn't disconnect managed
+    # interfaces — just updates the unmanaged-device rules. Soft-fail
+    # if NM isn't running (e.g. during install.sh's initial run).
+    nmcli general reload 2>/dev/null || systemctl reload NetworkManager 2>/dev/null || true
+    info "Regenerated NM monitor config (${nm_conf}) → unmanaged: ${macs_spec}"
 }
 
 # ---------------------------------------------------------------------------
@@ -407,6 +540,236 @@ _gps_sanity_check_update() {
     heading "GPS Configuration Check"
     _check_gpsd_conflict
     _check_gps_protocol "$gps_dev"
+}
+
+# ---------------------------------------------------------------------------
+# WiFi adapter mode-switch orchestration (v1.5.0+)
+# ---------------------------------------------------------------------------
+# Runs the same classifier logic that wifi_feeder uses at startup, then
+# decides based on how many monitor-capable USB adapters are present:
+#
+#   ≥2 adapters → dual-adapter mode
+#     - Populate WIFI_ADAPTER_2G_MAC + WIFI_ADAPTER_5G_MAC from the
+#       classifier's constraint-based role assignment
+#     - Enable droneaware-wifi-2g + droneaware-wifi-5g services
+#     - Disable droneaware-wifi.service (single-adapter unit)
+#
+#   1 adapter → single-adapter mode
+#     - Populate WIFI_ADAPTER_MAC
+#     - Enable droneaware-wifi.service
+#     - Disable the split units
+#
+#   0 adapters → leave mode untouched (fresh install with no hardware
+#     yet, or all adapters unplugged). Whichever service is enabled will
+#     enter FAULT until an adapter appears.
+#
+# Idempotent — every action is gated on the current state differing
+# from the desired state. Called from migrate_config_env (which runs
+# on every `droneaware update`) and from cmd_refresh (which operators
+# run after any hardware change).
+
+# Enumerate + classify wlan interfaces. Prints shell-sourceable KEY=VALUE
+# lines to stdout: MONITOR_COUNT, ROLE_2G_MAC, ROLE_5G_MAC. Kept in sync
+# with wifi_feeder.py's wclassifier_enumerate / wclassifier_assign_roles.
+_classify_wifi_adapters() {
+    python3 <<'PY'
+import glob, os, re, subprocess
+IW = "/usr/sbin/iw" if os.path.exists("/usr/sbin/iw") else (
+    "/sbin/iw" if os.path.exists("/sbin/iw") else "iw")
+
+def _read(p):
+    try: return open(p).read().strip()
+    except (OSError, UnicodeDecodeError): return None
+
+def _link(p):
+    try: return os.path.basename(os.readlink(p))
+    except OSError: return None
+
+def _bands(info):
+    b = set()
+    for line in info.splitlines():
+        m = re.search(r"\*\s+(\d{4})\.\d+\s+MHz\s+\[\d+\]", line)
+        if m:
+            f = int(m.group(1))
+            if 2400 <= f <= 2500: b.add("2.4")
+            elif 5000 <= f <= 6000: b.add("5")
+    return sorted(b)
+
+adapters = []
+for path in sorted(glob.glob("/sys/class/net/wlan*")):
+    iface = os.path.basename(path)
+    a = {
+        "iface": iface,
+        "mac": (_read(f"{path}/address") or "?").lower(),
+        "driver": _link(f"{path}/device/driver") or "?",
+        "bus": _link(f"{path}/device/subsystem") or "?",
+        "bands": [], "supports_monitor": False, "classification": "unknown",
+    }
+    phy = _read(f"{path}/phy80211/name")
+    if phy:
+        try:
+            r = subprocess.run([IW, "phy", phy, "info"],
+                               capture_output=True, text=True, timeout=5)
+            a["bands"] = _bands(r.stdout)
+            a["supports_monitor"] = bool(re.search(r"^\s*\*\s+monitor$",
+                                                    r.stdout, re.MULTILINE))
+        except Exception:
+            pass
+    if a["driver"] == "brcmfmac" or a["bus"] in ("sdio", "mmc"):
+        a["classification"] = "onboard"
+    elif a["bus"] == "usb":
+        a["classification"] = "usb-monitor" if a["supports_monitor"] else "usb-no-monitor"
+    adapters.append(a)
+
+monitor = sorted([a for a in adapters if a["classification"] == "usb-monitor"],
+                 key=lambda a: a["mac"])
+role_5g = role_24g = None
+if len(monitor) == 1:
+    only = monitor[0]
+    if "2.4" in only["bands"]: role_24g = only
+    if "5"   in only["bands"]: role_5g  = only
+elif len(monitor) >= 2:
+    fiveg = [a for a in monitor if "5" in a["bands"]]
+    twofour_only = [a for a in monitor if "2.4" in a["bands"] and "5" not in a["bands"]]
+    if fiveg and twofour_only:
+        role_5g  = fiveg[0]
+        role_24g = twofour_only[0]
+    elif fiveg:
+        role_5g = fiveg[0]
+        for a in monitor:
+            if a is not role_5g and "2.4" in a["bands"]:
+                role_24g = a
+                break
+    else:
+        twofour = [a for a in monitor if "2.4" in a["bands"]]
+        if twofour:
+            role_24g = twofour[0]
+
+print(f"MONITOR_COUNT={len(monitor)}")
+print(f"ROLE_2G_MAC={role_24g['mac'] if role_24g else ''}")
+print(f"ROLE_5G_MAC={role_5g['mac'] if role_5g else ''}")
+PY
+}
+
+# Set-or-add a config.env key. Idempotent — only touches the file when
+# the value actually differs. Uses sed -i for existing keys, append for
+# new ones. Handles empty-string values by writing them literally.
+_set_cfg_key() {
+    local cfg="$1" key="$2" value="$3"
+    if grep -q "^${key}=" "$cfg"; then
+        local current
+        current=$(_cfg_get "$cfg" "$key")
+        if [[ "$current" != "$value" ]]; then
+            sed -i "s|^${key}=.*|${key}=${value}|" "$cfg"
+        fi
+    else
+        echo "${key}=${value}" >> "$cfg"
+    fi
+}
+
+_orchestrate_wifi_mode() {
+    local cfg="$1"
+    local MONITOR_COUNT="" ROLE_2G_MAC="" ROLE_5G_MAC=""
+    eval "$(_classify_wifi_adapters 2>/dev/null)"
+
+    if [[ -z "$MONITOR_COUNT" ]]; then
+        warn "v1.5.0 mode-detect: classifier failed — leaving adapter mode unchanged"
+        return 0
+    fi
+
+    info "v1.5.0 mode-detect: ${MONITOR_COUNT} monitor-capable USB adapter(s) present"
+
+    if [[ "$MONITOR_COUNT" -ge 2 && -n "$ROLE_2G_MAC" && -n "$ROLE_5G_MAC" ]]; then
+        _switch_to_dual_adapter_mode "$cfg" "$ROLE_2G_MAC" "$ROLE_5G_MAC"
+    elif [[ "$MONITOR_COUNT" -ge 1 ]]; then
+        local single_mac="${ROLE_2G_MAC:-$ROLE_5G_MAC}"
+        _switch_to_single_adapter_mode "$cfg" "$single_mac"
+    else
+        info "v1.5.0 mode-detect: no monitor-capable USB adapters — feeder will FAULT until one is plugged in"
+    fi
+}
+
+_switch_to_dual_adapter_mode() {
+    local cfg="$1" mac_2g="$2" mac_5g="$3"
+    local prev_2g prev_5g
+    prev_2g=$(_cfg_get "$cfg" WIFI_ADAPTER_2G_MAC)
+    prev_5g=$(_cfg_get "$cfg" WIFI_ADAPTER_5G_MAC)
+
+    _set_cfg_key "$cfg" WIFI_ADAPTER_2G_MAC "$mac_2g"
+    _set_cfg_key "$cfg" WIFI_ADAPTER_5G_MAC "$mac_5g"
+
+    # Detect if we were previously in single-adapter mode (droneaware-wifi
+    # enabled and split units not enabled). Also detect if either MAC changed.
+    local mode_changed=0
+    if systemctl is-enabled droneaware-wifi.service >/dev/null 2>&1 \
+       && ! systemctl is-enabled droneaware-wifi-2g.service >/dev/null 2>&1; then
+        mode_changed=1
+    fi
+    local macs_changed=0
+    if [[ "$prev_2g" != "$mac_2g" || "$prev_5g" != "$mac_5g" ]]; then
+        macs_changed=1
+    fi
+
+    if [[ "$mode_changed" == "1" ]]; then
+        info "v1.5.0 mode-switch: single-adapter → dual-adapter (2g=${mac_2g}, 5g=${mac_5g})"
+        systemctl stop droneaware-wifi 2>/dev/null || true
+        systemctl disable droneaware-wifi 2>/dev/null || true
+        systemctl enable droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
+        systemctl start droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
+    elif [[ "$macs_changed" == "1" ]]; then
+        info "v1.5.0 dual-adapter MACs changed — restarting split units"
+        systemctl restart droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
+    fi
+}
+
+_switch_to_single_adapter_mode() {
+    local cfg="$1" mac="$2"
+    local prev_mac
+    prev_mac=$(_cfg_get "$cfg" WIFI_ADAPTER_MAC)
+    _set_cfg_key "$cfg" WIFI_ADAPTER_MAC "$mac"
+
+    local mode_changed=0
+    if systemctl is-enabled droneaware-wifi-2g.service >/dev/null 2>&1 \
+       || systemctl is-enabled droneaware-wifi-5g.service >/dev/null 2>&1; then
+        mode_changed=1
+    fi
+    local mac_changed=0
+    [[ "$prev_mac" != "$mac" ]] && mac_changed=1
+
+    if [[ "$mode_changed" == "1" ]]; then
+        info "v1.5.0 mode-switch: dual-adapter → single-adapter (${mac})"
+        systemctl stop droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
+        systemctl disable droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
+        systemctl enable droneaware-wifi 2>/dev/null || true
+        systemctl start droneaware-wifi 2>/dev/null || true
+    elif [[ "$mac_changed" == "1" ]]; then
+        info "v1.5.0 single-adapter MAC changed — restarting service"
+        systemctl restart droneaware-wifi 2>/dev/null || true
+    fi
+}
+
+cmd_refresh() {
+    require_root "refresh"
+    echo ""
+    echo -e "${BOLD}DroneAware Refresh${NC}"
+    echo ""
+    echo "  Re-detecting hardware and syncing configuration..."
+    echo "  (WiFi adapters, GPS protocol, gpsd conflict, NM config, service topology)"
+    echo ""
+    migrate_config_env
+    echo ""
+    info "Refresh complete."
+    echo ""
+    info "Current WiFi mode:"
+    if systemctl is-active droneaware-wifi-2g.service >/dev/null 2>&1 \
+       && systemctl is-active droneaware-wifi-5g.service >/dev/null 2>&1; then
+        echo "    dual-adapter (droneaware-wifi-2g + droneaware-wifi-5g)"
+    elif systemctl is-active droneaware-wifi.service >/dev/null 2>&1; then
+        echo "    single-adapter (droneaware-wifi)"
+    else
+        echo "    no WiFi services active — check 'sudo droneaware gps-diagnose' and 'sudo droneaware status'"
+    fi
+    echo ""
 }
 
 cmd_update() {
@@ -1359,6 +1722,7 @@ case "$1" in
     test)           cmd_test "$@" ;;
     install-webui)  cmd_install_webui ;;
     gps-diagnose)   cmd_gps_diagnose ;;
+    refresh)        cmd_refresh ;;
     __migrate)
         # Internal subcommand used by cmd_update for post-install config
         # migration. The double-underscore prefix is a convention signaling
@@ -1385,6 +1749,7 @@ case "$1" in
         echo "    test --dry-run  Check rate-limit availability without transmitting"
         echo "    install-webui   Install the optional local Web UI (LAN dashboard)"
         echo "    gps-diagnose    Read-only GPS health check (device, port, protocol, state)"
+        echo "    refresh         Re-detect hardware (WiFi adapters, GPS) and sync services"
         echo ""
         ;;
 esac

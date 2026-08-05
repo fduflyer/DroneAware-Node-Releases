@@ -59,6 +59,7 @@ import logging
 import os
 import socket
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -677,6 +678,52 @@ def api_detections():
     return jsonify(store.snapshot())
 
 
+def _read_feeder_states() -> dict:
+    """v1.5.0 Gap 3: read the per-band wifi state files written by the
+    wifi_feeder process(es). Returns a dict shaped:
+        {"wifi_2g": {...}, "wifi_5g": {...}}
+    Missing / stale / unreadable state files map to None entries so the
+    frontend can render "unknown" placeholders instead of crashing.
+
+    Also includes a static BLE entry — v1.5.0 doesn't yet have a BLE
+    state file (planned for v1.5.x), so we surface the systemd service
+    status as a coarse indicator until then.
+    """
+    out = {"ble": None, "wifi_2g": None, "wifi_5g": None}
+    for band in ("2g", "5g"):
+        path = f"/run/droneaware/wifi_state_{band}.json"
+        try:
+            with open(path) as f:
+                s = json.load(f)
+            age = time.time() - (s.get("updated_at") or 0)
+            s["age_sec"] = int(age)
+            # Stale if not refreshed in >180s (heartbeat cycle is 60s;
+            # 3 missed cycles = something is wrong)
+            s["stale"] = age > 180
+            out[f"wifi_{band}"] = s
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+
+    # BLE — placeholder until BLE feeder gets its own state file. Check
+    # systemd for a rough "is it running" signal.
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", "droneaware-ble.service"],
+            capture_output=True, text=True, timeout=2,
+        )
+        active = r.stdout.strip() == "active"
+    except Exception:
+        active = False
+    out["ble"] = {
+        "feeder": "ble",
+        "iface": "hci0",   # conventional — actual adapter may vary
+        "scan_mode": "lock",  # BLE is always "listening on all channels" — closest to lock
+        "wifi_ok": active,  # borrowing the field name for uniform frontend rendering
+        "stale": False,
+    }
+    return out
+
+
 @app.route("/api/status")
 def api_status():
     s = store.stats()
@@ -697,6 +744,9 @@ def api_status():
         # or 404s if CartoDB is unreachable.
         "tiles_local": _mbtiles_conn is not None,
         "tiles_local_max_zoom": WORLD_TILES_MAX_ZOOM if _mbtiles_conn else None,
+        # v1.5.0 Gap 3: per-feeder status for the three-row BLE/2.4/5
+        # panel in the offline UI (matching My Nodes layout).
+        "feeders":     _read_feeder_states(),
     })
     return jsonify(s)
 

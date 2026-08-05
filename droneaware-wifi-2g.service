@@ -1,0 +1,33 @@
+[Unit]
+# v1.5.0+ dual-adapter mode: dedicated 2.4 GHz feeder. Uses the
+# WIFI_ADAPTER_2G_MAC config key to resolve which USB adapter to bind
+# for monitor mode. Runs alongside droneaware-wifi-5g.service, which
+# does the same for the 5 GHz-149 band.
+#
+# Conflicts with the single-adapter droneaware-wifi.service — only ONE
+# of the two modes is enabled on a given node at a time. Mode-switching
+# is handled by install.sh / cmd_update based on the number of monitor-
+# capable USB adapters detected on the node.
+Description=DroneAware WiFi Remote ID Feeder (2.4 GHz, dual-adapter mode)
+After=network-online.target droneaware-bt-select.service
+Wants=network-online.target
+Conflicts=droneaware-wifi.service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/opt/droneaware/config.env
+ExecStart=/opt/droneaware/wifi_feeder \
+    --node-id ${NODE_ID} \
+    --server ${SERVER_URL} \
+    --batch-size ${BATCH_SIZE} \
+    --flush-interval ${FLUSH_INTERVAL} \
+    --band 2g
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=droneaware-wifi-2g
+
+[Install]
+WantedBy=multi-user.target

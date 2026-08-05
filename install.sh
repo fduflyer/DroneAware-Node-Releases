@@ -771,8 +771,16 @@ install_services() {
     chmod +x "${CLI_DIR}/droneaware-bt-select"
     info "droneaware-bt-select installed."
 
-    # Systemd service files
-    for svc in droneaware-bt-select.service droneaware-ble.service droneaware-wifi.service; do
+    # Systemd service files. droneaware-wifi-2g.service +
+    # droneaware-wifi-5g.service (added v1.5.0+) are the dual-adapter
+    # mode counterparts to droneaware-wifi.service. Only one mode is
+    # enabled per node — orchestration is handled by cmd_update /
+    # install.sh based on the number of monitor-capable USB adapters
+    # detected. All three files are shipped so the mode can be
+    # switched later without needing a fresh install.
+    for svc in droneaware-bt-select.service droneaware-ble.service \
+               droneaware-wifi.service \
+               droneaware-wifi-2g.service droneaware-wifi-5g.service; do
         if [[ "$LOCAL_INSTALL" == "1" ]]; then
             cp "${local_root}/${svc}" "/etc/systemd/system/${svc}"
         else

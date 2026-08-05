@@ -30,6 +30,7 @@ import argparse
 import socket
 import glob
 import os
+import re
 import sys
 import collections
 import serial
@@ -595,6 +596,384 @@ _NM_CONF       = "/etc/NetworkManager/conf.d/droneaware.conf"
 _MONITOR_MACS  = "/opt/droneaware/monitor_macs"
 
 
+# ============================================================================
+# WiFi adapter classifier (v1.5.0 Step 1 — LOGGING-ONLY)
+# ============================================================================
+# Discovers all wlan* interfaces and classifies each as onboard-Pi-WiFi
+# (brcmfmac driver OR sdio/mmc bus) vs external USB. For USB adapters,
+# probes monitor-mode support and band support via `iw phy info`. Then
+# assigns roles (5GHz-149 lock, 2.4GHz hopper) under capability
+# constraints — a 2.4-only adapter can never take the 5GHz role.
+#
+# Step 1 integration: LOG-ONLY. This code runs at startup and writes
+# what it discovers + what it would pick to the journal, but does NOT
+# change the actual iface selected by --iface. Steps 3+ later replace
+# the iface-based selection with MAC-based lookup driven by this
+# classifier. Split intentionally so we can validate the classifier's
+# picks on real hardware before consuming them.
+#
+# Prototype validated on njpi-120hotfix (Pi 3B + Alfa AWUS036ACM dual-band
+# + Alfa Ralink RT3070 2.4-only) across scenarios 1/2/3/5.
+
+_IW_PATH = "/usr/sbin/iw" if os.path.exists("/usr/sbin/iw") else (
+    "/sbin/iw" if os.path.exists("/sbin/iw") else "iw")
+
+
+def _wclassifier_read(path: str) -> str | None:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _wclassifier_readlink_base(path: str) -> str | None:
+    try:
+        return os.path.basename(os.readlink(path))
+    except OSError:
+        return None
+
+
+def _wclassifier_parse_bands(iw_info: str) -> list:
+    """Parse `iw phy info` output for supported bands (2.4 / 5) via
+    frequency list. Frequencies appear as '* 2412.0 MHz [1] (...)' lines."""
+    bands = set()
+    for line in iw_info.splitlines():
+        m = re.search(r"\*\s+(\d{4})\.\d+\s+MHz\s+\[\d+\]", line)
+        if not m:
+            continue
+        freq = int(m.group(1))
+        if 2400 <= freq <= 2500:
+            bands.add("2.4")
+        elif 5000 <= freq <= 6000:
+            bands.add("5")
+    return sorted(bands)
+
+
+def wclassifier_enumerate() -> list:
+    """Return list of adapter dicts. See wifi_probe.py for schema."""
+    result = []
+    for path in sorted(glob.glob("/sys/class/net/wlan*")):
+        iface = os.path.basename(path)
+        a = {
+            "iface": iface,
+            "mac": _wclassifier_read(f"{path}/address") or "?",
+            "driver": _wclassifier_readlink_base(f"{path}/device/driver") or "?",
+            "bus": _wclassifier_readlink_base(f"{path}/device/subsystem") or "?",
+            "usb_vid": None, "usb_pid": None, "phy": None,
+            "bands": [], "supports_monitor": False, "classification": "unknown",
+        }
+        if a["bus"] == "usb":
+            a["usb_vid"] = _wclassifier_read(f"{path}/device/../idVendor")
+            a["usb_pid"] = _wclassifier_read(f"{path}/device/../idProduct")
+        a["phy"] = _wclassifier_read(f"{path}/phy80211/name")
+        if a["phy"]:
+            try:
+                info = subprocess.run(
+                    [_IW_PATH, "phy", a["phy"], "info"],
+                    capture_output=True, text=True, timeout=5
+                ).stdout
+                a["bands"] = _wclassifier_parse_bands(info)
+                a["supports_monitor"] = bool(
+                    re.search(r"^\s*\*\s+monitor$", info, re.MULTILINE)
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+        # v1.5.0 classification rule: brcmfmac driver OR sdio/mmc bus →
+        # onboard (never monitor). Other USB → monitor-candidate iff
+        # capable. Everything else marked "other".
+        if a["driver"] == "brcmfmac" or a["bus"] in ("sdio", "mmc"):
+            a["classification"] = "onboard"
+        elif a["bus"] == "usb":
+            a["classification"] = "usb-monitor" if a["supports_monitor"] else "usb-no-monitor"
+        else:
+            a["classification"] = "other"
+        result.append(a)
+    return result
+
+
+def wclassifier_assign_roles(adapters: list) -> dict:
+    """Assign 5GHz-149-lock and 2.4GHz-hopper roles under capability
+    constraints. See wifi_probe.py for rules R1-R6."""
+    warnings = []
+    monitor = sorted(
+        [a for a in adapters if a["classification"] == "usb-monitor"],
+        key=lambda a: a["mac"],
+    )
+    if not monitor:
+        warnings.append("no monitor-capable USB adapter present")
+        return {"role_5g": None, "role_24g": None, "warnings": warnings}
+
+    fiveg = [a for a in monitor if "5" in a["bands"]]
+    twofour = [a for a in monitor if "2.4" in a["bands"]]
+
+    if len(monitor) == 1:
+        only = monitor[0]
+        r5 = only if "5" in only["bands"] else None
+        r2 = only if "2.4" in only["bands"] else None
+        if r5 is None:
+            warnings.append(
+                f"{only['iface']} is 2.4GHz-only — 5GHz channel 149 lock "
+                "impossible; no 5GHz RID coverage"
+            )
+        if r2 is None:
+            warnings.append(
+                f"{only['iface']} is 5GHz-only — 2.4GHz hopping impossible; "
+                "no 2.4GHz RID coverage"
+            )
+        return {"role_5g": r5, "role_24g": r2, "warnings": warnings}
+
+    # ≥2 monitor-capable adapters — apply capability constraints
+    twofour_only = [a for a in twofour if a not in fiveg]
+    r5 = None
+    r2 = None
+    if fiveg and twofour_only:
+        # Forced assignment: 2.4-only can only take 2.4 role
+        r5 = fiveg[0]
+        r2 = twofour_only[0]
+    elif fiveg:
+        r5 = fiveg[0]
+        for a in monitor:
+            if a is not r5 and "2.4" in a["bands"]:
+                r2 = a
+                break
+    else:
+        warnings.append(
+            "no 5GHz-capable adapter present — 5GHz channel 149 lock "
+            "impossible; no 5GHz RID coverage"
+        )
+        r2 = twofour[0] if twofour else None
+    return {"role_5g": r5, "role_24g": r2, "warnings": warnings}
+
+
+def wclassifier_log_startup_snapshot(current_iface: str) -> None:
+    """v1.5.0 Step 1 — logging-only. Called at feeder startup to record
+    the classifier's view of the adapter landscape + its proposed role
+    assignment + a comparison against the currently-selected --iface.
+    Never modifies state. Enables safe validation on real nodes before
+    step 3 flips to MAC-based selection."""
+    try:
+        adapters = wclassifier_enumerate()
+    except Exception as e:
+        log.warning(f"[classifier v1.5.0] enumeration failed: {e}")
+        return
+    log.info(f"[classifier v1.5.0] discovered {len(adapters)} wlan interface(s):")
+    for a in adapters:
+        usb = f" usb={a['usb_vid']}:{a['usb_pid']}" if a['usb_vid'] else ""
+        bands = f"[{'+'.join(a['bands'])}]" if a['bands'] else "[?]"
+        mon = "monitor=yes" if a['supports_monitor'] else "monitor=no"
+        log.info(
+            f"[classifier v1.5.0]   {a['iface']} mac={a['mac']} "
+            f"driver={a['driver']} bus={a['bus']}{usb} bands={bands} "
+            f"{mon} → {a['classification']}"
+        )
+
+    roles = wclassifier_assign_roles(adapters)
+    r5 = roles["role_5g"]
+    r2 = roles["role_24g"]
+    r5s = f"{r5['iface']} ({r5['mac']})" if r5 else "UNASSIGNED"
+    r2s = f"{r2['iface']} ({r2['mac']})" if r2 else "UNASSIGNED"
+    log.info(f"[classifier v1.5.0] proposed roles — 5GHz={r5s} | 2.4GHz={r2s}")
+    for w in roles["warnings"]:
+        log.warning(f"[classifier v1.5.0] {w}")
+
+    # Comparison: does the currently-selected --iface show up in the
+    # classifier's assignment? If yes, we're aligned and step 3 should
+    # be safe. If no, we've found a real difference to investigate
+    # BEFORE flipping to MAC-based selection.
+    current_mac = _get_iface_mac(current_iface) if current_iface else None
+    picks = [a["mac"] for a in [r5, r2] if a]
+    if current_mac and current_mac in picks:
+        log.info(
+            f"[classifier v1.5.0] current --iface={current_iface} "
+            f"(mac={current_mac}) is in classifier assignment ✓"
+        )
+    elif current_mac:
+        log.warning(
+            f"[classifier v1.5.0] current --iface={current_iface} "
+            f"(mac={current_mac}) is NOT in classifier assignment — "
+            f"classifier picked MACs: {picks}. Investigate before step 3."
+        )
+    else:
+        log.warning(
+            f"[classifier v1.5.0] current --iface={current_iface} has no "
+            "MAC (interface may not exist)"
+        )
+
+
+def _is_onboard_iface(iface: str | None) -> bool:
+    """Return True if iface is a Pi onboard WiFi adapter (brcmfmac driver
+    OR sdio/mmc bus). Choosing an onboard adapter as the monitor is a
+    HARD no — it would put the Pi's SSH backhaul interface into monitor
+    mode and instantly break management access to the node.
+
+    Belt-and-suspenders check that complements the classifier's onboard
+    filter. Used by resolve_monitor_iface to reject any resolution path
+    (WIFI_ADAPTER_MAC, WIFI_ADAPTER, classifier pick) that would land
+    on an onboard adapter.
+    """
+    if not iface:
+        return False
+    try:
+        driver = os.path.basename(os.readlink(f"/sys/class/net/{iface}/device/driver"))
+    except OSError:
+        driver = ""
+    try:
+        bus = os.path.basename(os.readlink(f"/sys/class/net/{iface}/device/subsystem"))
+    except OSError:
+        bus = ""
+    return driver == "brcmfmac" or bus in ("sdio", "mmc")
+
+
+def resolve_monitor_iface(fallback_iface: str | None, band: str = "auto") -> str:
+    """v1.5.0 Step 3 — pick which wlanN the feeder monitors, applying the
+    new MAC-based selection with fallbacks to legacy behavior.
+
+    Resolution order (first match wins):
+      1. WIFI_ADAPTER_MAC env var (new-style config from v1.5.0 migration)
+         → scan /sys/class/net/wlan*/address for the matching interface
+      2. fallback_iface (from --iface CLI arg / WIFI_ADAPTER env var /
+         default "wlan1") → use if it currently exists in /sys/class/net
+      3. Classifier auto-pick → 2.4GHz role preferred (single-adapter
+         dwell mode covers both bands); else 5GHz role
+      4. Nothing worked → log a loud error listing operator remediation
+         options and return the fallback iface anyway (feeder enters
+         FAULT loop, surfaces the issue via wifi_ok=False heartbeats)
+
+    Logs the resolution decision loudly so operators can see which path
+    took effect (matters for triaging misconfigs after hardware changes).
+    """
+    # 1. New-style config. In dual-adapter mode (--band=2g|5g), read
+    # the band-specific MAC key first, then fall back to the shared
+    # WIFI_ADAPTER_MAC key for backward compat / single-adapter setups.
+    band_key = {"2g": "WIFI_ADAPTER_2G_MAC", "5g": "WIFI_ADAPTER_5G_MAC"}.get(band)
+    # Track whether the MAC came from a band-specific key — matters for
+    # the unplug-safety refusal at the bottom of Step 1.
+    band_specific_configured = False
+    configured_mac = ""
+    if band_key:
+        configured_mac = os.environ.get(band_key, "").strip().lower()
+        if configured_mac:
+            band_specific_configured = True
+            log.info(f"[iface v1.5.0] --band={band}: using {band_key}={configured_mac}")
+    if not configured_mac:
+        configured_mac = os.environ.get("WIFI_ADAPTER_MAC", "").strip().lower()
+    if configured_mac:
+        for path in sorted(glob.glob("/sys/class/net/wlan*")):
+            iface = os.path.basename(path)
+            try:
+                with open(f"{path}/address") as f:
+                    mac = f.read().strip().lower()
+            except OSError:
+                continue
+            if mac == configured_mac:
+                # v1.5.0 Step 5: hard-filter onboard. Even if the operator
+                # explicitly configured the Pi onboard's MAC as the monitor
+                # adapter, REFUSE — putting the SSH backhaul into monitor
+                # mode is a self-inflicted lockout of the node.
+                if _is_onboard_iface(iface):
+                    log.error(
+                        f"[iface v1.5.0] REFUSING — configured MAC {configured_mac} "
+                        f"points at Pi onboard adapter {iface} "
+                        "(brcmfmac/sdio). Choosing onboard as monitor would "
+                        "break SSH access to this node. Fix the MAC in "
+                        "/opt/droneaware/config.env."
+                    )
+                    if band_specific_configured:
+                        # Dual-adapter mode: don't fall through to classifier —
+                        # would pick peer band's adapter and cause contention.
+                        return ""
+                    break  # single-adapter mode — safe to fall through
+                log.info(
+                    f"[iface v1.5.0] resolved WIFI_ADAPTER_MAC={configured_mac} "
+                    f"→ {iface}"
+                )
+                return iface
+        else:
+            # for loop completed without `break` — meaning we scanned all
+            # wlan* and found no MAC match at all.
+            #
+            # UNPLUG-SAFETY (v1.5.0 Step 7e): in dual-adapter mode where the
+            # MAC came from a band-specific key (WIFI_ADAPTER_2G_MAC or
+            # WIFI_ADAPTER_5G_MAC), the peer band's service is running on a
+            # DIFFERENT adapter. Falling through to the classifier's auto-pick
+            # would return the peer's adapter (only remaining monitor candidate)
+            # and cause adapter contention. Refuse to fall through — return ""
+            # so the feeder enters FAULT cleanly. The peer band's service
+            # keeps running normally. Operator recovers by plugging the adapter
+            # back in, or by running `sudo droneaware refresh` to switch modes.
+            if band_specific_configured:
+                log.error(
+                    f"[iface v1.5.0] --band={band}: configured "
+                    f"{band_key}={configured_mac} not present — adapter may have "
+                    "been unplugged. Refusing to fall through to another "
+                    "adapter (would contend with the peer band's service). "
+                    "Feeder will enter FAULT. Recovery: plug the adapter back "
+                    "in, or run 'sudo droneaware refresh' to reconfigure "
+                    "for the new hardware topology."
+                )
+                return ""
+            log.warning(
+                f"[iface v1.5.0] WIFI_ADAPTER_MAC={configured_mac} does not "
+                "match any present wlan interface — adapter may have been "
+                "unplugged or MAC changed since config was written. Falling "
+                "through to legacy iface + classifier auto-pick."
+            )
+
+    # 2. Legacy config: --iface / WIFI_ADAPTER env / default wlan1
+    if fallback_iface and os.path.exists(f"/sys/class/net/{fallback_iface}"):
+        # v1.5.0 Step 5: also apply hard-filter here. Common misconfig on
+        # older nodes: WIFI_ADAPTER=wlan0 accidentally points at Pi onboard.
+        if _is_onboard_iface(fallback_iface):
+            log.error(
+                f"[iface v1.5.0] REFUSING — legacy WIFI_ADAPTER={fallback_iface} "
+                "points at Pi onboard adapter (brcmfmac/sdio). Choosing "
+                "onboard as monitor would break SSH access. Fix "
+                "WIFI_ADAPTER in /opt/droneaware/config.env. Falling "
+                "through to classifier."
+            )
+        else:
+            log.info(
+                f"[iface v1.5.0] using legacy iface {fallback_iface} "
+                "(from --iface / WIFI_ADAPTER)"
+            )
+            return fallback_iface
+
+    # 3. Classifier auto-pick — classifier already filters onboard via
+    # driver/bus, so this never returns an onboard adapter. But we keep
+    # the check here as defense-in-depth against future classifier changes.
+    try:
+        adapters = wclassifier_enumerate()
+        roles = wclassifier_assign_roles(adapters)
+        pick = roles["role_24g"] or roles["role_5g"]
+        if pick and not _is_onboard_iface(pick["iface"]):
+            log.warning(
+                f"[iface v1.5.0] no config match — auto-picked {pick['iface']} "
+                f"(mac={pick['mac']}) via classifier. Consider setting "
+                f"WIFI_ADAPTER_MAC={pick['mac']} in /opt/droneaware/config.env "
+                "to make this choice stable across reboots."
+            )
+            return pick["iface"]
+    except Exception as e:
+        log.warning(f"[iface v1.5.0] classifier auto-pick failed: {e}")
+
+    # 4. Nothing worked — return empty string so the feeder's existing
+    # FAULT path fires (see WiFiFeeder.run() — "adapter not present"
+    # check). Keeps BLE feeder running independently. This is the
+    # right outcome for BLE-only nodes: no monitor adapter is a valid
+    # hardware config, not a fatal error.
+    log.error(
+        "[iface v1.5.0] No usable WiFi monitor adapter found. Feeder will "
+        "enter FAULT loop (BLE unaffected). Remediation options:\n"
+        "  - Plug in a USB WiFi adapter that supports monitor mode\n"
+        "  - Set WIFI_ADAPTER_MAC=<mac> in /opt/droneaware/config.env "
+        "for stable identification\n"
+        "  - Or run this node as BLE-only (no action needed — WiFi feeder "
+        "just stays in FAULT and reports absent 2.4/5 GHz coverage)"
+    )
+    return ""
+
+
 def _get_backhaul_iface() -> str | None:
     """Return the interface currently carrying the default route."""
     try:
@@ -958,6 +1337,39 @@ class AdaptiveChannelHopper(threading.Thread):
 
     def stop(self):
         self._stop.set()
+
+
+class LockedChannelHopper(threading.Thread):
+    """v1.5.0 dual-adapter mode: lock the adapter to one channel
+    permanently. Used when the wifi_feeder process is spawned with
+    `--band=5g` (locks to channel 149) so that a dedicated adapter
+    stays continuously tuned to the 5 GHz RID channel — no dwelling,
+    no hopping.
+
+    Contract-compatible with the other hopper classes (start/stop,
+    current_channel, target_channels, notify_detection). notify_detection
+    is a no-op because there's nothing to switch to.
+    """
+
+    def __init__(self, iface: str, channel: int):
+        super().__init__(daemon=True)
+        self.iface           = iface
+        self.channel         = channel
+        self.current_channel = channel
+        self.target_channels = [channel]
+        self._stop           = threading.Event()
+
+    def run(self):
+        set_channel(self.iface, self.channel)
+        log.info(f"Locked channel hopper: {self.iface} → ch{self.channel} (no hop)")
+        # Set once, then block. No tuning needed for the lifetime of the process.
+        self._stop.wait()
+
+    def stop(self):
+        self._stop.set()
+
+    def notify_detection(self, ch: int):
+        pass
 
 
 class DualBandHopper(threading.Thread):
@@ -1876,48 +2288,59 @@ class WiFiFeeder:
     def __init__(self, iface: str, node_id: str, server_url: str,
                  verbose: bool = False, batch_size: int = 10,
                  flush_interval: float = 2.0, channel_dwell: float = 0.2,
-                 token: str = ""):
+                 token: str = "", band: str = "auto"):
         self.iface       = iface
         self.node_id     = node_id
         self.verbose     = verbose
         self.token       = token
+        self.band        = band  # "auto" | "2g" | "5g" — v1.5.0 dual-adapter mode
         self.start_time  = time.time()
         self.forwarder   = Forwarder(server_url, node_id, batch_size, flush_interval, token)
         self.publisher   = LocalPublisher()
-        # ADAPTIVE_DWELL=false reverts to legacy flat 1–11 hop (A/B testing)
-        adaptive_dwell = os.environ.get("ADAPTIVE_DWELL", "true").strip().lower() \
-                            in ("true", "1", "yes", "on")
-        if not adaptive_dwell:
-            log.info("Hopper mode: flat (legacy even hop across 1–11)")
-            self.hopper = ChannelHopper(iface, CHANNELS_24, channel_dwell)
-        else:
-            wifi_5g = os.environ.get("WIFI_5G_ENABLED", "auto").strip().lower()
-            if wifi_5g in ("true", "1", "yes", "on"):
-                supports_5g = _adapter_supports_5g(iface) if iface else False
-                if not supports_5g:
-                    log.warning(
-                        f"WIFI_5G_ENABLED=true but {iface or '<none>'} does not "
-                        "expose channel 149 — falling back to 2.4 GHz only"
-                    )
-                enable_5g = supports_5g
-            elif wifi_5g in ("false", "0", "no", "off"):
-                enable_5g = False
-            else:  # "auto" (default) — detect at startup
-                enable_5g = _adapter_supports_5g(iface) if iface else False
-                if iface and enable_5g:
-                    log.info(f"Dual-band adapter detected on {iface} — enabling 5 GHz scanning")
-                elif iface:
-                    log.info(f"Single-band adapter on {iface} — 2.4 GHz only")
 
-            if enable_5g:
-                # Cycle length is per-instance (dwell env vars, v1.4.6+) so
-                # DON'T hardcode it here — the DualBandHopper's own startup
-                # log reports the actual timing after __init__ parses env.
-                log.info("Hopper mode: dual-band (ch6 + ch149)")
-                self.hopper = DualBandHopper(iface)
+        # v1.5.0 dual-adapter mode overrides hopper choice explicitly.
+        # --band=2g runs a dedicated 2.4 GHz hopper (no 5 GHz work at all).
+        # --band=5g locks to channel 149 (no dwelling, no 2.4 GHz work).
+        # --band=auto keeps the single-adapter behavior (may dwell or lock).
+        if band == "2g":
+            log.info(f"Hopper mode: 2g-only dedicated (band={band}, --band=2g)")
+            self.hopper = AdaptiveChannelHopper(iface)
+        elif band == "5g":
+            log.info(f"Hopper mode: 5g locked to ch149 (band={band}, --band=5g)")
+            self.hopper = LockedChannelHopper(iface, 149)
+        else:
+            # band == "auto" — existing single-adapter logic
+            # ADAPTIVE_DWELL=false reverts to legacy flat 1–11 hop (A/B testing)
+            adaptive_dwell = os.environ.get("ADAPTIVE_DWELL", "true").strip().lower() \
+                                in ("true", "1", "yes", "on")
+            if not adaptive_dwell:
+                log.info("Hopper mode: flat (legacy even hop across 1–11)")
+                self.hopper = ChannelHopper(iface, CHANNELS_24, channel_dwell)
             else:
-                log.info("Hopper mode: adaptive (sweep + sticky, channel-6 biased)")
-                self.hopper = AdaptiveChannelHopper(iface)
+                wifi_5g = os.environ.get("WIFI_5G_ENABLED", "auto").strip().lower()
+                if wifi_5g in ("true", "1", "yes", "on"):
+                    supports_5g = _adapter_supports_5g(iface) if iface else False
+                    if not supports_5g:
+                        log.warning(
+                            f"WIFI_5G_ENABLED=true but {iface or '<none>'} does not "
+                            "expose channel 149 — falling back to 2.4 GHz only"
+                        )
+                    enable_5g = supports_5g
+                elif wifi_5g in ("false", "0", "no", "off"):
+                    enable_5g = False
+                else:  # "auto" (default) — detect at startup
+                    enable_5g = _adapter_supports_5g(iface) if iface else False
+                    if iface and enable_5g:
+                        log.info(f"Dual-band adapter detected on {iface} — enabling 5 GHz scanning")
+                    elif iface:
+                        log.info(f"Single-band adapter on {iface} — 2.4 GHz only")
+
+                if enable_5g:
+                    log.info("Hopper mode: dual-band (ch6 + ch149)")
+                    self.hopper = DualBandHopper(iface)
+                else:
+                    log.info("Hopper mode: adaptive (sweep + sticky, channel-6 biased)")
+                    self.hopper = AdaptiveChannelHopper(iface)
         self.count       = 0
         self.nan_count   = 0
         self._scanning   = False
@@ -2077,6 +2500,200 @@ class WiFiFeeder:
                 f"sent={self.forwarder.sent_total}  failed={self.forwarder.failed_total}"
             )
 
+    # ------------------------------------------------------------------
+    # v1.5.0 heartbeat schema — feeder split (wifi_2g / wifi_5g / scan_mode)
+    # ------------------------------------------------------------------
+    # Server accepts the new schema as of 2026-08-05 (see project memory
+    # `project_v1_5_0_heartbeat_schema.md` for full sign-off). Emitter
+    # gated on WIFI_HEARTBEAT_SPLIT env var — defaults to "true" for
+    # v1.5.0+; can be flipped to "false" as an emergency escape hatch
+    # if server-side gets rolled back.
+    #
+    # Behavior:
+    #   flag=true (default v1.5.0+):
+    #     Single-adapter mode: emit TWO heartbeats per cycle — one with
+    #       feeder=wifi_2g and one with feeder=wifi_5g. scan_mode is
+    #       derived from the adapter's band capability:
+    #         - dual-band card (2.4+5): both scan_mode=dwell
+    #         - 2.4-only card: 2.4=lock, 5=absent
+    #         - 5-only card:   2.4=absent, 5=lock
+    #         - no usable adapter (FAULT): both absent (still emit — server
+    #           counts absent as "present" for freshness/online detection)
+    #   flag=false: single legacy heartbeat with feeder omitted (server
+    #     infers wifi from wifi_ok/ble_ok null-ness, as pre-v1.5.0 nodes do).
+    def _emit_wifi_heartbeats(self, common_payload: dict, wifi_ok: bool,
+                              wifi_adp: str | None, wifi_fault: str | None,
+                              scanning: bool):
+        """Send heartbeats using the v1.5.0 split schema (or legacy shape
+        if the env-var escape hatch is flipped off). Called from both the
+        normal cycle and the FAULT loop."""
+        # Base payload merges the common fields with wifi-specific status.
+        # In FAULT mode wifi_fault is set; in normal mode it's None.
+        base = dict(common_payload)
+        base["wifi_ok"]      = wifi_ok
+        base["wifi_adapter"] = wifi_adp
+        base["scanning"]     = scanning
+        if wifi_fault is not None:
+            base["wifi_fault"] = wifi_fault
+
+        split_on = os.environ.get("WIFI_HEARTBEAT_SPLIT", "true").strip().lower() == "true"
+        if not split_on:
+            # Legacy pre-v1.5.0 shape: one heartbeat, no feeder discriminator.
+            self._post_heartbeat_body(base)
+            return
+
+        # v1.5.0 dual-adapter mode: when --band is explicit, this process
+        # emits ONLY its own band's heartbeat. The peer process (started
+        # from the sibling systemd unit) handles the other band. Never
+        # emit `absent` from here — that would clobber the peer's real
+        # heartbeat via server-side rollup order.
+        if self.band == "2g":
+            mac = _get_iface_mac(self.iface) if self.iface else None
+            p24 = dict(base)
+            p24["feeder"] = "wifi_2g"
+            p24["scan_mode"] = "lock"  # dedicated adapter, this band only
+            p24["wifi_adapter_mac"] = mac
+            p24["wifi_adapter_id"]  = None  # TODO: could look up via classifier
+            log.info(f"[heartbeat v1.5.0] emitting: wifi_2g(lock, iface={self.iface})")
+            self._post_heartbeat_body(p24)
+            self._write_local_wifi_state("wifi_2g", "lock", mac, None, wifi_ok, wifi_fault)
+            return
+        if self.band == "5g":
+            mac = _get_iface_mac(self.iface) if self.iface else None
+            p5 = dict(base)
+            p5["feeder"] = "wifi_5g"
+            p5["scan_mode"] = "lock"
+            p5["wifi_adapter_mac"] = mac
+            p5["wifi_adapter_id"]  = None
+            log.info(f"[heartbeat v1.5.0] emitting: wifi_5g(lock, iface={self.iface})")
+            self._post_heartbeat_body(p5)
+            self._write_local_wifi_state("wifi_5g", "lock", mac, None, wifi_ok, wifi_fault)
+            return
+
+        # v1.5.0 split — figure out this adapter's band capability, then
+        # emit one heartbeat per band. Fall back to "both absent" if we
+        # can't identify the adapter (FAULT / iface missing / classifier
+        # enumeration error).
+        adapter_mac: str | None = None
+        adapter_id:  str | None = None
+        can_24 = False
+        can_5  = False
+        try:
+            current_mac = _get_iface_mac(self.iface) if self.iface else None
+            if current_mac:
+                for a in wclassifier_enumerate():
+                    if a["mac"] == current_mac:
+                        adapter_mac = a["mac"]
+                        if a["usb_vid"] and a["usb_pid"]:
+                            adapter_id = f"{a['usb_vid']}:{a['usb_pid']}"
+                        can_24 = "2.4" in a["bands"]
+                        can_5  = "5"   in a["bands"]
+                        break
+        except Exception as e:
+            log.warning(f"[heartbeat v1.5.0] adapter capability probe failed: {e}")
+
+        # Derive scan_mode per server-claude's vocabulary:
+        #   lock  = dedicated adapter continuously on one band
+        #   dwell = shared adapter visits the band fractionally
+        #   absent = no capable adapter present
+        if can_24 and can_5:
+            mode_24, mode_5 = "dwell", "dwell"
+        elif can_24:
+            mode_24, mode_5 = "lock", "absent"
+        elif can_5:
+            mode_24, mode_5 = "absent", "lock"
+        else:
+            mode_24, mode_5 = "absent", "absent"
+
+        log.info(
+            f"[heartbeat v1.5.0] emitting split: "
+            f"wifi_2g(mode={mode_24}, mac={adapter_mac if can_24 else None}) + "
+            f"wifi_5g(mode={mode_5}, mac={adapter_mac if can_5 else None})"
+        )
+
+        # wifi_2g heartbeat. When absent (no 2.4GHz-capable adapter),
+        # null out the LEGACY wifi_adapter field too — otherwise the
+        # server dashboard renders "(wlanN)" next to an absent row,
+        # which is misleading.
+        mac_24 = adapter_mac if can_24 else None
+        id_24  = adapter_id  if can_24 else None
+        p24 = dict(base)
+        p24["feeder"] = "wifi_2g"
+        p24["scan_mode"] = mode_24
+        p24["wifi_adapter_mac"] = mac_24
+        p24["wifi_adapter_id"]  = id_24
+        if not can_24:
+            p24["wifi_adapter"] = None
+        self._post_heartbeat_body(p24)
+        self._write_local_wifi_state("wifi_2g", mode_24, mac_24, id_24, wifi_ok, wifi_fault)
+
+        # wifi_5g heartbeat — same absent-nulling
+        mac_5 = adapter_mac if can_5 else None
+        id_5  = adapter_id  if can_5 else None
+        p5 = dict(base)
+        p5["feeder"] = "wifi_5g"
+        p5["scan_mode"] = mode_5
+        p5["wifi_adapter_mac"] = mac_5
+        p5["wifi_adapter_id"]  = id_5
+        if not can_5:
+            p5["wifi_adapter"] = None
+        self._post_heartbeat_body(p5)
+        self._write_local_wifi_state("wifi_5g", mode_5, mac_5, id_5, wifi_ok, wifi_fault)
+
+    def _write_local_wifi_state(self, feeder: str, scan_mode: str,
+                                adapter_mac: str | None, adapter_id: str | None,
+                                wifi_ok: bool, wifi_fault: str | None):
+        """v1.5.0 Gap 3: mirror the heartbeat's per-band status to a tmpfs
+        file so the offline Web UI can render feeder status (three-row
+        BLE/2.4/5 layout matching My Nodes) without a server round-trip.
+
+        One file per feeder (per band). Called from _emit_wifi_heartbeats
+        immediately after each per-band POST. Atomic write via tmpfile
+        + rename, same pattern as _write_gps_state — soft-fails silently
+        if the tmpfs isn't writable (dashboard just misses this refresh).
+        """
+        # File naming — matches the feeder identifier for clean lookup
+        # by the Web UI (wifi_state_2g.json, wifi_state_5g.json).
+        band_suffix = feeder.replace("wifi_", "")  # "2g" or "5g"
+        path = f"/run/droneaware/wifi_state_{band_suffix}.json"
+        try:
+            os.makedirs("/run/droneaware", exist_ok=True)
+            state = {
+                "feeder":       feeder,
+                "band":         band_suffix,
+                "iface":        self.iface or None,
+                "adapter_mac":  adapter_mac,
+                "adapter_id":   adapter_id,
+                "scan_mode":    scan_mode,
+                "current_channel": getattr(self.hopper, "current_channel", None)
+                                    if hasattr(self, "hopper") else None,
+                "wifi_ok":      wifi_ok,
+                "wifi_fault":   wifi_fault,
+                "sent_total":   self.forwarder.sent_total if hasattr(self, "forwarder") else 0,
+                "updated_at":   time.time(),
+            }
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, path)
+        except Exception:
+            # Non-fatal — the offline dashboard just misses this refresh
+            pass
+
+    def _post_heartbeat_body(self, payload: dict):
+        """POST a fully-assembled heartbeat body. Isolates the network
+        call so retry / logging changes only touch one place."""
+        try:
+            requests.post(
+                "https://api.droneaware.io/api/node/heartbeat",
+                json=payload,
+                headers={"X-Node-Token": self.token},
+                timeout=5,
+            )
+            log.debug(f"Heartbeat sent (feeder={payload.get('feeder', 'wifi[legacy]')})")
+        except requests.RequestException as e:
+            log.warning(f"Heartbeat failed (feeder={payload.get('feeder', 'wifi[legacy]')}): {e}")
+
     def _fault_loop(self, reason: str):
         """
         Degraded loop entered when no usable WiFi adapter is present.
@@ -2100,38 +2717,35 @@ class WiFiFeeder:
                 load_1m, load_5m, load_15m = get_cpu_load()
                 has_gps  = os.path.exists(os.environ.get("GPS_DEVICE", "/dev/ttyUSB0"))
                 mobile   = os.environ.get("NODE_MOBILE", "false").lower() == "true"
-                requests.post(
-                    "https://api.droneaware.io/api/node/heartbeat",
-                    json={
-                        # Per-feeder heartbeat: wifi_* fields only (see note above)
-                        "node_id":      self.node_id,
-                        "uptime_s":     int(time.time() - self.start_time),
-                        "fw_version":   FW_VERSION,
-                        "cpu_count":    os.cpu_count(),
-                        "cpu_temp_c":   cpu_temp,
-                        "cpu_percent":  cpu_pct,
-                        "load_1m":      load_1m,
-                        "load_5m":      load_5m,
-                        "load_15m":     load_15m,
-                        "wifi_ok":      False,
-                        "wifi_adapter": self.iface or None,
-                        "wifi_fault":   reason,
-                        "scanning":     False,
-                        "mobile":       mobile,
-                        "has_gps":      has_gps,
-                        "lat":          lat,
-                        "lon":          lon,
-                        # v1.4.8 telemetry — restart count is meaningful
-                        # even in FAULT loop (a crash-looping FAULT feeder
-                        # is worth surfacing). No forwarder in FAULT mode,
-                        # so no buffered/dropped fields.
-                        "restarts_since_boot": self.restart_count,
-                    },
-                    headers={"X-Node-Token": self.token},
-                    timeout=5,
+                common = {
+                    "node_id":      self.node_id,
+                    "uptime_s":     int(time.time() - self.start_time),
+                    "fw_version":   FW_VERSION,
+                    "cpu_count":    os.cpu_count(),
+                    "cpu_temp_c":   cpu_temp,
+                    "cpu_percent":  cpu_pct,
+                    "load_1m":      load_1m,
+                    "load_5m":      load_5m,
+                    "load_15m":     load_15m,
+                    "mobile":       mobile,
+                    "has_gps":      has_gps,
+                    "lat":          lat,
+                    "lon":          lon,
+                    # v1.4.8 telemetry — restart count is meaningful even
+                    # in FAULT loop. No forwarder in FAULT mode → no
+                    # buffered/dropped fields.
+                    "restarts_since_boot": self.restart_count,
+                }
+                # v1.5.0 split (or legacy single heartbeat if flag off).
+                # wifi_adapter carries the iface string for legacy compat;
+                # v1.5.0 also emits wifi_adapter_mac/id under split schema.
+                self._emit_wifi_heartbeats(
+                    common,
+                    wifi_ok=False,
+                    wifi_adp=self.iface or None,
+                    wifi_fault=reason,
+                    scanning=False,
                 )
-            except requests.RequestException as e:
-                log.warning(f"FAULT heartbeat failed: {e}")
             except Exception as e:
                 log.warning(f"FAULT loop error: {e}")
 
@@ -2163,43 +2777,45 @@ class WiFiFeeder:
                         cpu_temp          = get_cpu_temp()
                         has_gps           = os.path.exists(os.environ.get("GPS_DEVICE", "/dev/ttyUSB0"))
                         mobile            = os.environ.get("NODE_MOBILE", "false").lower() == "true"
-                        requests.post(
-                            "https://api.droneaware.io/api/node/heartbeat",
-                            json={
-                                # Per-feeder heartbeat: wifi_* fields only.
-                                # Do NOT include ble_ok or ble_fault — the server
-                                # uses presence of an ok-field to route the
-                                # heartbeat to that feeder's status row.
-                                "node_id":      self.node_id,
-                                "uptime_s":     int(time.time() - self.start_time),
-                                "fw_version":   FW_VERSION,
-                                "cpu_count":    os.cpu_count(),
-                                "cpu_temp_c":   cpu_temp,
-                                "cpu_percent":  cpu_pct,
-                                "load_1m":      load_1m,
-                                "load_5m":      load_5m,
-                                "load_15m":     load_15m,
-                                "wifi_ok":      wifi_ok,
-                                "wifi_adapter": wifi_adp,
-                                "scanning":     self._scanning,
-                                "mobile":       mobile,
-                                "has_gps":      has_gps,
-                                "lat":          lat,
-                                "lon":          lon,
-                                # v1.4.8 telemetry additions — mirror BLE.
-                                "buffered":            len(self.forwarder.buffer),
-                                "buffered_bytes":      self.forwarder.buffer_bytes,
-                                "dropped_total":       self.forwarder.dropped_total,
-                                "sent_total":          self.forwarder.sent_total,
-                                "restarts_since_boot": self.restart_count,
-                                # WiFi feeder is threading-based — no
-                                # equivalent event_loop_max_lag_ms metric.
-                            },
-                            headers={"X-Node-Token": self.token},
-                            timeout=5,
+                        common = {
+                            # Per-feeder heartbeat: wifi_* fields only.
+                            # Do NOT include ble_ok or ble_fault — the server
+                            # uses presence of an ok-field to route the
+                            # heartbeat to that feeder's status row.
+                            "node_id":      self.node_id,
+                            "uptime_s":     int(time.time() - self.start_time),
+                            "fw_version":   FW_VERSION,
+                            "cpu_count":    os.cpu_count(),
+                            "cpu_temp_c":   cpu_temp,
+                            "cpu_percent":  cpu_pct,
+                            "load_1m":      load_1m,
+                            "load_5m":      load_5m,
+                            "load_15m":     load_15m,
+                            "mobile":       mobile,
+                            "has_gps":      has_gps,
+                            "lat":          lat,
+                            "lon":          lon,
+                            # v1.4.8 telemetry additions — mirror BLE.
+                            "buffered":            len(self.forwarder.buffer),
+                            "buffered_bytes":      self.forwarder.buffer_bytes,
+                            "dropped_total":       self.forwarder.dropped_total,
+                            "sent_total":          self.forwarder.sent_total,
+                            "restarts_since_boot": self.restart_count,
+                            # WiFi feeder is threading-based — no
+                            # equivalent event_loop_max_lag_ms metric.
+                        }
+                        # v1.5.0 split — emits TWO heartbeats per cycle
+                        # (wifi_2g + wifi_5g with scan_mode) when the
+                        # WIFI_HEARTBEAT_SPLIT env var is on (default true).
+                        # Falls back to legacy single heartbeat when off.
+                        self._emit_wifi_heartbeats(
+                            common,
+                            wifi_ok=wifi_ok,
+                            wifi_adp=wifi_adp,
+                            wifi_fault=None,
+                            scanning=self._scanning,
                         )
-                        log.debug("Heartbeat sent to droneaware.io")
-                    except requests.RequestException as e:
+                    except Exception as e:
                         log.warning(f"Heartbeat failed: {e}")
 
 
@@ -2260,21 +2876,51 @@ def main():
         "--verbose", "-v", action="store_true",
         help="Log every decoded packet"
     )
+    parser.add_argument(
+        "--band", choices=["auto", "2g", "5g"], default="auto",
+        help="v1.5.0 dual-adapter mode. 'auto' (default) = single-adapter "
+             "behavior (may dwell dual-band or hop 2.4 only). '2g' = "
+             "dedicated 2.4 GHz feeder (uses WIFI_ADAPTER_2G_MAC). '5g' = "
+             "dedicated 5 GHz-149 lock (uses WIFI_ADAPTER_5G_MAC). "
+             "Split-band services set this explicitly."
+    )
     args = parser.parse_args()
+
+    # v1.5.0 Step 3 — MAC-based iface resolution (--band-aware for the
+    # dual-adapter split units). WIFI_ADAPTER_2G_MAC / WIFI_ADAPTER_5G_MAC
+    # win when --band is set explicitly; single-adapter WIFI_ADAPTER_MAC
+    # is the fallback.
+    args.iface = resolve_monitor_iface(args.iface, band=args.band)
+
+    # v1.5.0 Step 1 (logging-only): snapshot the classifier's view of
+    # adapters + proposed role assignment. Compares against --iface but
+    # does NOT change behavior. Enables validation on real nodes.
+    wclassifier_log_startup_snapshot(args.iface)
 
     token = resolve_token()
 
-    gps_device = find_gps_device()
-    if gps_device:
-        log.info(f"[GPS] Dongle detected at {gps_device}")
-        # Seed initial state so `droneaware status` has something to show
-        # before the reader thread has a chance to update it.
-        _write_gps_state(device=gps_device, status="detecting_baud")
-        t = threading.Thread(target=gps_reader_thread, args=(gps_device,), daemon=True)
-        t.start()
+    # v1.5.0 Gap 1 fix: in dual-adapter mode, only ONE process owns the
+    # GPS serial port. Two processes opening the same /dev/ttyUSB0
+    # corrupt the NMEA stream for both (Linux tty devices don't do
+    # exclusive locking by default). Convention: --band=2g owns GPS
+    # (arbitrary but deterministic); --band=5g skips the reader entirely
+    # and relies on the peer to update the shared /run/droneaware/gps_state.json.
+    # --band=auto (single-adapter mode) owns GPS as always.
+    if args.band == "5g":
+        log.info("[GPS] --band=5g: skipping GPS reader (peer 2g feeder owns "
+                 "the serial port; state file is shared)")
     else:
-        log.info("[GPS] No GPS dongle detected — position will not be reported")
-        _write_gps_state(status="not_configured")
+        gps_device = find_gps_device()
+        if gps_device:
+            log.info(f"[GPS] Dongle detected at {gps_device}")
+            # Seed initial state so `droneaware status` has something to show
+            # before the reader thread has a chance to update it.
+            _write_gps_state(device=gps_device, status="detecting_baud")
+            t = threading.Thread(target=gps_reader_thread, args=(gps_device,), daemon=True)
+            t.start()
+        else:
+            log.info("[GPS] No GPS dongle detected — position will not be reported")
+            _write_gps_state(status="not_configured")
 
     feeder = WiFiFeeder(
         iface=args.iface,
@@ -2285,6 +2931,7 @@ def main():
         flush_interval=args.flush_interval,
         channel_dwell=args.channel_dwell,
         token=token,
+        band=args.band,
     )
     feeder.run()
 

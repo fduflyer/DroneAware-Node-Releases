@@ -176,6 +176,31 @@
       flex-wrap: wrap;
       gap: 6px;
     }
+    /* v1.5.0 Gap 3 — feeder-status panel (BLE + 2.4 + 5 rows, matching
+       My Nodes layout). Populated from /api/status.feeders on each poll. */
+    .feeders-panel {
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 12px;
+    }
+    .feeder-row {
+      display: grid;
+      grid-template-columns: 20px 60px 1fr;
+      gap: 8px;
+      align-items: center;
+      color: var(--text-dim);
+    }
+    .feeder-icon { text-align: center; opacity: 0.7; }
+    .feeder-label { font-weight: 600; color: var(--text-primary); }
+    .feeder-status { font-family: var(--font-mono, monospace); font-size: 11px; }
+    .feeder-status.ok      { color: var(--fresh-live); }
+    .feeder-status.warn    { color: var(--fresh-recent); }
+    .feeder-status.fault   { color: var(--fresh-older); }
+    .feeder-status.absent  { color: var(--text-muted); font-style: italic; }
+    .feeder-status.stale   { color: var(--text-muted); }
     .chip {
       display: inline-flex;
       align-items: center;
@@ -701,6 +726,27 @@
   <!-- Main: sidebar + map -->
   <div class="main">
     <div class="sidebar" id="sidebar">
+      <!-- v1.5.0 Gap 3: three-row feeder status matching My Nodes.
+           Populated from /api/status's `feeders` object (data comes
+           from /run/droneaware/wifi_state_{2g,5g}.json + a systemd
+           check for BLE). -->
+      <div class="feeders-panel" id="feeders-panel">
+        <div class="feeder-row" data-feeder="ble">
+          <span class="feeder-icon">📶</span>
+          <span class="feeder-label">BLE</span>
+          <span class="feeder-status" data-role="ble-status">—</span>
+        </div>
+        <div class="feeder-row" data-feeder="wifi_2g">
+          <span class="feeder-icon">📡</span>
+          <span class="feeder-label">2.4 GHz</span>
+          <span class="feeder-status" data-role="wifi_2g-status">—</span>
+        </div>
+        <div class="feeder-row" data-feeder="wifi_5g">
+          <span class="feeder-icon">📡</span>
+          <span class="feeder-label">5 GHz</span>
+          <span class="feeder-status" data-role="wifi_5g-status">—</span>
+        </div>
+      </div>
       <div class="sidebar-filters">
         <span class="chip on" data-filter="freshness" data-value="live">
           <span class="chip-dot" style="color: var(--fresh-live);"></span>&lt; 2 min
@@ -1405,11 +1451,51 @@
     }
 
     /* ----- Status bar ----- */
+    /* v1.5.0 Gap 3 — render the three-row feeder panel (BLE / 2.4 / 5)
+       from /api/status.feeders. Mirrors My Nodes' visual layout so the
+       operator sees consistent status whether they're on the online
+       dashboard or the offline node UI. */
+    function renderFeeders(feeders) {
+      if (!feeders) return;
+      const bands = [
+        { key: "ble",     label: "BLE" },
+        { key: "wifi_2g", label: "2.4 GHz" },
+        { key: "wifi_5g", label: "5 GHz" },
+      ];
+      for (const {key} of bands) {
+        const el = document.querySelector(`[data-role="${key}-status"]`);
+        if (!el) continue;
+        const f = feeders[key];
+        if (!f) { el.textContent = "unknown"; el.className = "feeder-status stale"; continue; }
+        if (f.stale) {
+          el.textContent = `stale (${f.age_sec}s)`;
+          el.className = "feeder-status stale";
+          continue;
+        }
+        const mode = f.scan_mode || "?";
+        const iface = f.iface ? ` (${f.iface})` : "";
+        if (mode === "absent") {
+          el.textContent = `Absent — no capable adapter`;
+          el.className = "feeder-status absent";
+        } else if (f.wifi_fault) {
+          el.textContent = `Fault: ${f.wifi_fault}${iface}`;
+          el.className = "feeder-status fault";
+        } else if (f.wifi_ok === false) {
+          el.textContent = `not scanning${iface}`;
+          el.className = "feeder-status warn";
+        } else {
+          el.textContent = `OK · ${mode}${iface}`;
+          el.className = "feeder-status ok";
+        }
+      }
+    }
+
     async function refreshStatus() {
       try {
         const r = await fetch("/api/status");
         if (!r.ok) return;
         const s = await r.json();
+        renderFeeders(s.feeders);
         document.getElementById("stat-buffer").textContent =
           `${s.buffer_pct}% (${(s.buffer_bytes / 1e6).toFixed(1)} MB)`;
         document.getElementById("stat-cpu").textContent =
