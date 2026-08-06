@@ -10,6 +10,60 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.5.0.2] — Unreleased
+
+Post-update self-heal: `cmd_update` now re-execs the newly-installed
+CLI's `refresh` at the end of every update. Closes the "one-release-
+lag" class of bug where a fix ships in release N but doesn't take
+effect until release N+1 (because cmd_update runs from the pre-
+upgrade script's open file descriptor).
+
+### The gap this closes
+
+Bash scripts stay executing from the file descriptor they were
+launched with. When `sudo droneaware update` runs from v1.5.0 →
+v1.5.0.1, the bash interpreter reads cmd_update from v1.5.0's file —
+even after the v1.5.0.1 CLI is installed to disk mid-update. Any
+fix to cmd_update lands to disk but doesn't fire until the NEXT
+update after installation.
+
+v1.5.0 → v1.5.0.1 hit exactly this. v1.5.0.1's fix (start correct
+wifi service based on config) was correct, but v1.5.0's cmd_update
+was the one actually executing during the transition — so it
+hardcoded-started the wrong service. Operators had to manually run
+`sudo droneaware refresh` afterward.
+
+### The fix
+
+`cmd_update` now ends with `/usr/local/bin/droneaware refresh` — a
+subprocess call that re-execs the newly-installed CLI. Whatever
+self-heal logic the new CLI ships with (mode-switch orchestration,
+config migration, NM regen, GPS check, future features) runs
+automatically at the end of every update.
+
+Same architectural pattern as v1.3.0's `__migrate` re-exec, which
+solved the same problem for config migrations.
+
+### Effects on the upgrade path
+
+- **v1.5.0.1 → v1.5.0.2**: clean transition. v1.5.0.1's cmd_update
+  already starts correct services; v1.5.0.2's refresh call at the
+  end is a no-op (idempotent).
+- **v1.5.0.2 → v1.5.0.3+ and beyond**: every update self-heals. Any
+  future orchestration change lands cleanly without operators
+  needing to run `refresh` manually.
+- **v1.4.x / v1.5.0 → v1.5.0.2 direct upgrades**: pre-v1.5.0.2
+  cmd_update still runs during the transition (one-release-lag
+  applies). Operators with 2+ USB WiFi adapters should run
+  `sudo droneaware refresh` once after upgrading.
+
+### Files changed
+
+- `droneaware` (CLI) — cmd_update ends with a re-exec of
+  `/usr/local/bin/droneaware refresh`.
+
+---
+
 ## [1.5.0.1] — Unreleased
 
 Hotfix for two mode-switching bugs surfaced during v1.5.0's binary

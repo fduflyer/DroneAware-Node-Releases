@@ -1001,6 +1001,23 @@ cmd_update() {
     fi
     info "Services restarted."
     echo ""
+
+    # v1.5.0.2: re-exec the newly-installed CLI's `refresh` at the end
+    # of every update. This closes the "one-release-lag" gap where
+    # cmd_update runs from the pre-upgrade script (open FD) and can
+    # only ship service-start logic that pre-dates newer orchestration.
+    # By re-execing the NEW CLI's refresh, v1.5.0.2+'s self-heal fires
+    # immediately during the update that installs it, catching any
+    # mode-switch mismatches (e.g., wrong wifi service active).
+    #
+    # Idempotent: refresh is a no-op when the actual state already
+    # matches config. Also gives every future update a clean way to
+    # apply orchestration changes without needing another release
+    # to unstick prior nodes.
+    if [[ -x /usr/local/bin/droneaware ]]; then
+        /usr/local/bin/droneaware refresh
+    fi
+
     info "Update complete — now running ${LATEST}."
     echo ""
 }
