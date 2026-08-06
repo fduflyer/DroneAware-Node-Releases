@@ -10,6 +10,130 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.5.0.6] — Unreleased
+
+Installation and adapter-mode correctness. Five defects found in a code
+audit of the v1.5.0.x line following operator reports of failed installs
+and nodes that stopped scanning.
+
+### Nodes could end an update with no WiFi feeder running
+
+`_switch_to_single_adapter_mode` wrote `WIFI_ADAPTER_MAC` but never
+cleared `WIFI_ADAPTER_2G_MAC` / `WIFI_ADAPTER_5G_MAC`. Those two keys
+are how every other code path decides whether the node is in dual mode,
+so a node that had once had two adapters and later resolved to one kept
+being treated as dual. The result was a loop:
+
+1. `_orchestrate_wifi_mode` correctly selects single mode, disables the
+   split units and starts `droneaware-wifi`
+2. `_start_wifi_services_for_current_mode`, at the end of `cmd_update`,
+   re-reads the stale band keys, takes the dual branch, stops
+   `droneaware-wifi` and starts the split units — which were just
+   disabled, and on pre-v1.5.0.4 nodes were not installed at all
+3. the update finishes with no WiFi feeder running, and every later
+   `refresh` or `update` repeats the same sequence
+
+`cmd_status` read the same stale keys, so affected nodes also displayed
+two split-unit rows when they should have shown one.
+
+Fixes:
+- `_switch_to_single_adapter_mode` clears both band keys, so `config.env`
+  is an honest record of the mode. Only writes when a stale value is
+  actually present — a no-op on nodes that have only ever had one adapter.
+- `_start_wifi_services_for_current_mode` no longer takes the dual branch
+  when the split unit files are absent from `/etc/systemd/system/`. It
+  logs the mismatch and starts the single-adapter feeder instead, so a
+  configuration/filesystem disagreement can never leave the node dark.
+
+### The installer could fail silently
+
+`install_packages` sent both `apt-get` calls to `/dev/null 2>&1`. With
+`set -e` active, a non-zero exit aborted the script immediately; when the
+failure occurred before NetworkManager had been touched, the `ERR` trap
+printed nothing either. The installer simply stopped after the
+"Installing System Packages" heading with no message.
+
+The common trigger is an interrupted `dpkg` transaction, which makes apt
+refuse every subsequent operation until `dpkg --configure -a` is run —
+so the install then failed identically on every retry with no diagnostic.
+
+Fixes:
+- apt stderr is no longer discarded; stdout stays quiet.
+- Both apt calls have an explicit failure handler naming the likely
+  causes and the exact remediation command for each.
+- The handler performs the NetworkManager rollback explicitly, because
+  `fatal` exits directly and does not fire the `ERR` trap.
+- `systemctl enable/start bluetooth` are now non-fatal warnings. A node
+  with no Bluetooth hardware can still run the WiFi feeder; previously a
+  masked or absent unit aborted the entire install.
+
+### Fresh installs started feeders before enrollment
+
+`migrate_config` runs `__migrate`, which reaches `_orchestrate_wifi_mode`
+and started the WiFi unit(s) immediately. `enroll_node` — which writes
+`/etc/droneaware/token` — does not run until the following step, so every
+fresh install briefly ran a feeder with no credentials, crash-looping
+under `Restart=always` until the operator rebooted. This also contradicted
+install.sh's own design, in which units are enabled at install time and
+started by the reboot the summary asks for.
+
+Fix: install.sh sets `DRONEAWARE_NO_SERVICE_START=1` for its single
+`__migrate` call. Orchestration still writes config keys and sets
+enable/disable state; it just does not start anything. `refresh` and
+`update` leave the flag unset and start units as before.
+
+### Binaries could be overwritten while in use
+
+Both `install.sh` and `cmd_update` stopped only `droneaware-ble` and
+`droneaware-wifi` before replacing `/opt/droneaware/wifi_feeder`. On a
+dual-adapter node the two split feeders were still running, holding that
+inode as their text image — giving `ETXTBSY` or a truncated binary. In
+install.sh this additionally tripped the `ERR` trap and rolled back
+NetworkManager mid-install.
+
+Fix: both stop lists include `droneaware-wifi-2g` and
+`droneaware-wifi-5g`.
+
+### install-webui dropped dual-adapter nodes to one band
+
+`cmd_install_webui` ended with a hardcoded `systemctl restart
+droneaware-wifi`. On a dual-adapter node that trips the split units'
+`Conflicts=droneaware-wifi.service` clause and stops them, leaving the
+node scanning one band. Same defect class v1.5.0.1 fixed in `cmd_update`;
+this path was missed.
+
+Fix: the restart is mode-aware, routed through
+`_start_wifi_services_for_current_mode`.
+
+### Added: under-voltage pre-flight
+
+`install.sh` now reads `vcgencmd get_throttled` before running apt. A Pi
+on a marginal supply browns out under load, and apt — sustained SD writes
+plus CPU — is a frequent victim; the kernel kills it mid-transaction and
+`dpkg` is left interrupted, which is what makes the failure above recur
+on every retry.
+
+Only the under-voltage bits (`0x1`, `0x10000`) gate the install, since
+throttling alone may be thermal. On a non-zero reading the operator sees
+the decoded state, the recommended remedies, and an explicit
+continue/cancel prompt. Silent on `0x0`, and skipped entirely where
+`vcgencmd` is unavailable.
+
+### Files changed
+
+- `droneaware` (CLI) — band-key clearing in `_switch_to_single_adapter_mode`;
+  unit-file presence guard and start-suppression in
+  `_start_wifi_services_for_current_mode`; new `_service_start_suppressed`
+  helper guarding every start/restart in both mode-switch functions;
+  split units added to the `cmd_update` stop list; mode-aware feeder
+  restart in `cmd_install_webui`.
+- `install.sh` — apt failure handling with explicit rollback; non-fatal
+  bluetooth setup; split units added to the `download_binaries` stop list;
+  `DRONEAWARE_NO_SERVICE_START=1` on the `__migrate` call; new
+  `_check_undervoltage` pre-flight.
+
+---
+
 ## [1.5.0.5] — Unreleased
 
 Release-workflow fix: `.github/workflows/build.yaml` now uploads the

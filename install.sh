@@ -525,9 +525,113 @@ EOF
 # ---------------------------------------------------------------------------
 # 6. System packages
 # ---------------------------------------------------------------------------
+# v1.5.0.6 — under-voltage pre-flight.
+#
+# A Pi running on a marginal PSU or a thin USB cable browns out under
+# load. apt is one of the heaviest things the installer does (sustained
+# SD writes plus CPU), so it is a common victim: the kernel kills it
+# mid-transaction and dpkg is left in an interrupted state. Every
+# subsequent apt call then fails until `dpkg --configure -a` is run, so
+# the install fails identically on every retry.
+#
+# `vcgencmd get_throttled` reports the PMIC's latched flags:
+#   0x1     under-voltage right now
+#   0x4     currently throttled
+#   0x10000 under-voltage has occurred since boot
+#   0x40000 throttling has occurred since boot
+# Throttling alone can be thermal, so only the under-voltage bits gate
+# the install; anything else is reported for information.
+#
+# Flags are latched since boot, so a freshly booted Pi that has not yet
+# drawn much current can still read 0x0 with an inadequate supply. This
+# catches the already-degraded case, which is the one that wedges dpkg.
+_check_undervoltage() {
+    command -v vcgencmd > /dev/null 2>&1 || return 0   # not a Pi, or vcgencmd absent
+
+    local raw bits
+    raw=$(vcgencmd get_throttled 2>/dev/null) || return 0
+    bits="${raw#throttled=}"
+    [[ "$bits" =~ ^0x[0-9a-fA-F]+$ ]] || return 0      # unexpected format — don't block
+    (( bits == 0 )) && return 0
+
+    if (( (bits & 0x1) == 0 && (bits & 0x10000) == 0 )); then
+        # Throttling without under-voltage — most likely thermal. Note it
+        # and continue; it does not put the package manager at risk.
+        warn "Pi reports throttling (${bits}) with no under-voltage — likely thermal. Continuing."
+        return 0
+    fi
+
+    echo ""
+    warn "POWER WARNING — this Pi has recorded under-voltage (${bits})."
+    echo ""
+    if (( (bits & 0x1) != 0 )); then
+        echo "    The supply is BELOW the safe threshold right now."
+    else
+        echo "    The supply dropped below the safe threshold earlier this boot."
+    fi
+    echo ""
+    echo "  Installing packages on an under-volted Pi can get apt killed"
+    echo "  mid-transaction, which leaves dpkg broken and makes every later"
+    echo "  install attempt fail. It can also drop USB WiFi adapters and"
+    echo "  your SSH session."
+    echo ""
+    echo "  Recommended before continuing:"
+    echo "    • Use the official Raspberry Pi PSU (15W USB-C / 12.5W micro-USB)"
+    echo "    • Use a short, thick power cable — thin cables lose voltage"
+    echo "    • Put external USB WiFi adapters on a POWERED USB hub"
+    echo ""
+    read -rp "  Continue anyway? [y/N]: " PWR_ACK </dev/tty
+    if [[ ! "${PWR_ACK,,}" =~ ^y(es)?$ ]]; then
+        fatal "Installation cancelled. Re-run once the power supply is sorted."
+    fi
+    warn "Continuing on an under-volted Pi at operator request."
+}
+
 install_packages() {
     heading "Installing System Packages"
-    apt-get update -qq
+
+    # v1.5.0.6: check power before apt — see _check_undervoltage above.
+    _check_undervoltage
+
+    # v1.5.0.6: apt failures used to be invisible. Both apt calls sent
+    # stderr to /dev/null, and with `set -e` active (line 9) a non-zero
+    # exit aborted the script instantly. When the failure happened before
+    # pin_wifi_unmanaged ran, NM_TOUCHED was still 0, so the ERR trap
+    # printed nothing either — the installer simply stopped after the
+    # "Installing System Packages" heading with no message at all.
+    #
+    # The common real-world trigger is an interrupted dpkg transaction
+    # (power loss, SIGKILL, Ctrl-C during an earlier apt run). apt then
+    # refuses every subsequent operation until `dpkg --configure -a` is
+    # run, so the installer fails identically on every retry and the
+    # operator has nothing to go on.
+    #
+    # Keep stdout quiet (progress bars are noise) but let stderr through,
+    # and handle failure explicitly with the remedy named.
+    _apt_failed() {
+        echo ""
+        warn "System package installation failed (see the apt error above)."
+        echo ""
+        echo "  Most common causes:"
+        echo "    • Interrupted dpkg transaction — fix with:"
+        echo "        sudo dpkg --configure -a"
+        echo "    • Another process holds the apt lock (unattended-upgrades"
+        echo "      runs automatically for a few minutes after first boot) —"
+        echo "      wait 5 minutes and re-run the installer"
+        echo "    • No internet route — check: ping -c3 deb.debian.org"
+        echo "    • Under-voltage killing apt mid-transaction — check:"
+        echo "        vcgencmd get_throttled     (0x0 is healthy)"
+        echo ""
+        # `fatal` exits directly, which does NOT fire the ERR trap, so the
+        # NetworkManager rollback the trap normally performs would be
+        # skipped. install_packages runs after pin_wifi_unmanaged, so
+        # NM_TOUCHED is already 1 by this point — roll back explicitly to
+        # preserve the pre-v1.5.0.6 failure behaviour.
+        _rollback_nm
+        fatal "Re-run this installer once the above is resolved."
+    }
+
+    apt-get update -qq || _apt_failed
     # gpsd-clients gives us `gpsctl` for the GPS protocol auto-fix
     # (SiRF/UBX → NMEA). --no-install-recommends is important: without it
     # apt pulls gpsd itself, which would seize the GPS port and prevent
@@ -535,9 +639,14 @@ install_packages() {
     # `gpsctl -f -n /dev/xxx` direct-to-device mode we use.
     apt-get install -y --no-install-recommends \
         bluez bluetooth iw rfkill curl gpsd-clients \
-        > /dev/null 2>&1
-    systemctl enable bluetooth > /dev/null 2>&1
-    systemctl start bluetooth  > /dev/null 2>&1
+        > /dev/null || _apt_failed
+    # Non-fatal: a node with no Bluetooth hardware can still run the WiFi
+    # feeder. Pre-v1.5.0.6 these were bare commands under `set -e`, so a
+    # masked or absent bluetooth unit aborted the whole install silently.
+    systemctl enable bluetooth > /dev/null 2>&1 \
+        || warn "Could not enable bluetooth.service — BLE feeder may not start."
+    systemctl start bluetooth  > /dev/null 2>&1 \
+        || warn "Could not start bluetooth.service — BLE feeder may not start."
 
     # Disable boot-delay services — reduces boot-to-SSH from ~15s to <5s
     systemctl disable cloud-init cloud-init-local cloud-init-main cloud-init-network > /dev/null 2>&1 || true
@@ -714,8 +823,15 @@ gps_sanity_check() {
 # ---------------------------------------------------------------------------
 download_binaries() {
     heading "Downloading DroneAware Binaries ($BINARY_VERSION)"
-    # Stop any running feeders so binaries aren't locked during download
-    systemctl stop droneaware-ble droneaware-wifi 2>/dev/null || true
+    # Stop any running feeders so binaries aren't locked during download.
+    # v1.5.0.6: include the dual-adapter split units. Re-running the
+    # installer on a node already in dual mode left droneaware-wifi-2g /
+    # -5g holding ${INSTALL_DIR}/wifi_feeder open, so the curl -o below
+    # failed with ETXTBSY. Because `set -e` is active and an ERR trap is
+    # installed, that aborted the install and rolled back NetworkManager
+    # mid-run.
+    systemctl stop droneaware-ble droneaware-wifi \
+        droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
     mkdir -p "$INSTALL_DIR" "$CLI_DIR"
 
     if [[ "$LOCAL_INSTALL" == "1" ]]; then
@@ -881,9 +997,24 @@ EOF
 # migrate is canonical; write_config only needs the minimum bootstrap.
 # Failure here is non-fatal — every release key has a code-side default.
 # ---------------------------------------------------------------------------
+#
+# v1.5.0.6: DRONEAWARE_NO_SERVICE_START=1 is set for this one call.
+# migrate_config_env runs _orchestrate_wifi_mode, which enables the
+# correct WiFi unit(s) for the detected adapter count AND — pre-v1.5.0.6
+# — started them immediately. That start happened here, at install.sh
+# line ~1222, while enroll_node (which writes /etc/droneaware/token) does
+# not run until the following step. So every fresh install briefly ran a
+# feeder with no credentials, crash-looping on Restart=always until the
+# operator rebooted.
+#
+# It also contradicted install.sh's own design: services are enabled at
+# install time and started by the reboot the summary asks for. The flag
+# restores that contract — orchestration still writes config keys and
+# sets enable/disable state, it just doesn't start anything. `refresh`
+# and `update` leave the flag unset and start units as before.
 migrate_config() {
     if [[ -x /usr/local/bin/droneaware ]]; then
-        if ! /usr/local/bin/droneaware __migrate; then
+        if ! DRONEAWARE_NO_SERVICE_START=1 /usr/local/bin/droneaware __migrate; then
             warn "Release config migration encountered issues — install continues. Run 'sudo droneaware __migrate' to retry."
         fi
     else

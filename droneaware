@@ -667,6 +667,23 @@ _set_cfg_key() {
     fi
 }
 
+# v1.5.0.6 — install-time service-start suppression.
+#
+# install.sh deliberately does NOT start feeders itself: it enables the
+# units and tells the operator to reboot. The enrollment token is written
+# to /etc/droneaware/token AFTER migrate runs, so any feeder started
+# during migration comes up without credentials and crash-loops until the
+# reboot. Pre-v1.5.0.6 the orchestration reached from `__migrate` issued
+# `systemctl start` regardless of caller, so every fresh install raced
+# enrollment.
+#
+# install.sh now sets DRONEAWARE_NO_SERVICE_START=1 for its one __migrate
+# call. `refresh` and `update` leave it unset and start units normally —
+# on those paths the token already exists.
+_service_start_suppressed() {
+    [[ "${DRONEAWARE_NO_SERVICE_START:-0}" == "1" ]]
+}
+
 _orchestrate_wifi_mode() {
     local cfg="$1"
     local MONITOR_COUNT="" ROLE_2G_MAC="" ROLE_5G_MAC=""
@@ -781,14 +798,17 @@ _switch_to_dual_adapter_mode() {
         systemctl stop droneaware-wifi 2>/dev/null || true
         systemctl disable droneaware-wifi 2>/dev/null || true
         systemctl enable droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
-        systemctl start droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
+        _service_start_suppressed \
+            || systemctl start droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
     elif [[ "$wrong_unit_active" == "1" ]]; then
         info "v1.5.0.1 self-heal: droneaware-wifi is active but dual-adapter mode is desired — switching"
         systemctl stop droneaware-wifi 2>/dev/null || true
-        systemctl start droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
+        _service_start_suppressed \
+            || systemctl start droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
     elif [[ "$macs_changed" == "1" ]]; then
         info "v1.5.0 dual-adapter MACs changed — restarting split units"
-        systemctl restart droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
+        _service_start_suppressed \
+            || systemctl restart droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
     fi
 }
 
@@ -797,6 +817,37 @@ _switch_to_single_adapter_mode() {
     local prev_mac
     prev_mac=$(_cfg_get "$cfg" WIFI_ADAPTER_MAC)
     _set_cfg_key "$cfg" WIFI_ADAPTER_MAC "$mac"
+
+    # v1.5.0.6: CLEAR the dual-adapter band keys. Pre-v1.5.0.6 this
+    # function wrote WIFI_ADAPTER_MAC but left WIFI_ADAPTER_2G_MAC /
+    # WIFI_ADAPTER_5G_MAC populated from whenever the node last had two
+    # adapters. Those keys are how every other code path decides "am I
+    # in dual mode", so a stale pair meant a node that had dropped to
+    # one adapter kept being treated as dual:
+    #
+    #   1. this function correctly disables the split units and starts
+    #      droneaware-wifi
+    #   2. _start_wifi_services_for_current_mode (end of cmd_update)
+    #      re-reads the STALE keys, takes the dual branch, stops
+    #      droneaware-wifi and starts the split units — which are now
+    #      disabled, and on pre-v1.5.0.4 nodes missing entirely
+    #   3. node ends the update with NO wifi feeder running, and every
+    #      subsequent refresh repeats the same thrash
+    #
+    # cmd_status read the same stale keys, so it listed two split rows
+    # for a node that should show one. Clearing here makes config.env
+    # an honest record of the mode and stops the loop at the source.
+    #
+    # Only writes when a stale value is actually present, so this is a
+    # true no-op on nodes that have only ever had one adapter.
+    local stale_2g stale_5g
+    stale_2g=$(_cfg_get "$cfg" WIFI_ADAPTER_2G_MAC)
+    stale_5g=$(_cfg_get "$cfg" WIFI_ADAPTER_5G_MAC)
+    if [[ -n "$stale_2g" || -n "$stale_5g" ]]; then
+        info "v1.5.0.6: clearing stale dual-adapter band keys (node resolved to single-adapter)"
+        _set_cfg_key "$cfg" WIFI_ADAPTER_2G_MAC ""
+        _set_cfg_key "$cfg" WIFI_ADAPTER_5G_MAC ""
+    fi
 
     local mode_needs_enable_flip=0
     if systemctl is-enabled droneaware-wifi-2g.service >/dev/null 2>&1 \
@@ -818,14 +869,17 @@ _switch_to_single_adapter_mode() {
         systemctl stop droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
         systemctl disable droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
         systemctl enable droneaware-wifi 2>/dev/null || true
-        systemctl start droneaware-wifi 2>/dev/null || true
+        _service_start_suppressed \
+            || systemctl start droneaware-wifi 2>/dev/null || true
     elif [[ "$wrong_unit_active" == "1" ]]; then
         info "v1.5.0.1 self-heal: split unit(s) active but single-adapter mode is desired — switching"
         systemctl stop droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
-        systemctl start droneaware-wifi 2>/dev/null || true
+        _service_start_suppressed \
+            || systemctl start droneaware-wifi 2>/dev/null || true
     elif [[ "$mac_changed" == "1" ]]; then
         info "v1.5.0 single-adapter MAC changed — restarting service"
-        systemctl restart droneaware-wifi 2>/dev/null || true
+        _service_start_suppressed \
+            || systemctl restart droneaware-wifi 2>/dev/null || true
     fi
 }
 
@@ -836,16 +890,38 @@ _switch_to_single_adapter_mode() {
 # pre-v1.5.0.1 bug was exactly that (hardcoded droneaware-wifi start
 # would auto-stop the split units via their Conflicts clause).
 _start_wifi_services_for_current_mode() {
+    if _service_start_suppressed; then
+        info "v1.5.0.6: service start suppressed (install-time) — units enabled, will start on reboot"
+        return 0
+    fi
+
     local cfg="${INSTALL_DIR}/config.env"
     local mac_2g mac_5g
     mac_2g=$(_cfg_get "$cfg" WIFI_ADAPTER_2G_MAC)
     mac_5g=$(_cfg_get "$cfg" WIFI_ADAPTER_5G_MAC)
-    if [[ -n "$mac_2g" && -n "$mac_5g" ]]; then
+
+    # v1.5.0.6: never stop a working single-adapter feeder in favour of
+    # split units that cannot run. Config alone used to decide this, so a
+    # node whose band keys said "dual" while the unit files were absent
+    # (the pre-v1.5.0.4 missing-asset case) would have droneaware-wifi
+    # stopped and nothing started in its place — silently dark, and the
+    # same thing happened again on every subsequent update.
+    local dual_units_present=0
+    if [[ -f /etc/systemd/system/droneaware-wifi-2g.service \
+       && -f /etc/systemd/system/droneaware-wifi-5g.service ]]; then
+        dual_units_present=1
+    fi
+
+    if [[ -n "$mac_2g" && -n "$mac_5g" && "$dual_units_present" == "1" ]]; then
         # Dual-adapter mode. Ensure single-mode unit is stopped, then
         # start the split units.
         systemctl stop droneaware-wifi 2>/dev/null || true
         systemctl start droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
     else
+        if [[ -n "$mac_2g" && -n "$mac_5g" ]]; then
+            warn "Dual-adapter configured but unit files are missing — starting single-adapter feeder instead."
+            warn "Run 'sudo droneaware refresh' to download the missing unit files."
+        fi
         # Single-adapter mode. Ensure split units are stopped, then
         # start the single unit.
         systemctl stop droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
@@ -959,7 +1035,13 @@ cmd_update() {
     fi
 
     echo "  Stopping services..."
-    systemctl stop droneaware-ble droneaware-wifi 2>/dev/null || true
+    # v1.5.0.6: stop the split units too. Pre-v1.5.0.6 this stopped only
+    # droneaware-ble + droneaware-wifi, so on a dual-adapter node both
+    # split feeders were still running when the `cp` below overwrote
+    # /opt/droneaware/wifi_feeder — the kernel holds that inode as their
+    # text image, giving ETXTBSY or a truncated binary.
+    systemctl stop droneaware-ble droneaware-wifi \
+        droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
     [[ "$update_webui" == "1" ]] && systemctl stop droneaware-web 2>/dev/null || true
 
     # Also update the droneaware CLI itself. NON-SILENT — earlier
@@ -1141,7 +1223,7 @@ cmd_status() {
         state=$(systemctl is-active "$svc" 2>/dev/null)
         # v1.5.0.4: distinguish missing-unit-file from inactive. systemctl
         # is-active returns "inactive" for both, making the pre-v1.5.0.4
-        # "not-found" case invisible (the_ninja / dallas-drones incident).
+        # "not-found" case invisible (surfaced by an operator report).
         # is-enabled returns "not-found" specifically when the unit file
         # doesn't exist on disk.
         local enabled
@@ -1690,7 +1772,13 @@ cmd_install_webui() {
     # the Web UI immediately (this is the post-install path — operator
     # has a running node, no reason to force a reboot).
     systemctl daemon-reload
-    systemctl restart droneaware-wifi 2>/dev/null || true
+    # v1.5.0.6: mode-aware feeder restart. A hardcoded `restart
+    # droneaware-wifi` on a dual-adapter node trips the split units'
+    # Conflicts=droneaware-wifi.service clause and stops them, leaving the
+    # node scanning one band instead of two. Same bug class v1.5.0.1 fixed
+    # in cmd_update — this path was missed.
+    systemctl stop droneaware-wifi droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
+    _start_wifi_services_for_current_mode
     systemctl restart droneaware-ble  2>/dev/null || true
     systemctl enable  droneaware-web > /dev/null 2>&1
     systemctl start   droneaware-web
