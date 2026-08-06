@@ -10,6 +10,41 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.5.0.5] — Unreleased
+
+Release-workflow fix: `.github/workflows/build.yaml` now uploads the
+two dual-adapter systemd unit files (`droneaware-wifi-2g.service` and
+`droneaware-wifi-5g.service`) as release assets.
+
+### Background
+
+These files were introduced in v1.5.0 and consumed by `install.sh`,
+but the release workflow's three hardcoded asset lists (attest
+subject-path, `gh release create` args, SHA256 checksum loop) were
+never updated to include them. Result: v1.5.0 through v1.5.0.4
+shipped without these files as release assets — fresh installs 404'd
+in install.sh's download loop, and the v1.5.0.4 self-heal path
+(which downloads missing unit files from the current release URL)
+also 404'd until the files were manually uploaded to the v1.5.0.4
+release post-tagging.
+
+### Fix
+
+- `.github/workflows/build.yaml` — add `droneaware-wifi-2g.service`
+  and `droneaware-wifi-5g.service` to all three lists.
+
+### Files changed
+
+- `.github/workflows/build.yaml`
+
+### Impact
+
+v1.5.0.5 is the first release where CI ships the correct asset set
+end-to-end with no manual `gh release upload` step. All future
+releases inherit the fix.
+
+---
+
 ## [1.5.0.4] — Unreleased
 
 Critical fix for dual-adapter nodes that upgraded from v1.4.x to any

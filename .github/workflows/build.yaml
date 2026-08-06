@@ -65,6 +65,8 @@ jobs:
             droneaware-bt-select.service
             droneaware-ble.service
             droneaware-wifi.service
+            droneaware-wifi-2g.service
+            droneaware-wifi-5g.service
             droneaware-web.service
       - name: Create Release
         run: |
@@ -78,6 +80,8 @@ jobs:
             droneaware-bt-select.service \
             droneaware-ble.service \
             droneaware-wifi.service \
+            droneaware-wifi-2g.service \
+            droneaware-wifi-5g.service \
             droneaware-web.service \
             --generate-notes
         env:
@@ -102,6 +106,7 @@ jobs:
             for f in ble_feeder wifi_feeder web_ui install.sh droneaware \
                      droneaware-bt-select droneaware-bt-select.service \
                      droneaware-ble.service droneaware-wifi.service \
+                     droneaware-wifi-2g.service droneaware-wifi-5g.service \
                      droneaware-web.service; do
               src="${DL_PATH}/${f}"
               [[ -f "$src" ]] || src="${f}"
