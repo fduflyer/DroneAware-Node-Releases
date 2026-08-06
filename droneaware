@@ -773,11 +773,26 @@ _switch_to_dual_adapter_mode() {
     # if the operator never runs another `update`.
     _ensure_dual_adapter_unit_files_installed
 
-    # Detect if the ENABLED unit topology is single-mode (needs enable/disable flip).
-    local mode_needs_enable_flip=0
+    # v1.5.0.6: enforce the enable-state for dual mode instead of only
+    # reacting to a detected single→dual transition.
+    #
+    # The old guard required droneaware-wifi enabled AND the split units
+    # NOT enabled. install.sh's install_services unconditionally runs
+    # `systemctl enable droneaware-wifi`, so on a RE-install of a node
+    # already in dual mode the split units were already enabled, the guard
+    # evaluated false, and droneaware-wifi was left enabled alongside them.
+    # Both modes then start on the next boot and fight over Conflicts=.
+    # install.sh explicitly tells operators to re-run it after an
+    # interrupted install, so this is reachable in the field.
+    #
+    # Stating the desired end state and enforcing it is the same principle
+    # as clearing the stale band keys above: derive from what the hardware
+    # is now, not from whether a transition happened to be observed.
+    local enable_state_wrong=0
     if systemctl is-enabled droneaware-wifi.service >/dev/null 2>&1 \
-       && ! systemctl is-enabled droneaware-wifi-2g.service >/dev/null 2>&1; then
-        mode_needs_enable_flip=1
+       || ! systemctl is-enabled droneaware-wifi-2g.service >/dev/null 2>&1 \
+       || ! systemctl is-enabled droneaware-wifi-5g.service >/dev/null 2>&1; then
+        enable_state_wrong=1
     fi
     # v1.5.0.1: detect ACTIVE-state mismatch too. Enabled state can be
     # correct (split units enabled) while droneaware-wifi is still running
@@ -793,22 +808,23 @@ _switch_to_dual_adapter_mode() {
         macs_changed=1
     fi
 
-    if [[ "$mode_needs_enable_flip" == "1" ]]; then
-        info "v1.5.0 mode-switch: single-adapter → dual-adapter (2g=${mac_2g}, 5g=${mac_5g})"
+    if [[ "$enable_state_wrong" == "1" ]]; then
+        info "v1.5.0 unit topology → dual-adapter (2g=${mac_2g}, 5g=${mac_5g})"
         systemctl stop droneaware-wifi 2>/dev/null || true
         systemctl disable droneaware-wifi 2>/dev/null || true
         systemctl enable droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
-        _service_start_suppressed \
-            || systemctl start droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
-    elif [[ "$wrong_unit_active" == "1" ]]; then
-        info "v1.5.0.1 self-heal: droneaware-wifi is active but dual-adapter mode is desired — switching"
+    fi
+
+    # One place decides whether the feeders need (re)starting, so the log
+    # never claims an action that suppression skipped. `restart` covers
+    # both cases — it starts a stopped unit.
+    if [[ "$enable_state_wrong" == "1" || "$wrong_unit_active" == "1" || "$macs_changed" == "1" ]]; then
         systemctl stop droneaware-wifi 2>/dev/null || true
-        _service_start_suppressed \
-            || systemctl start droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
-    elif [[ "$macs_changed" == "1" ]]; then
-        info "v1.5.0 dual-adapter MACs changed — restarting split units"
-        _service_start_suppressed \
-            || systemctl restart droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
+        if _service_start_suppressed; then
+            info "v1.5.0.6: split units enabled — start deferred to reboot (install-time)"
+        else
+            systemctl restart droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
+        fi
     fi
 }
 
@@ -849,10 +865,15 @@ _switch_to_single_adapter_mode() {
         _set_cfg_key "$cfg" WIFI_ADAPTER_5G_MAC ""
     fi
 
-    local mode_needs_enable_flip=0
+    # v1.5.0.6: enforce the enable-state for single mode, symmetric with
+    # the dual-mode path above — the desired end state is droneaware-wifi
+    # enabled and both split units disabled, regardless of whether a
+    # transition was observed.
+    local enable_state_wrong=0
     if systemctl is-enabled droneaware-wifi-2g.service >/dev/null 2>&1 \
-       || systemctl is-enabled droneaware-wifi-5g.service >/dev/null 2>&1; then
-        mode_needs_enable_flip=1
+       || systemctl is-enabled droneaware-wifi-5g.service >/dev/null 2>&1 \
+       || ! systemctl is-enabled droneaware-wifi.service >/dev/null 2>&1; then
+        enable_state_wrong=1
     fi
     # v1.5.0.1 self-heal symmetric to dual-mode: if a split unit is
     # currently active but single-adapter is desired, force the transition.
@@ -864,22 +885,20 @@ _switch_to_single_adapter_mode() {
     local mac_changed=0
     [[ "$prev_mac" != "$mac" ]] && mac_changed=1
 
-    if [[ "$mode_needs_enable_flip" == "1" ]]; then
-        info "v1.5.0 mode-switch: dual-adapter → single-adapter (${mac})"
+    if [[ "$enable_state_wrong" == "1" ]]; then
+        info "v1.5.0 unit topology → single-adapter (${mac})"
         systemctl stop droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
         systemctl disable droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
         systemctl enable droneaware-wifi 2>/dev/null || true
-        _service_start_suppressed \
-            || systemctl start droneaware-wifi 2>/dev/null || true
-    elif [[ "$wrong_unit_active" == "1" ]]; then
-        info "v1.5.0.1 self-heal: split unit(s) active but single-adapter mode is desired — switching"
+    fi
+
+    if [[ "$enable_state_wrong" == "1" || "$wrong_unit_active" == "1" || "$mac_changed" == "1" ]]; then
         systemctl stop droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
-        _service_start_suppressed \
-            || systemctl start droneaware-wifi 2>/dev/null || true
-    elif [[ "$mac_changed" == "1" ]]; then
-        info "v1.5.0 single-adapter MAC changed — restarting service"
-        _service_start_suppressed \
-            || systemctl restart droneaware-wifi 2>/dev/null || true
+        if _service_start_suppressed; then
+            info "v1.5.0.6: droneaware-wifi enabled — start deferred to reboot (install-time)"
+        else
+            systemctl restart droneaware-wifi 2>/dev/null || true
+        fi
     fi
 }
 

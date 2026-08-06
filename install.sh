@@ -1237,10 +1237,26 @@ install_webui() {
     local local_root
     local_root="$(dirname "${LOCAL_DIST}")"
 
-    echo "    Downloading web_ui binary..."
+    # v1.5.0.6: stop droneaware-web before replacing its binary. A running
+    # web_ui holds ${INSTALL_DIR}/web_ui as its text image, so writing over
+    # it fails with ETXTBSY ("Text file busy"). download_binaries stops the
+    # feeders but never this unit, and cmd_update's equivalent stop was
+    # never mirrored here — so re-running the installer on a node with the
+    # Web UI already installed always failed to update the binary.
+    systemctl stop droneaware-web 2>/dev/null || true
+
+    echo "    Installing web_ui binary..."
     if [[ "$LOCAL_INSTALL" == "1" ]]; then
-        cp "${LOCAL_DIST}/web_ui" "${INSTALL_DIR}/web_ui" 2>/dev/null \
-            || { warn "Web UI binary not found in local dist — skipping Web UI install."; return 0; }
+        # v1.5.0.6: do not discard the error. This previously used
+        # `2>/dev/null` and reported "not found in local dist" for ANY
+        # failure — including ETXTBSY, which is what actually happened,
+        # sending the operator looking for a missing file that was present
+        # the whole time.
+        if ! cp "${LOCAL_DIST}/web_ui" "${INSTALL_DIR}/web_ui"; then
+            warn "Could not install web_ui from ${LOCAL_DIST} (see error above) — skipping Web UI install."
+            warn "You can retry later with: sudo droneaware install-webui"
+            return 0
+        fi
     else
         if ! curl -fsSL --retry 3 "${base_url}/web_ui" -o "${INSTALL_DIR}/web_ui"; then
             warn "Web UI binary download failed — skipping Web UI install."

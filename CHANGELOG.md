@@ -105,6 +105,38 @@ this path was missed.
 Fix: the restart is mode-aware, routed through
 `_start_wifi_services_for_current_mode`.
 
+### Re-running the installer left both adapter modes enabled
+
+`install_services` unconditionally runs `systemctl enable
+droneaware-wifi`. The dual-mode switch only disabled it when the split
+units were **not** already enabled — true on a first install, false when
+re-running the installer on a node already in dual mode. That node ended
+up with `droneaware-wifi` enabled alongside `droneaware-wifi-2g` and
+`droneaware-wifi-5g`, so all three start on the next boot and fight over
+`Conflicts=`. install.sh tells operators to re-run it after an
+interrupted install, so this is reachable in the field.
+
+Fix: both mode-switch functions now state the desired enable-state and
+enforce it, rather than reacting to a transition they happened to
+observe — the same principle as clearing the stale band keys. The
+restart decision moved to a single place so the log no longer reports an
+action that install-time suppression skipped.
+
+### Web UI binary could never be replaced once installed
+
+`install_webui` wrote over `/opt/droneaware/web_ui` without stopping
+`droneaware-web`. A running process holds its own binary as its text
+image, so the write failed with `ETXTBSY`. In LOCAL_INSTALL mode the copy
+was additionally wrapped in `2>/dev/null`, so the real error was
+discarded and the operator was told `Web UI binary not found in local
+dist` — pointed at a missing file that was present the whole time.
+
+`download_binaries` stops the feeders but never this unit, and
+`cmd_update`'s equivalent stop was never mirrored here.
+
+Fix: stop `droneaware-web` before replacing its binary, and report the
+actual error instead of discarding it.
+
 ### `update` ignored pre-release status, so rollbacks did not reach nodes
 
 `cmd_update` read tag names from `GET /releases` and never looked at the
@@ -154,7 +186,8 @@ continue/cancel prompt. Silent on `0x0`, and skipped entirely where
   `_start_wifi_services_for_current_mode`; new `_service_start_suppressed`
   helper guarding every start/restart in both mode-switch functions;
   split units added to the `cmd_update` stop list; mode-aware feeder
-  restart in `cmd_install_webui`; stable-release selection in `cmd_update`
+  restart in `cmd_install_webui`; enable-state enforcement in both
+  mode-switch functions; stable-release selection in `cmd_update`
   with `DRONEAWARE_ALLOW_PRERELEASE=1` opt-in.
 - `.github/workflows/release.yaml`, `.github/workflows/build.yaml` — new
   `prerelease` input, so a validation build can be published and tested on
@@ -163,7 +196,8 @@ continue/cancel prompt. Silent on `0x0`, and skipped entirely where
 - `install.sh` — apt failure handling with explicit rollback; non-fatal
   bluetooth setup; split units added to the `download_binaries` stop list;
   `DRONEAWARE_NO_SERVICE_START=1` on the `__migrate` call; new
-  `_check_undervoltage` pre-flight.
+  `_check_undervoltage` pre-flight; `droneaware-web` stopped before its
+  binary is replaced, with the real error surfaced.
 
 ---
 
