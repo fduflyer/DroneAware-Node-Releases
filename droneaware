@@ -1032,7 +1032,23 @@ cmd_status() {
     echo "  Firmware : ${ver}"
     echo "  Node ID  : $(_cfg_get "${INSTALL_DIR}/config.env" NODE_ID unknown)"
     echo ""
-    for svc in droneaware-ble droneaware-wifi; do
+    # v1.5.0.3: mode-aware WiFi service list. In dual-adapter mode
+    # (both WIFI_ADAPTER_2G_MAC + WIFI_ADAPTER_5G_MAC set),
+    # droneaware-wifi.service is CORRECTLY inactive (the two split
+    # units are the active ones). Pre-v1.5.0.3 status only checked
+    # droneaware-wifi and displayed it as red-inactive, misleading
+    # operators into thinking wifi was broken.
+    local svcs=(droneaware-ble)
+    local cfg="${INSTALL_DIR}/config.env"
+    local mac_2g mac_5g
+    mac_2g=$(_cfg_get "$cfg" WIFI_ADAPTER_2G_MAC)
+    mac_5g=$(_cfg_get "$cfg" WIFI_ADAPTER_5G_MAC)
+    if [[ -n "$mac_2g" && -n "$mac_5g" ]]; then
+        svcs+=(droneaware-wifi-2g droneaware-wifi-5g)
+    else
+        svcs+=(droneaware-wifi)
+    fi
+    for svc in "${svcs[@]}"; do
         local state
         state=$(systemctl is-active "$svc" 2>/dev/null)
         if [[ "$state" == "active" ]]; then

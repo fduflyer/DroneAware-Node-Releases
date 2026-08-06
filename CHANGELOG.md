@@ -10,6 +10,32 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.5.0.3] — Unreleased
+
+Cosmetic fix for `sudo droneaware status` on dual-adapter nodes.
+
+Pre-v1.5.0.3 `cmd_status` hardcoded `for svc in droneaware-ble
+droneaware-wifi` and displayed the state of each. In dual-adapter
+mode (both `WIFI_ADAPTER_2G_MAC` + `WIFI_ADAPTER_5G_MAC` set),
+`droneaware-wifi.service` is CORRECTLY inactive — the two split
+units `droneaware-wifi-2g` and `droneaware-wifi-5g` are the active
+ones. But status showed `droneaware-wifi` as red-inactive, which
+looked broken.
+
+Fix: mode-aware service list. Read config keys; if dual-mode keys
+set, show the two split units. Else show `droneaware-wifi` as
+before. Same one-adapter/two-adapter detection logic as
+`_start_wifi_services_for_current_mode` (v1.5.0.1) and
+`_orchestrate_wifi_mode`.
+
+Data was always correct — only the display was wrong.
+
+### Files changed
+
+- `droneaware` (CLI) — `cmd_status` service list becomes mode-aware.
+
+---
+
 ## [1.5.0.2] — Unreleased
 
 Post-update self-heal: `cmd_update` now re-execs the newly-installed
