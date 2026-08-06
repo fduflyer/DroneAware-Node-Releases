@@ -698,23 +698,35 @@ _switch_to_dual_adapter_mode() {
     _set_cfg_key "$cfg" WIFI_ADAPTER_2G_MAC "$mac_2g"
     _set_cfg_key "$cfg" WIFI_ADAPTER_5G_MAC "$mac_5g"
 
-    # Detect if we were previously in single-adapter mode (droneaware-wifi
-    # enabled and split units not enabled). Also detect if either MAC changed.
-    local mode_changed=0
+    # Detect if the ENABLED unit topology is single-mode (needs enable/disable flip).
+    local mode_needs_enable_flip=0
     if systemctl is-enabled droneaware-wifi.service >/dev/null 2>&1 \
        && ! systemctl is-enabled droneaware-wifi-2g.service >/dev/null 2>&1; then
-        mode_changed=1
+        mode_needs_enable_flip=1
+    fi
+    # v1.5.0.1: detect ACTIVE-state mismatch too. Enabled state can be
+    # correct (split units enabled) while droneaware-wifi is still running
+    # — e.g., cmd_update's post-migration `systemctl start droneaware-wifi`
+    # trips this (pre-v1.5.0.1 bug). Force a heal in that case even when
+    # enable flags already agree with the desired mode.
+    local wrong_unit_active=0
+    if systemctl is-active droneaware-wifi.service >/dev/null 2>&1; then
+        wrong_unit_active=1
     fi
     local macs_changed=0
     if [[ "$prev_2g" != "$mac_2g" || "$prev_5g" != "$mac_5g" ]]; then
         macs_changed=1
     fi
 
-    if [[ "$mode_changed" == "1" ]]; then
+    if [[ "$mode_needs_enable_flip" == "1" ]]; then
         info "v1.5.0 mode-switch: single-adapter → dual-adapter (2g=${mac_2g}, 5g=${mac_5g})"
         systemctl stop droneaware-wifi 2>/dev/null || true
         systemctl disable droneaware-wifi 2>/dev/null || true
         systemctl enable droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
+        systemctl start droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
+    elif [[ "$wrong_unit_active" == "1" ]]; then
+        info "v1.5.0.1 self-heal: droneaware-wifi is active but dual-adapter mode is desired — switching"
+        systemctl stop droneaware-wifi 2>/dev/null || true
         systemctl start droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
     elif [[ "$macs_changed" == "1" ]]; then
         info "v1.5.0 dual-adapter MACs changed — restarting split units"
@@ -728,23 +740,58 @@ _switch_to_single_adapter_mode() {
     prev_mac=$(_cfg_get "$cfg" WIFI_ADAPTER_MAC)
     _set_cfg_key "$cfg" WIFI_ADAPTER_MAC "$mac"
 
-    local mode_changed=0
+    local mode_needs_enable_flip=0
     if systemctl is-enabled droneaware-wifi-2g.service >/dev/null 2>&1 \
        || systemctl is-enabled droneaware-wifi-5g.service >/dev/null 2>&1; then
-        mode_changed=1
+        mode_needs_enable_flip=1
+    fi
+    # v1.5.0.1 self-heal symmetric to dual-mode: if a split unit is
+    # currently active but single-adapter is desired, force the transition.
+    local wrong_unit_active=0
+    if systemctl is-active droneaware-wifi-2g.service >/dev/null 2>&1 \
+       || systemctl is-active droneaware-wifi-5g.service >/dev/null 2>&1; then
+        wrong_unit_active=1
     fi
     local mac_changed=0
     [[ "$prev_mac" != "$mac" ]] && mac_changed=1
 
-    if [[ "$mode_changed" == "1" ]]; then
+    if [[ "$mode_needs_enable_flip" == "1" ]]; then
         info "v1.5.0 mode-switch: dual-adapter → single-adapter (${mac})"
         systemctl stop droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
         systemctl disable droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
         systemctl enable droneaware-wifi 2>/dev/null || true
         systemctl start droneaware-wifi 2>/dev/null || true
+    elif [[ "$wrong_unit_active" == "1" ]]; then
+        info "v1.5.0.1 self-heal: split unit(s) active but single-adapter mode is desired — switching"
+        systemctl stop droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
+        systemctl start droneaware-wifi 2>/dev/null || true
     elif [[ "$mac_changed" == "1" ]]; then
         info "v1.5.0 single-adapter MAC changed — restarting service"
         systemctl restart droneaware-wifi 2>/dev/null || true
+    fi
+}
+
+# v1.5.0.1 — pick which WiFi service(s) to start at the end of cmd_update.
+# Reads config keys to determine the current mode: if dual-adapter keys
+# are both set, start the split units. Else, start the single-adapter
+# unit. Never both — Conflicts= in the unit files would fight, and the
+# pre-v1.5.0.1 bug was exactly that (hardcoded droneaware-wifi start
+# would auto-stop the split units via their Conflicts clause).
+_start_wifi_services_for_current_mode() {
+    local cfg="${INSTALL_DIR}/config.env"
+    local mac_2g mac_5g
+    mac_2g=$(_cfg_get "$cfg" WIFI_ADAPTER_2G_MAC)
+    mac_5g=$(_cfg_get "$cfg" WIFI_ADAPTER_5G_MAC)
+    if [[ -n "$mac_2g" && -n "$mac_5g" ]]; then
+        # Dual-adapter mode. Ensure single-mode unit is stopped, then
+        # start the split units.
+        systemctl stop droneaware-wifi 2>/dev/null || true
+        systemctl start droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
+    else
+        # Single-adapter mode. Ensure split units are stopped, then
+        # start the single unit.
+        systemctl stop droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
+        systemctl start droneaware-wifi 2>/dev/null || true
     fi
 }
 
@@ -935,7 +982,13 @@ cmd_update() {
     _gps_sanity_check_update
 
     systemctl daemon-reload
-    systemctl start droneaware-wifi
+    # v1.5.0.1: start the WiFi service(s) matching the CURRENT adapter mode.
+    # Pre-v1.5.0 unconditionally started droneaware-wifi, which — after the
+    # v1.5.0 dual-adapter split — would auto-stop the enabled split units
+    # via their `Conflicts=droneaware-wifi.service` clause and leave the
+    # node in a broken state (wrong service active, mode-detect thinks it's
+    # already correct). Query config to decide which unit(s) to start.
+    _start_wifi_services_for_current_mode
     if hciconfig 2>/dev/null | grep -q "hci"; then
         systemctl start droneaware-ble
     else

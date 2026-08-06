@@ -10,6 +10,71 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.5.0.1] — Unreleased
+
+Hotfix for two mode-switching bugs surfaced during v1.5.0's binary
+validation. Both bugs left dual-adapter mode broken after a `sudo
+droneaware update` from v1.4.x → v1.5.0:
+the wrong WiFi service ended up running (single-adapter `droneaware-
+wifi.service` instead of the two split units), and `sudo droneaware
+refresh` couldn't fix it because its self-heal check only looked at
+`is-enabled` flags, not `is-active` state.
+
+### Bug A: `cmd_update` hardcoded start of `droneaware-wifi.service`
+
+Pre-v1.5.0.1 `cmd_update` ended with an unconditional `systemctl
+start droneaware-wifi` — a leftover from the pre-v1.5.0 single-
+adapter world. After v1.5.0's dual-adapter split, this started the
+wrong service on dual-adapter nodes. The `Conflicts=droneaware-wifi.service`
+clause on the two split units then auto-stopped them, leaving the
+node in a state where:
+
+- Enable flags matched the desired dual-adapter topology (2g + 5g enabled,
+  wifi disabled) — so mode-detection thought everything was fine
+- But the ACTIVE service was `droneaware-wifi` — the wrong one
+
+Fix: new `_start_wifi_services_for_current_mode` helper reads config
+keys to decide which unit(s) to start. If `WIFI_ADAPTER_2G_MAC` +
+`WIFI_ADAPTER_5G_MAC` both set → stop `droneaware-wifi`, start the
+split units. Else → stop split units, start `droneaware-wifi`. Never
+both (would fight via `Conflicts=`).
+
+### Bug B: `refresh` didn't self-heal on active-state mismatch
+
+`_switch_to_dual_adapter_mode` and `_switch_to_single_adapter_mode`
+only triggered a mode transition when `is-enabled` flags disagreed
+with the desired mode. If the enable flags were correct but the
+wrong service was currently ACTIVE (Bug A's aftermath), `refresh`
+concluded "already in correct mode, no action" and did nothing.
+
+Fix: both orchestrator functions now also check `is-active`. If the
+wrong service is currently running while enable flags already agree
+with the desired mode, force the transition — stop the wrong service,
+start the right one(s). Prints a "self-heal" log line to distinguish
+from a normal mode-switch.
+
+### Recovery for existing v1.5.0 nodes stuck in the broken state
+
+After updating to v1.5.0.1, `sudo droneaware refresh` self-heals the
+broken state automatically. For operators who want to fix v1.5.0 nodes
+before v1.5.0.1 rolls out, the manual remediation is:
+
+```
+sudo systemctl stop droneaware-wifi
+sudo systemctl start droneaware-wifi-2g droneaware-wifi-5g
+```
+
+Single-adapter nodes were not affected (Bug A landed them in the
+correct state coincidentally).
+
+### Files changed
+
+- `droneaware` (CLI) — new `_start_wifi_services_for_current_mode`
+  helper called from `cmd_update`; `_switch_to_*_adapter_mode` gain
+  `wrong_unit_active` self-heal branches.
+
+---
+
 ## [1.5.0] — Unreleased
 
 **Multi-radio milestone.** Adapter-identification fragility fixed for
