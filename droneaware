@@ -962,21 +962,66 @@ cmd_update() {
     CURRENT=$(cat "$VERSION_FILE" 2>/dev/null || echo "unknown")
     echo "  Checking latest release..."
 
-    # Find the most recent release that actually contains binaries.
+    # Find the newest STABLE release that actually contains binaries.
     # Installer-only releases (no ble_feeder asset) are skipped.
-    LATEST=""
-    while IFS= read -r tag; do
-        [[ -z "$tag" ]] && continue
-        has_binary=$(curl -sf "https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${tag}" \
-            | grep '"name"' | grep -c 'ble_feeder' || true)
-        if [[ "$has_binary" -gt 0 ]]; then
-            LATEST="$tag"
-            break
-        fi
-    done < <(curl -sf "https://api.github.com/repos/${GITHUB_REPO}/releases" \
-        | grep '"tag_name"' | cut -d'"' -f4)
+    #
+    # v1.5.0.6: pre-releases are now excluded, and the whole thing is one
+    # API call. Two problems with the previous implementation:
+    #
+    #   1. It read tag names from GET /releases and never looked at the
+    #      `prerelease` flag, so marking a release as a pre-release on
+    #      GitHub did NOT keep nodes off it. A withdrawn release stayed
+    #      installable via `droneaware update` even after the `Latest`
+    #      pointer had been moved back — the rollback only ever protected
+    #      fresh installs, not existing nodes.
+    #   2. It issued one extra API call per candidate tag against
+    #      GitHub's 60-requests-per-hour unauthenticated limit.
+    #
+    # Sorting is done here on published_at rather than trusting the API's
+    # list order, which is not stable once pre-releases are present.
+    #
+    # The asset test deliberately checks for ble_feeder ONLY. Requiring
+    # the full v1.5.0 asset set (including the dual-adapter unit files)
+    # would make every pre-v1.5.0 release unselectable and break the
+    # ability to roll the fleet back to one.
+    #
+    # To validate a release candidate on a test node, opt in explicitly:
+    #     sudo DRONEAWARE_ALLOW_PRERELEASE=1 droneaware update
+    LATEST=$(curl -sf "https://api.github.com/repos/${GITHUB_REPO}/releases" \
+        | ALLOW_PRE="${DRONEAWARE_ALLOW_PRERELEASE:-0}" python3 -c '
+import json, os, sys
+allow_pre = os.environ.get("ALLOW_PRE") == "1"
+try:
+    releases = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(releases, list):
+    sys.exit(1)
+candidates = []
+for r in releases:
+    if not isinstance(r, dict) or r.get("draft"):
+        continue
+    if r.get("prerelease") and not allow_pre:
+        continue
+    if not any((a or {}).get("name") == "ble_feeder" for a in (r.get("assets") or [])):
+        continue
+    tag = r.get("tag_name")
+    if tag:
+        candidates.append((r.get("published_at") or r.get("created_at") or "", tag))
+if candidates:
+    candidates.sort(reverse=True)
+    print(candidates[0][1])
+' 2>/dev/null)
 
-    [[ -n "$LATEST" ]] || fatal "Could not reach GitHub or no binary release found — check internet connection."
+    if [[ -z "$LATEST" ]]; then
+        if [[ "${DRONEAWARE_ALLOW_PRERELEASE:-0}" == "1" ]]; then
+            fatal "Could not reach GitHub or no release with binaries found — check internet connection."
+        fi
+        fatal "Could not reach GitHub or no stable release with binaries found. If you are testing a release candidate, use: sudo DRONEAWARE_ALLOW_PRERELEASE=1 droneaware update"
+    fi
+    if [[ "${DRONEAWARE_ALLOW_PRERELEASE:-0}" == "1" ]]; then
+        warn "Pre-releases enabled — ${LATEST} may be a release candidate."
+    fi
 
     echo "  Installed : ${CURRENT}"
     echo "  Latest    : ${LATEST}"

@@ -105,6 +105,34 @@ this path was missed.
 Fix: the restart is mode-aware, routed through
 `_start_wifi_services_for_current_mode`.
 
+### `update` ignored pre-release status, so rollbacks did not reach nodes
+
+`cmd_update` read tag names from `GET /releases` and never looked at the
+`prerelease` flag. Marking a release as a pre-release on GitHub moves the
+`Latest` pointer that fresh installs resolve to, but it did not keep
+existing nodes off that release — `sudo droneaware update` would still
+select it. A withdrawn release therefore remained installable on every
+node in the field, and a rollback only ever protected new installs.
+
+The same loop also issued one additional API call per candidate tag,
+against GitHub's 60-requests-per-hour unauthenticated limit.
+
+Fix: a single API call, parsed properly, skipping drafts and
+pre-releases and requiring the `ble_feeder` asset. Sorting is done on
+`published_at` rather than trusting the API's list order, which is not
+stable once pre-releases are present.
+
+The asset test deliberately checks for `ble_feeder` only. Requiring the
+full v1.5.0 asset set would make every pre-v1.5.0 release unselectable
+and remove the ability to roll the fleet back to one.
+
+Release candidates can still be installed on a test node by opting in
+explicitly:
+
+```
+sudo DRONEAWARE_ALLOW_PRERELEASE=1 droneaware update
+```
+
 ### Added: under-voltage pre-flight
 
 `install.sh` now reads `vcgencmd get_throttled` before running apt. A Pi
@@ -126,7 +154,8 @@ continue/cancel prompt. Silent on `0x0`, and skipped entirely where
   `_start_wifi_services_for_current_mode`; new `_service_start_suppressed`
   helper guarding every start/restart in both mode-switch functions;
   split units added to the `cmd_update` stop list; mode-aware feeder
-  restart in `cmd_install_webui`.
+  restart in `cmd_install_webui`; stable-release selection in `cmd_update`
+  with `DRONEAWARE_ALLOW_PRERELEASE=1` opt-in.
 - `.github/workflows/release.yaml`, `.github/workflows/build.yaml` — new
   `prerelease` input, so a validation build can be published and tested on
   real hardware without becoming the `Latest` release that the install
