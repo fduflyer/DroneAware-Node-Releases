@@ -689,6 +689,54 @@ _orchestrate_wifi_mode() {
     fi
 }
 
+# v1.5.0.4: recovery for nodes whose upgrade path missed the dual-adapter
+# systemd unit files (pre-v1.5.0.4 cmd_update only downloaded binaries +
+# CLI, not the two new .service files added in v1.5.0). Downloads from
+# the release matching the currently-installed version, using the same
+# GitHub URL scheme cmd_update uses. Safe no-op when both files already
+# exist. Fatal if a download attempt is needed and fails, so the operator
+# sees a clear error rather than a silent gap.
+_ensure_dual_adapter_unit_files_installed() {
+    local svc_2g="/etc/systemd/system/droneaware-wifi-2g.service"
+    local svc_5g="/etc/systemd/system/droneaware-wifi-5g.service"
+    if [[ -f "$svc_2g" && -f "$svc_5g" ]]; then
+        return 0
+    fi
+
+    local ver
+    ver=$(cat "$VERSION_FILE" 2>/dev/null)
+    if [[ -z "$ver" ]]; then
+        warn "v1.5.0.4 self-heal: cannot read ${VERSION_FILE} — skipping unit-file download"
+        return 1
+    fi
+
+    local base="https://github.com/${GITHUB_REPO}/releases/download/${ver}"
+    info "v1.5.0.4 self-heal: dual-adapter unit files missing — downloading from ${ver} release"
+
+    if [[ ! -f "$svc_2g" ]]; then
+        if ! curl -fsSL --retry 3 "${base}/droneaware-wifi-2g.service" -o "$svc_2g"; then
+            warn "Failed to download droneaware-wifi-2g.service — dual-adapter mode will not start"
+            warn "Fix manually with:"
+            warn "  sudo curl -fsSL ${base}/droneaware-wifi-2g.service -o ${svc_2g}"
+            return 1
+        fi
+        chmod 644 "$svc_2g"
+    fi
+    if [[ ! -f "$svc_5g" ]]; then
+        if ! curl -fsSL --retry 3 "${base}/droneaware-wifi-5g.service" -o "$svc_5g"; then
+            warn "Failed to download droneaware-wifi-5g.service — dual-adapter mode will not start"
+            warn "Fix manually with:"
+            warn "  sudo curl -fsSL ${base}/droneaware-wifi-5g.service -o ${svc_5g}"
+            return 1
+        fi
+        chmod 644 "$svc_5g"
+    fi
+
+    systemctl daemon-reload
+    info "v1.5.0.4 self-heal: unit files installed."
+    return 0
+}
+
 _switch_to_dual_adapter_mode() {
     local cfg="$1" mac_2g="$2" mac_5g="$3"
     local prev_2g prev_5g
@@ -697,6 +745,16 @@ _switch_to_dual_adapter_mode() {
 
     _set_cfg_key "$cfg" WIFI_ADAPTER_2G_MAC "$mac_2g"
     _set_cfg_key "$cfg" WIFI_ADAPTER_5G_MAC "$mac_5g"
+
+    # v1.5.0.4: self-heal missing unit files. Nodes upgraded from
+    # v1.4.x to v1.5.0.x via pre-v1.5.0.4 cmd_update never received
+    # droneaware-wifi-2g.service / droneaware-wifi-5g.service (cmd_update
+    # only downloaded binaries). Symptom: is-enabled returns "not-found",
+    # feeders silently absent, status shows "inactive" with no clue why.
+    # Any refresh call in dual-adapter mode now downloads missing units
+    # so the node self-heals on its next `sudo droneaware refresh` even
+    # if the operator never runs another `update`.
+    _ensure_dual_adapter_unit_files_installed
 
     # Detect if the ENABLED unit topology is single-mode (needs enable/disable flip).
     local mode_needs_enable_flip=0
@@ -859,6 +917,29 @@ cmd_update() {
     curl -fsSL --retry 3 "${BASE}/ble_feeder"  -o /tmp/da_ble_feeder  || fatal "Failed to download ble_feeder"
     curl -fsSL --retry 3 "${BASE}/wifi_feeder" -o /tmp/da_wifi_feeder || fatal "Failed to download wifi_feeder"
     chmod +x /tmp/da_ble_feeder /tmp/da_wifi_feeder
+    # v1.5.0.4: also download the dual-adapter unit files. Pre-v1.5.0.4
+    # cmd_update only downloaded binaries + CLI, so nodes that upgraded
+    # from v1.4.x to any v1.5.0.x release via `sudo droneaware update`
+    # never received droneaware-wifi-2g.service / droneaware-wifi-5g.service.
+    # The classifier populated dual-adapter config keys and status showed
+    # the two split rows, but systemd had no units to run — feeders silently
+    # absent, is-enabled returned not-found. Only fresh installs via
+    # install.sh got the files.
+    #
+    # Non-fatal on download failure: single-adapter operators don't need
+    # these files, and the refresh path (_ensure_dual_adapter_unit_files_
+    # installed) can recover later. Log a warning so we notice release-
+    # asset gaps but don't block the update.
+    wifi_2g_svc_ok=1
+    wifi_5g_svc_ok=1
+    if ! curl -fsSL --retry 3 "${BASE}/droneaware-wifi-2g.service" -o /tmp/da_wifi_2g_svc; then
+        warn "droneaware-wifi-2g.service download failed — dual-adapter mode will need 'sudo droneaware refresh' after update."
+        wifi_2g_svc_ok=0
+    fi
+    if ! curl -fsSL --retry 3 "${BASE}/droneaware-wifi-5g.service" -o /tmp/da_wifi_5g_svc; then
+        warn "droneaware-wifi-5g.service download failed — dual-adapter mode will need 'sudo droneaware refresh' after update."
+        wifi_5g_svc_ok=0
+    fi
     info "Downloaded ${LATEST}."
 
     # If the operator has opted into the local Web UI (presence of the
@@ -912,6 +993,13 @@ cmd_update() {
 
     cp /tmp/da_ble_feeder  "${INSTALL_DIR}/ble_feeder"
     cp /tmp/da_wifi_feeder "${INSTALL_DIR}/wifi_feeder"
+    # v1.5.0.4: install the dual-adapter unit files (downloaded above).
+    # daemon-reload happens further down before service starts, so systemd
+    # sees the new units before _start_wifi_services_for_current_mode runs.
+    # Skip cleanly if the download failed — refresh's self-heal will retry
+    # later, and single-adapter operators don't need these files.
+    [[ "$wifi_2g_svc_ok" == "1" ]] && install -m 644 /tmp/da_wifi_2g_svc /etc/systemd/system/droneaware-wifi-2g.service
+    [[ "$wifi_5g_svc_ok" == "1" ]] && install -m 644 /tmp/da_wifi_5g_svc /etc/systemd/system/droneaware-wifi-5g.service
     if [[ "$update_webui" == "1" ]]; then
         cp /tmp/da_web_ui "${INSTALL_DIR}/web_ui"
         ln -sf "${INSTALL_DIR}/web_ui" /usr/local/bin/web_ui 2>/dev/null || true
@@ -938,7 +1026,7 @@ cmd_update() {
             rm -f /usr/local/bin/droneaware.new 2>/dev/null || true
         fi
     fi
-    rm -f /tmp/da_ble_feeder /tmp/da_wifi_feeder /tmp/da_web_ui /tmp/da_cli
+    rm -f /tmp/da_ble_feeder /tmp/da_wifi_feeder /tmp/da_web_ui /tmp/da_cli /tmp/da_wifi_2g_svc /tmp/da_wifi_5g_svc
     echo "$LATEST" > "$VERSION_FILE"
 
     # Nodes installed before v1.0.19 have service files pointing to /usr/local/bin/.
@@ -1051,8 +1139,17 @@ cmd_status() {
     for svc in "${svcs[@]}"; do
         local state
         state=$(systemctl is-active "$svc" 2>/dev/null)
+        # v1.5.0.4: distinguish missing-unit-file from inactive. systemctl
+        # is-active returns "inactive" for both, making the pre-v1.5.0.4
+        # "not-found" case invisible (the_ninja / dallas-drones incident).
+        # is-enabled returns "not-found" specifically when the unit file
+        # doesn't exist on disk.
+        local enabled
+        enabled=$(systemctl is-enabled "$svc" 2>/dev/null)
         if [[ "$state" == "active" ]]; then
             echo -e "  ${GREEN}●${NC}  ${svc}  (running)"
+        elif [[ "$enabled" == "not-found" ]]; then
+            echo -e "  ${RED}●${NC}  ${svc}  (unit file missing — run 'sudo droneaware refresh')"
         else
             echo -e "  ${RED}●${NC}  ${svc}  (${state})"
         fi

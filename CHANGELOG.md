@@ -10,6 +10,56 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.5.0.4] — Unreleased
+
+Critical fix for dual-adapter nodes that upgraded from v1.4.x to any
+v1.5.0.x release via `sudo droneaware update`. The upgrade path pulled
+new binaries + CLI but never installed the two new systemd unit files
+introduced in v1.5.0 (`droneaware-wifi-2g.service` and
+`droneaware-wifi-5g.service`). Only fresh installs via install.sh
+received them.
+
+Symptom: on nodes with 2+ monitor-capable USB WiFi adapters, the
+classifier populated `WIFI_ADAPTER_2G_MAC` + `WIFI_ADAPTER_5G_MAC`
+in config.env, `sudo droneaware status` showed the two split-unit
+rows as `inactive`, and `systemctl is-enabled droneaware-wifi-2g`
+returned `not-found`. Feeders silently absent; heartbeats reported
+no WiFi coverage.
+
+### Fixes
+
+- `cmd_update` now downloads both dual-adapter unit files alongside
+  the binaries, and installs them to `/etc/systemd/system/` before
+  `daemon-reload`. Non-fatal on download failure — single-adapter
+  operators aren't blocked, and the refresh path (below) recovers.
+- `refresh` (via `_switch_to_dual_adapter_mode`) now calls a new
+  `_ensure_dual_adapter_unit_files_installed` helper. If either unit
+  file is missing on disk, it downloads from the release matching the
+  currently-installed version and reloads systemd. Runs on every
+  refresh in dual-adapter mode, so nodes previously stuck by this bug
+  self-heal on their next `sudo droneaware refresh` even without
+  running another `update`.
+- `cmd_status` now distinguishes `unit file missing` from `inactive`.
+  Pre-v1.5.0.4, both rendered as red-inactive and gave no signal that
+  systemd literally didn't know about the unit. New display reads:
+  `● droneaware-wifi-2g  (unit file missing — run 'sudo droneaware refresh')`.
+
+### Files changed
+
+- `droneaware` (CLI) — `cmd_update` download + install; new
+  `_ensure_dual_adapter_unit_files_installed` helper called from
+  `_switch_to_dual_adapter_mode`; `cmd_status` distinguishes
+  missing unit files.
+
+### Impact
+
+Once a node is on v1.5.0.4, both the update path AND the refresh
+path guarantee unit files match the installed release. Combined
+with v1.5.0.2's re-exec-refresh-at-end pattern, any future missing-
+file situation self-heals during the update that introduces the fix.
+
+---
+
 ## [1.5.0.3] — Unreleased
 
 Cosmetic fix for `sudo droneaware status` on dual-adapter nodes.
