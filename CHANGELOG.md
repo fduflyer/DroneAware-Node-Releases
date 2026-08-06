@@ -127,6 +127,10 @@ continue/cancel prompt. Silent on `0x0`, and skipped entirely where
   helper guarding every start/restart in both mode-switch functions;
   split units added to the `cmd_update` stop list; mode-aware feeder
   restart in `cmd_install_webui`.
+- `.github/workflows/release.yaml`, `.github/workflows/build.yaml` — new
+  `prerelease` input, so a validation build can be published and tested on
+  real hardware without becoming the `Latest` release that the install
+  snippet resolves to.
 - `install.sh` — apt failure handling with explicit rollback; non-fatal
   bluetooth setup; split units added to the `download_binaries` stop list;
   `DRONEAWARE_NO_SERVICE_START=1` on the `__migrate` call; new

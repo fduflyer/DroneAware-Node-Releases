@@ -8,6 +8,14 @@ on:
       publish:
         default: false
         type: boolean
+      # v1.5.0.6: cut a validation build without touching the "Latest"
+      # pointer. GitHub auto-promotes the newest non-prerelease release to
+      # Latest, which is what the standard install snippet resolves to —
+      # so before this input existed, publishing a release candidate to
+      # test on real hardware immediately exposed it to every new operator.
+      prerelease:
+        default: false
+        type: boolean
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -71,6 +79,13 @@ jobs:
       - name: Create Release
         run: |
           [[ "$VERSION" =~ ^v ]] || VERSION="v$VERSION"
+          # A pre-release is never auto-promoted to "Latest", so the
+          # install snippet keeps resolving to the current stable release.
+          RELEASE_FLAGS=(--generate-notes)
+          if [[ "$PRERELEASE" == "true" ]]; then
+            RELEASE_FLAGS+=(--prerelease)
+            echo "Publishing ${VERSION} as a PRE-RELEASE — 'Latest' is unchanged."
+          fi
           gh release create "${VERSION}" "${DL_PATH}/ble_feeder" \
             "${DL_PATH}/wifi_feeder" \
             "${DL_PATH}/web_ui" \
@@ -83,10 +98,11 @@ jobs:
             droneaware-wifi-2g.service \
             droneaware-wifi-5g.service \
             droneaware-web.service \
-            --generate-notes
+            "${RELEASE_FLAGS[@]}"
         env:
           VERSION: ${{ inputs.version }}
           DL_PATH: ${{ steps.download.outputs.download-path }}
+          PRERELEASE: ${{ inputs.prerelease }}
           GH_TOKEN: ${{ github.token }}
       - name: Append SHA256 checksums to release notes
         # Lower-barrier verification path than `gh attestation verify` (which

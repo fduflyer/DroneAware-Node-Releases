@@ -10,6 +10,10 @@ on:
         default: true
         type: boolean
         description: Whether to publish the release on GitHub (defaults to true)
+      prerelease:
+        default: false
+        type: boolean
+        description: Mark as pre-release — does NOT become "Latest". Use for validation builds tested on real hardware before promoting.
 jobs:
   build-and-publish:
     uses: ./.github/workflows/build.yaml
@@ -21,3 +25,4 @@ jobs:
     with:
       version: ${{ inputs.version }}
       publish: ${{ inputs.publish }}
+      prerelease: ${{ inputs.prerelease }}
