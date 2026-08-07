@@ -105,6 +105,24 @@ this path was missed.
 Fix: the restart is mode-aware, routed through
 `_start_wifi_services_for_current_mode`.
 
+### `refresh` left a stopped feeder stopped
+
+The restart decision looked at enable-state, active-state of the *wrong*
+unit, and whether the adapter MACs had changed — but never at whether
+the desired feeder was actually running. A node whose config, enable
+flags and MACs were all correct but whose feeders were stopped (after a
+failed update, a manual stop, or a crash loop that exhausted its restart
+budget) got a `refresh` that reported success and changed nothing.
+
+That is the single most common reason an operator runs `refresh`, and it
+was the one case it did not handle. Pre-v1.5.0.6 had the same gap, so
+this is not a regression — but it defeats the documented purpose of the
+command.
+
+Fix: both mode-switch functions now treat "the units that should be
+running are not running" as a trigger, and say so in the output. Still a
+no-op when everything is already healthy.
+
 ### Re-running the installer left both adapter modes enabled
 
 `install_services` unconditionally runs `systemctl enable
@@ -187,7 +205,8 @@ continue/cancel prompt. Silent on `0x0`, and skipped entirely where
   helper guarding every start/restart in both mode-switch functions;
   split units added to the `cmd_update` stop list; mode-aware feeder
   restart in `cmd_install_webui`; enable-state enforcement in both
-  mode-switch functions; stable-release selection in `cmd_update`
+  mode-switch functions; not-running feeders started by `refresh`;
+  stable-release selection in `cmd_update`
   with `DRONEAWARE_ALLOW_PRERELEASE=1` opt-in.
 - `.github/workflows/release.yaml`, `.github/workflows/build.yaml` — new
   `prerelease` input, so a validation build can be published and tested on

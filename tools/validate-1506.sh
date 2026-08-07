@@ -148,11 +148,27 @@ stage_d() {
         bad "binary overwrite succeeds" "cp succeeds" "cp failed (ETXTBSY?)"
     fi
     rm -f /tmp/_wf_check
-    echo ""
-    note "restoring services..."
-    droneaware refresh > /dev/null 2>&1 || true
+
+    banner "refresh must bring the stopped feeders back"
+    echo "  A correctly-configured but stopped feeder is the most common"
+    echo "  reason an operator runs refresh. Before v1.5.0.6 nothing in the"
+    echo "  restart decision looked at whether the units were RUNNING, so"
+    echo "  refresh reported success and left them down."
+    droneaware refresh 2>&1 | sed 's/^/  /'
     systemctl start droneaware-ble 2>/dev/null || true
-    sleep 3
+    sleep 5
+
+    local m2 m5
+    m2=$(cfg WIFI_ADAPTER_2G_MAC); m5=$(cfg WIFI_ADAPTER_5G_MAC)
+    if [[ -n "$m2" && -n "$m5" ]]; then
+        want "droneaware-wifi-2g back up" "$(act droneaware-wifi-2g)" "active"
+        want "droneaware-wifi-5g back up" "$(act droneaware-wifi-5g)" "active"
+    else
+        want "droneaware-wifi back up" "$(act droneaware-wifi)" "active"
+    fi
+    want "droneaware-ble back up" "$(act droneaware-ble)" "active"
+
+    banner "final state"
     droneaware status 2>&1 | sed 's/^/  /'
 }
 

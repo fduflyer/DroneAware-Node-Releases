@@ -807,6 +807,17 @@ _switch_to_dual_adapter_mode() {
     if [[ "$prev_2g" != "$mac_2g" || "$prev_5g" != "$mac_5g" ]]; then
         macs_changed=1
     fi
+    # v1.5.0.6: also act when the desired units simply are not running.
+    # Config, enable-state and MACs can all be correct while the feeders
+    # are stopped — after a failed update, a manual stop, or a crash loop
+    # that exhausted its restart budget. Without this, `refresh` reported
+    # success and changed nothing, which defeats the whole reason
+    # operators are told to run it when a feeder is down.
+    local units_not_running=0
+    if ! systemctl is-active droneaware-wifi-2g.service >/dev/null 2>&1 \
+       || ! systemctl is-active droneaware-wifi-5g.service >/dev/null 2>&1; then
+        units_not_running=1
+    fi
 
     if [[ "$enable_state_wrong" == "1" ]]; then
         info "v1.5.0 unit topology → dual-adapter (2g=${mac_2g}, 5g=${mac_5g})"
@@ -818,11 +829,14 @@ _switch_to_dual_adapter_mode() {
     # One place decides whether the feeders need (re)starting, so the log
     # never claims an action that suppression skipped. `restart` covers
     # both cases — it starts a stopped unit.
-    if [[ "$enable_state_wrong" == "1" || "$wrong_unit_active" == "1" || "$macs_changed" == "1" ]]; then
+    if [[ "$enable_state_wrong" == "1" || "$wrong_unit_active" == "1" \
+       || "$macs_changed" == "1" || "$units_not_running" == "1" ]]; then
         systemctl stop droneaware-wifi 2>/dev/null || true
         if _service_start_suppressed; then
             info "v1.5.0.6: split units enabled — start deferred to reboot (install-time)"
         else
+            [[ "$units_not_running" == "1" ]] \
+                && info "v1.5.0.6: split unit(s) not running — starting"
             systemctl restart droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
         fi
     fi
@@ -884,6 +898,12 @@ _switch_to_single_adapter_mode() {
     fi
     local mac_changed=0
     [[ "$prev_mac" != "$mac" ]] && mac_changed=1
+    # v1.5.0.6: symmetric with dual mode — a correctly-configured but
+    # stopped feeder must be started by refresh.
+    local units_not_running=0
+    if ! systemctl is-active droneaware-wifi.service >/dev/null 2>&1; then
+        units_not_running=1
+    fi
 
     if [[ "$enable_state_wrong" == "1" ]]; then
         info "v1.5.0 unit topology → single-adapter (${mac})"
@@ -892,11 +912,14 @@ _switch_to_single_adapter_mode() {
         systemctl enable droneaware-wifi 2>/dev/null || true
     fi
 
-    if [[ "$enable_state_wrong" == "1" || "$wrong_unit_active" == "1" || "$mac_changed" == "1" ]]; then
+    if [[ "$enable_state_wrong" == "1" || "$wrong_unit_active" == "1" \
+       || "$mac_changed" == "1" || "$units_not_running" == "1" ]]; then
         systemctl stop droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
         if _service_start_suppressed; then
             info "v1.5.0.6: droneaware-wifi enabled — start deferred to reboot (install-time)"
         else
+            [[ "$units_not_running" == "1" ]] \
+                && info "v1.5.0.6: droneaware-wifi not running — starting"
             systemctl restart droneaware-wifi 2>/dev/null || true
         fi
     fi
