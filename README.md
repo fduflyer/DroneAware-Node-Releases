@@ -233,9 +233,13 @@ durations are configurable through `SNIFFLE_*_SECONDS`. One radio cannot hear
 all three profiles simultaneously, so repeated Remote ID broadcasts reduce but
 do not eliminate time-slicing misses.
 
-Only one process can own the Sonoff serial port. Local applications should use
-DroneAware's UDP output or HTTP API rather than opening the serial device a
-second time.
+Only one process can own the Sonoff serial port. This backend is for
+installations where DroneAware should own that port and perform the Sniffle
+capture itself; local consumers can then use DroneAware's UDP output or HTTP
+API. If an existing local collector already owns the Sonoff, do not enable
+`BLE_BACKEND=sniffle` and do not try to share or multiplex the bidirectional
+Sniffle serial connection. Keep the collector as the receiver owner and forward
+captured advertisements through a supported local-event input instead.
 
 ---
 
