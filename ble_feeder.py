@@ -1020,6 +1020,26 @@ class BLEFeeder:
             return self.sniffle.health()
         return get_ble_health(self.adapter)
 
+    async def _background_forwarder_loop(self) -> None:
+        """Flush queued events for backends that own their scan loop.
+
+        The HCI path performs this work inside its scanner loop. External
+        backends such as Sniffle await their own long-running capture loop, so
+        they need a separate task to preserve the same five-second upload
+        behavior without blocking advertisement processing.
+        """
+        while True:
+            try:
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                return
+
+            if self.forwarder.should_flush():
+                try:
+                    await asyncio.to_thread(self.forwarder._flush)
+                except Exception as e:
+                    log.warning(f"Forwarder flush task failed: {e}")
+
     async def _fault_loop(self, reason: str):
         """
         Degraded loop entered when the BLE adapter is unhealthy or absent.
@@ -1085,12 +1105,18 @@ class BLEFeeder:
                 "(coded, extended, and legacy BLE profiles)..."
             )
             heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            forwarder_task = asyncio.create_task(self._background_forwarder_loop())
             try:
                 await self.sniffle.run(self.on_sniffle_advertisement)
             finally:
                 heartbeat_task.cancel()
+                forwarder_task.cancel()
                 try:
                     await heartbeat_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                try:
+                    await forwarder_task
                 except (asyncio.CancelledError, Exception):
                     pass
             return
