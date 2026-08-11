@@ -221,7 +221,7 @@ for path in sorted(glob.glob("/sys/class/net/wlan*")):
                                  text=True, timeout=8).stdout
             b = set()
             for line in out.splitlines():
-                m = re.search(r"\*\s+(\d{4})\.\d+\s+MHz\s+\[\d+\]", line)
+                m = re.search(r"\*\s+(\d{4})(?:\.\d+)?\s+MHz\s+\[\d+\]", line)
                 if m:
                     f = int(m.group(1))
                     if 2400 <= f <= 2500: b.add("2.4")

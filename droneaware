@@ -588,7 +588,7 @@ def _link(p):
 def _bands(info):
     b = set()
     for line in info.splitlines():
-        m = re.search(r"\*\s+(\d{4})\.\d+\s+MHz\s+\[\d+\]", line)
+        m = re.search(r"\*\s+(\d{4})(?:\.\d+)?\s+MHz\s+\[\d+\]", line)
         if m:
             f = int(m.group(1))
             if 2400 <= f <= 2500: b.add("2.4")
