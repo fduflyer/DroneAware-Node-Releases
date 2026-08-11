@@ -266,6 +266,54 @@ captured advertisements through a supported local-event input instead.
 
 ---
 
+## Collector-owned local-event backend
+
+Set `BLE_BACKEND=external` when another local service owns the BLE receiver and
+DroneAware should only validate, decode, locally publish, and upload the
+advertisements it receives. DroneAware opens no radio in this mode. It listens
+only on a Unix socket, so the input is not exposed to the LAN or Internet.
+
+Configure `/opt/droneaware/config.env`:
+
+```bash
+BLE_BACKEND=external
+EXTERNAL_BLE_SOCKET=/run/droneaware/ble-input.sock
+EXTERNAL_BLE_SOCKET_MODE=0660
+EXTERNAL_BLE_SOCKET_GROUP=airwatch
+EXTERNAL_BLE_MAX_LINE_BYTES=8192
+```
+
+`EXTERNAL_BLE_SOCKET_GROUP` is optional. When set, it must name an existing
+local group whose members may write to the socket. Keep the default `0660` mode
+or use a more restrictive mode; do not make the socket world-writable.
+
+The producer connects to the socket and sends one JSON object per line. Each
+object uses protocol `version` 1 and contains the original FFFA service data,
+not a DroneAware-decoded record:
+
+```json
+{"version":1,"observed_at":"2026-08-11T19:42:03.123Z","receiver":"sonoff-sniffle","profile":"bt5-coded","source_mac":"AA:BB:CC:DD:EE:FF","rssi":-67,"channel":37,"tx_power":12,"service_uuid":"0000fffa-0000-1000-8000-00805f9b34fb","service_data_hex":"0d01000102030405060708090a0b0c0d0e0f101112131415161718"}
+```
+
+Required fields are `version`, `receiver`, `service_uuid`, and
+`service_data_hex`. `observed_at` is optional but, when present, must be an
+ISO-8601 timestamp with a UTC offset. The remaining receiver metadata is
+optional. DroneAware replies with one JSON line per event:
+
+```json
+{"accepted":true}
+```
+
+Invalid or unsupported events receive `{"accepted":false,"error":"..."}` and
+are not queued for upload. The producer should reconnect after either service
+restarts; the socket is recreated by `droneaware-ble`.
+
+This topology keeps receiver control and durable raw capture in the local
+collector while reusing DroneAware's normal authenticated batching, heartbeat,
+server upload, UDP output, and in-memory detection history.
+
+---
+
 ## Local / Offline Use
 
 Every detection is also broadcast as a JSON line over UDP to
@@ -533,6 +581,7 @@ your node, and update its location there. Node location is managed server-side.
 | `/usr/local/bin/ble_feeder` | BLE Remote ID feeder binary |
 | `/usr/local/bin/wifi_feeder` | WiFi Remote ID feeder binary |
 | `/usr/local/bin/droneaware-bt-select` | Boot-time Bluetooth adapter selector |
+| `external_backend.py` | Source: optional collector-owned Unix-socket BLE input |
 | External Sniffle `python_cli` directory | Optional Sonoff serial backend; path selected by `SNIFFLE_PYTHON` |
 | `/opt/droneaware/config.env` | Node configuration (ID, location, adapters) |
 | `/etc/droneaware/token` | Node credential (written at enrollment) |

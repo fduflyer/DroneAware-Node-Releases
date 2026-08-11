@@ -249,6 +249,23 @@ EOF
         info "Added Sniffle BLE backend options to config.env"
     fi
 
+    # Optional local-event backend. This is a separate migration so nodes that
+    # already received the Sniffle block also gain the external input options.
+    if ! grep -q '^EXTERNAL_BLE_SOCKET=' "$cfg"; then
+        [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+        cat >> "$cfg" <<'EOF'
+
+# ─── Collector-owned BLE input ───
+# external = accept validated FFFA service-data events from a local collector
+#            over a permission-restricted Unix socket.
+EXTERNAL_BLE_SOCKET=/run/droneaware/ble-input.sock
+EXTERNAL_BLE_SOCKET_MODE=0660
+EXTERNAL_BLE_SOCKET_GROUP=
+EXTERNAL_BLE_MAX_LINE_BYTES=8192
+EOF
+        info "Added external BLE input options to config.env"
+    fi
+
     # ─── WIFI_ADAPTER_MAC (added by droneaware update for v1.5.0+) ───
     # MAC-based adapter identification. WIFI_ADAPTER=wlanN is fragile:
     # kernel enumeration reshuffles wlanN assignments when USB ports get
@@ -1277,7 +1294,9 @@ if candidates:
     local ble_backend sniffle_serial
     ble_backend=$(_cfg_get "${INSTALL_DIR}/config.env" BLE_BACKEND hci)
     sniffle_serial=$(_cfg_get "${INSTALL_DIR}/config.env" SNIFFLE_SERIAL)
-    if [[ "$ble_backend" == "sniffle" && -e "$sniffle_serial" ]]; then
+    if [[ "$ble_backend" == "external" ]]; then
+        systemctl start droneaware-ble
+    elif [[ "$ble_backend" == "sniffle" && -e "$sniffle_serial" ]]; then
         systemctl start droneaware-ble
     elif [[ "$ble_backend" == "sniffle" ]]; then
         warn "Sniffle serial device not found (${sniffle_serial:-not configured}) — skipping droneaware-ble"

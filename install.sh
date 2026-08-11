@@ -941,6 +941,12 @@ SNIFFLE_EXTENDED_SECONDS=15
 SNIFFLE_LEGACY_SECONDS=15
 SNIFFLE_SERIAL_TIMEOUT=0.5
 SNIFFLE_SYNC_TIMEOUT=5
+# Optional collector-owned input. Set BLE_BACKEND=external to listen on this
+# local Unix socket instead of opening an HCI or Sniffle receiver.
+EXTERNAL_BLE_SOCKET=/run/droneaware/ble-input.sock
+EXTERNAL_BLE_SOCKET_MODE=0660
+EXTERNAL_BLE_SOCKET_GROUP=
+EXTERNAL_BLE_MAX_LINE_BYTES=8192
 WIFI_ADAPTER=${WIFI_ADAPTER}
 
 # ─── Location & GPS ───────────────────────────────────────────────────────
