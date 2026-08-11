@@ -279,7 +279,7 @@ Configure `/opt/droneaware/config.env`:
 BLE_BACKEND=external
 EXTERNAL_BLE_SOCKET=/run/droneaware/ble-input.sock
 EXTERNAL_BLE_SOCKET_MODE=0660
-EXTERNAL_BLE_SOCKET_GROUP=airwatch
+EXTERNAL_BLE_SOCKET_GROUP=rid-collector
 EXTERNAL_BLE_MAX_LINE_BYTES=8192
 ```
 
