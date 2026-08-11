@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 DroneAware BLE Feeder - Remote ID Capture Script
-Hardware: Raspberry Pi 4 + USB Bluetooth Adapter (Sena UD100 / CSR)
+Hardware: Raspberry Pi + Linux HCI Bluetooth adapter or external Sniffle radio
 
 Captures BLE Remote ID advertisements (ASTM F3411 / UUID 0xFFFA) and forwards
 raw payloads to the DroneAware server in 5-second batches.
@@ -32,6 +32,8 @@ from datetime import datetime, timezone
 from bleak import BleakScanner
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
+
+from sniffle_backend import SniffleBackend
 
 # -- Logging -------------------------------------------------------------------
 logging.basicConfig(
@@ -675,6 +677,9 @@ class LocalPublisher:
             "t":       event.get("timestamp") or event.get("observed_at"),
             "mac":     event.get("source_mac") or event.get("mac"),
             "radio":   event.get("radio"),
+            "receiver": event.get("adapter"),
+            "backend": event.get("backend"),
+            "profile": event.get("sniffle_profile"),
             "rssi":    event.get("rssi"),
             "channel": event.get("channel"),
             "type":    decoded.get("message_type"),
@@ -877,9 +882,17 @@ class BLEFeeder:
     def __init__(self, node_id: str, server_url: str, adapter: str = "hci0",
                  verbose: bool = False, batch_size: int = 200,
                  flush_interval: float = 5.0, token: str = "",
-                 wifi_adapter: str | None = None):
+                 wifi_adapter: str | None = None,
+                 backend: str = "hci",
+                 sniffle_options: dict | None = None):
         self.node_id      = node_id
-        self.adapter      = adapter
+        self.backend      = backend
+        self.sniffle      = (
+            SniffleBackend(**(sniffle_options or {}))
+            if backend == "sniffle"
+            else None
+        )
+        self.adapter      = self.sniffle.label if self.sniffle else adapter
         self.wifi_adapter = wifi_adapter
         self.verbose      = verbose
         self.token        = token
@@ -895,25 +908,26 @@ class BLEFeeder:
         self.restart_count           = _get_restart_count()
         self.max_lag_ms_this_interval = 0
 
-    def on_advertisement(self, device: BLEDevice, adv: AdvertisementData):
-        """Callback for every BLE advertisement containing UUID 0xFFFA service data."""
-        # Locate the FFFA service data entry
-        svc_data  = None
-        svc_uuid  = None
-        for uuid, data in adv.service_data.items():
-            if "fffa" in uuid.lower():
-                svc_data = data
-                svc_uuid = uuid
-                break
-
-        if svc_data is None:
-            return
-
-        rid_payload_hex, strategy = extract_rid_payload(svc_data)
+    def _handle_service_data(
+        self,
+        *,
+        source_mac: str | None,
+        source_name: str | None,
+        rssi: int | None,
+        channel: int | None,
+        tx_power: int | None,
+        service_uuid: str,
+        service_data: bytes,
+        extra: dict | None = None,
+    ) -> None:
+        """Normalize one Remote ID service payload from any BLE backend."""
+        rid_payload_hex, strategy = extract_rid_payload(service_data)
         if rid_payload_hex is None:
             log.warning(
-                f"Unrecognised service data from {device.address} "
-                f"({len(svc_data)} bytes: {svc_data.hex()}) — skipped"
+                "Unrecognised service data from %s (%d bytes: %s) — skipped",
+                source_mac or "unknown",
+                len(service_data),
+                service_data.hex(),
             )
             return
 
@@ -924,23 +938,30 @@ class BLEFeeder:
             "observed_at":          datetime.now(timezone.utc).isoformat(),
             "observed_monotonic":   time.monotonic(),
             "radio":                "ble",
-            "source_mac":           device.address,
-            "source_name":          device.name or None,
-            "rssi":                 adv.rssi,
-            "channel":              None,  # BLE adv channel (37/38/39) not exposed by bleak
-            "tx_power":             getattr(adv, "tx_power", None),
-            "service_uuid":         svc_uuid,
-            "service_data_hex":     svc_data.hex(),
-            "service_data_len":     len(svc_data),
+            "source_mac":           source_mac,
+            "source_name":          source_name,
+            "rssi":                 rssi,
+            "channel":              channel,
+            "tx_power":             tx_power,
+            "service_uuid":         service_uuid,
+            "service_data_hex":     service_data.hex(),
+            "service_data_len":     len(service_data),
             "rid_payload_hex":      rid_payload_hex,
             "rid_payload_strategy": strategy,
             "adapter":              self.adapter,
+            "backend":              self.backend,
         }
+        if extra:
+            event.update(extra)
 
         if self.verbose:
             log.info(
-                f"[BLE] MAC={device.address}  RSSI={adv.rssi}dBm  "
-                f"payload={rid_payload_hex[:16]}...  strategy={strategy}"
+                "[BLE:%s] MAC=%s  RSSI=%sdBm  payload=%s...  strategy=%s",
+                self.backend,
+                source_mac or "unknown",
+                rssi,
+                rid_payload_hex[:16],
+                strategy,
             )
 
         self.forwarder.add(event)
@@ -956,6 +977,48 @@ class BLEFeeder:
                 pub_event = dict(event)
                 pub_event["decoded"] = msg
                 self.publisher.publish(pub_event)
+
+    def on_advertisement(self, device: BLEDevice, adv: AdvertisementData):
+        """Callback for HCI advertisements containing UUID 0xFFFA data."""
+        # Locate the FFFA service data entry
+        svc_data  = None
+        svc_uuid  = None
+        for uuid, data in adv.service_data.items():
+            if "fffa" in uuid.lower():
+                svc_data = data
+                svc_uuid = uuid
+                break
+
+        if svc_data is None:
+            return
+
+        self._handle_service_data(
+            source_mac=device.address,
+            source_name=device.name or None,
+            rssi=adv.rssi,
+            channel=None,  # BLE adv channel (37/38/39) is not exposed by Bleak
+            tx_power=getattr(adv, "tx_power", None),
+            service_uuid=svc_uuid,
+            service_data=svc_data,
+        )
+
+    def on_sniffle_advertisement(self, capture: dict) -> None:
+        """Callback for advertisements decoded by the Sniffle backend."""
+        self._handle_service_data(
+            source_mac=capture.get("source_mac"),
+            source_name=None,
+            rssi=capture.get("rssi"),
+            channel=capture.get("channel"),
+            tx_power=capture.get("tx_power"),
+            service_uuid=REMOTE_ID_SERVICE_UUID,
+            service_data=capture["service_data"],
+            extra={"sniffle_profile": capture.get("profile")},
+        )
+
+    def _backend_health(self) -> tuple[bool, str]:
+        if self.sniffle is not None:
+            return self.sniffle.health()
+        return get_ble_health(self.adapter)
 
     async def _fault_loop(self, reason: str):
         """
@@ -1008,8 +1071,29 @@ class BLEFeeder:
                 log.warning(f"FAULT loop error: {e}")
 
     async def run(self):
-        log.info(f"DroneAware BLE Feeder - Node: {self.node_id}  Adapter: {self.adapter}")
+        log.info(
+            "DroneAware BLE Feeder - Node: %s  Backend: %s  Adapter: %s",
+            self.node_id,
+            self.backend,
+            self.adapter,
+        )
         _check_cli_freshness()
+
+        if self.sniffle is not None:
+            log.info(
+                "Scanning for Remote ID broadcasts with Sniffle "
+                "(coded, extended, and legacy BLE profiles)..."
+            )
+            heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            try:
+                await self.sniffle.run(self.on_sniffle_advertisement)
+            finally:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            return
 
         # Adapter not healthy at startup — try the standard recovery sequence
         # before declaring FAULT. Auto-heals the Pi onboard BT UART sync issue
@@ -1101,7 +1185,7 @@ class BLEFeeder:
                 cpu_temp        = get_cpu_temp()
                 cpu_pct         = get_cpu_percent()
                 load_1m, load_5m, load_15m = get_cpu_load()
-                ble_ok, ble_adp = get_ble_health(self.adapter)
+                ble_ok, ble_adp = self._backend_health()
                 temp_str    = f"{cpu_temp}°C" if cpu_temp is not None else "n/a"
                 cpu_pct_str = f"{cpu_pct:.1f}%" if cpu_pct is not None else "n/a"
                 load_str    = f"{load_1m:.2f}" if load_1m is not None else "n/a"
@@ -1200,6 +1284,11 @@ def main():
         help="DroneAware server base URL"
     )
     parser.add_argument(
+        "--backend", choices=("hci", "sniffle"),
+        default=os.environ.get("BLE_BACKEND", "hci").strip().lower() or "hci",
+        help="BLE capture backend: hci (Bleak/BlueZ) or sniffle (serial)"
+    )
+    parser.add_argument(
         "--adapter", default="hci0",
         help="HCI adapter to use for scanning (default: hci0)"
     )
@@ -1225,13 +1314,26 @@ def main():
     token        = resolve_token()
 
     adapter = args.adapter
-    if args.adapter_mac:
+    if args.backend == "hci" and args.adapter_mac:
         resolved = find_adapter_by_mac(args.adapter_mac)
         if resolved:
             log.info(f"Resolved adapter MAC {args.adapter_mac} -> {resolved}")
             adapter = resolved
         else:
             log.error(f"No adapter found with MAC {args.adapter_mac} — falling back to {adapter}")
+
+    sniffle_options = None
+    if args.backend == "sniffle":
+        sniffle_options = {
+            "python_path": os.environ.get("SNIFFLE_PYTHON", ""),
+            "serial_port": os.environ.get("SNIFFLE_SERIAL", ""),
+            "baudrate": int(os.environ.get("SNIFFLE_BAUD", "2000000")),
+            "channel": int(os.environ.get("SNIFFLE_CHANNEL", "37")),
+            "coded_seconds": float(os.environ.get("SNIFFLE_CODED_SECONDS", "30")),
+            "extended_seconds": float(os.environ.get("SNIFFLE_EXTENDED_SECONDS", "15")),
+            "legacy_seconds": float(os.environ.get("SNIFFLE_LEGACY_SECONDS", "15")),
+            "serial_timeout": float(os.environ.get("SNIFFLE_SERIAL_TIMEOUT", "0.5")),
+        }
 
     feeder = BLEFeeder(
         node_id=args.node_id,
@@ -1242,6 +1344,8 @@ def main():
         flush_interval=args.flush_interval,
         token=token,
         wifi_adapter=wifi_adapter,
+        backend=args.backend,
+        sniffle_options=sniffle_options,
     )
 
     try:

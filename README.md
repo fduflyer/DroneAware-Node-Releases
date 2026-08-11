@@ -38,6 +38,7 @@ Once connected, you'll also get real-time email alerts anytime your node(s) dete
 | Raspberry Pi 4 (1 GB or more) | 2 GB+ recommended if running other software |
 | MicroSD card (16 GB+, Class 10) | Samsung Endurance or SanDisk High Endurance preferred |
 | USB Bluetooth adapter | **Sena UD100** (newer variants with Bluetooth 4.0+ only) or any CSR/Cambridge Silicon Radio USB dongle. **Older UD100 variants (G01, G02, G03 and similar) are Bluetooth Classic (BT 2.0/2.1) only and will not work.** If unsure which version you have, the Pi's built-in Bluetooth works out of the box at shorter range. |
+| Optional Sniffle receiver | A **Sonoff ZBDongle-P** flashed with Sniffle can replace the HCI Bluetooth adapter. Sniffle is installed separately; see [Sonoff/Sniffle backend](#sonoffsniffle-backend). |
 | WiFi adapter (required) | **Alfa AWUS036N** (Ralink RT3070 chipset, 2.4 GHz) |
 | 5V/3A USB-C power supply | Official Raspberry Pi PSU recommended |
 | Ethernet cable or WiFi credentials | For initial setup |
@@ -60,7 +61,8 @@ DroneAware nodes run two background services that continuously scan for drone
 Remote ID broadcasts:
 
 **BLE Feeder (`droneaware-ble`)**
-Listens for Bluetooth Low Energy advertisements carrying Remote ID service data
+Listens through either a Linux HCI controller (BlueZ/Bleak) or an optional
+Sniffle serial radio for Bluetooth Low Energy advertisements carrying Remote ID service data
 (UUID 0xFFFA, ASTM F3411). When a drone broadcast is detected, the raw 25-byte
 ODID message is decoded locally (drone ID, position, speed, operator location)
 and forwarded to the DroneAware server in batches.
@@ -198,6 +200,42 @@ sudo systemctl start droneaware-ble droneaware-wifi
 # To upgrade an existing node
 sudo droneaware update
 ```
+
+---
+
+## Sonoff/Sniffle backend
+
+The Sonoff ZBDongle-P is not a Linux Bluetooth controller and therefore never
+appears as `hciN`. DroneAware can instead read it through Sniffle's serial
+protocol. Sniffle remains a separate GPL-licensed project and is not bundled in
+DroneAware's binary or installer.
+
+1. Flash the Sonoff with the correct Sniffle firmware variant by following the
+   [Sniffle firmware instructions](https://github.com/nccgroup/Sniffle#firmware-installation-sonoff-usb-dongle).
+2. Install Sniffle separately, for example under `/opt/sniffle`, and confirm its
+   `python_cli/sniffle` package is present.
+3. Edit `/opt/droneaware/config.env`:
+
+   ```bash
+   BLE_BACKEND=sniffle
+   SNIFFLE_PYTHON=/opt/sniffle/python_cli
+   SNIFFLE_SERIAL=/dev/serial/by-id/usb-ITead_Sonoff_Zigbee_3.0_USB_Dongle_Plus_YOUR_SERIAL-if00-port0
+   SNIFFLE_BAUD=2000000
+   ```
+
+   Some older Sonoff units use a CP2102 bridge limited to 921600 baud and need
+   both Sniffle's `_1M` firmware variant and `SNIFFLE_BAUD=921600`.
+4. Restart the feeder with `sudo systemctl restart droneaware-bt-select droneaware-ble`.
+
+The default schedule listens for coded PHY for 30 seconds, extended
+advertisements for 15 seconds, and legacy advertisements for 15 seconds. These
+durations are configurable through `SNIFFLE_*_SECONDS`. One radio cannot hear
+all three profiles simultaneously, so repeated Remote ID broadcasts reduce but
+do not eliminate time-slicing misses.
+
+Only one process can own the Sonoff serial port. Local applications should use
+DroneAware's UDP output or HTTP API rather than opening the serial device a
+second time.
 
 ---
 
@@ -446,6 +484,9 @@ Common causes:
   sees it; unplug and replug the dongle if not
 - Adapter MAC in `config.env` doesn't match the installed adapter — update
   `BLE_ADAPTER_MAC` in `/opt/droneaware/config.env` and restart
+- In Sniffle mode, `SNIFFLE_SERIAL` does not resolve to the connected Sonoff,
+  `SNIFFLE_PYTHON` does not contain the Sniffle package, or the configured baud
+  does not match the firmware variant
 
 **"No internet connection" during install**
 - Ethernet: check the cable and that your router assigned an IP
@@ -465,6 +506,7 @@ your node, and update its location there. Node location is managed server-side.
 | `/usr/local/bin/ble_feeder` | BLE Remote ID feeder binary |
 | `/usr/local/bin/wifi_feeder` | WiFi Remote ID feeder binary |
 | `/usr/local/bin/droneaware-bt-select` | Boot-time Bluetooth adapter selector |
+| External Sniffle `python_cli` directory | Optional Sonoff serial backend; path selected by `SNIFFLE_PYTHON` |
 | `/opt/droneaware/config.env` | Node configuration (ID, location, adapters) |
 | `/etc/droneaware/token` | Node credential (written at enrollment) |
 | `/etc/systemd/system/droneaware-ble.service` | BLE feeder systemd unit |

@@ -13,6 +13,14 @@ OVERLAY="dtoverlay=disable-bt"
 log()  { echo "$*"; }
 fatal(){ log "FATAL: $1"; exit 1; }
 
+# Sniffle adapters are serial radios, not Linux HCI controllers. Leave the
+# onboard controller state alone when the feeder is explicitly using Sniffle.
+BLE_BACKEND=$(sed -n 's/^BLE_BACKEND=//p' "$DA_CONFIG" 2>/dev/null | tail -1)
+if [[ "$BLE_BACKEND" == "sniffle" ]]; then
+    log "BLE_BACKEND=sniffle; skipping HCI adapter selection."
+    exit 0
+fi
+
 # ---------------------------------------------------------------------------
 # 1. Detect USB BT adapter
 #    A USB-connected hci device has its subsystem symlink pointing into /usb
