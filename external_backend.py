@@ -30,6 +30,21 @@ class ExternalEventError(ValueError):
     """Raised when a local producer sends an invalid event."""
 
 
+def _as_int(name: str, value: object, base: int = 10) -> int:
+    """Coerce one config value, naming the setting when it is unusable.
+
+    main() passes raw config.env strings so that every BLE_INPUT setting that
+    fails to parse surfaces from here as a ValueError the feeder can report as
+    a FAULT reason, rather than as an int() traceback before startup.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    try:
+        return int(str(value).strip(), base)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} is not a valid value: {value!r}") from None
+
+
 def _optional_string(payload: dict, key: str, max_length: int) -> str | None:
     value = payload.get(key)
     if value is None:
@@ -135,6 +150,9 @@ class ExternalBackend:
         socket_group: str = "",
         max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
     ) -> None:
+        socket_path = (str(socket_path).strip() or DEFAULT_SOCKET_PATH)
+        socket_mode = _as_int("EXTERNAL_BLE_SOCKET_MODE", socket_mode, 8)
+        max_line_bytes = _as_int("EXTERNAL_BLE_MAX_LINE_BYTES", max_line_bytes)
         path = Path(socket_path)
         if not path.is_absolute():
             raise ValueError("external BLE socket path must be absolute")
@@ -246,11 +264,20 @@ class ExternalBackend:
         self._remove_stale_socket()
 
         try:
-            self._server = await asyncio.start_unix_server(
-                lambda reader, writer: self._handle_client(reader, writer, callback),
-                path=self.socket_path,
-                limit=self.max_line_bytes + 1,
-            )
+            # start_unix_server() binds with the process umask, so between the
+            # bind and the chmod below the socket carries 0777 & ~umask. Under
+            # a permissive umask that is a window in which any local user can
+            # connect and inject events. Bind private, then widen to the
+            # configured mode.
+            previous_umask = os.umask(0o077)
+            try:
+                self._server = await asyncio.start_unix_server(
+                    lambda reader, writer: self._handle_client(reader, writer, callback),
+                    path=self.socket_path,
+                    limit=self.max_line_bytes + 1,
+                )
+            finally:
+                os.umask(previous_umask)
             self._apply_permissions()
             self.healthy = True
             log.info(

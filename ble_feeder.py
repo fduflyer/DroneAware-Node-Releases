@@ -1080,6 +1080,34 @@ class BLEFeeder:
                 except Exception as e:
                     log.warning(f"Forwarder flush task failed: {e}")
 
+    async def _run_owned_backend(self, start) -> str | None:
+        """Run a backend that owns its own loop, with the support tasks.
+
+        Returns a FAULT reason, or None when the loop exits cleanly. This
+        keeps the HCI contract for every backend: a dead receiver degrades
+        the node, it does not silence it. Letting the exception escape would
+        exit the process, systemd would restart it every 10s, and the server
+        would see no heartbeat at all rather than ble_ok=False with a reason.
+        """
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        forwarder_task = asyncio.create_task(self._background_forwarder_loop())
+        fault = None
+        try:
+            await start()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            fault = f"{type(e).__name__}: {e}"
+            log.error("%s capture loop failed: %s", self.backend, fault)
+        finally:
+            for task in (heartbeat_task, forwarder_task):
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        return fault
+
     async def _fault_loop(self, reason: str):
         """
         Degraded loop entered when the BLE adapter is unhealthy or absent.
@@ -1139,14 +1167,19 @@ class BLEFeeder:
         )
         _check_cli_freshness()
 
-        if self.backend not in ("hci", "sniffle"):
+        if self.backend not in ("hci", "sniffle", "external"):
             await self._fault_loop(
-                f"unknown BLE backend '{self.backend}' (expected hci or sniffle)"
+                f"unknown BLE backend '{self.backend}' "
+                "(expected hci, sniffle, or external)"
             )
             return
 
-        if self.backend == "sniffle" and self.sniffle is None:
-            await self._fault_loop(f"Sniffle backend misconfigured: {self.sniffle_error}")
+        # Without this the feeder would fall through to the HCI path and
+        # silently scan hci0 while config.env asked for a different receiver.
+        if self.backend in ("sniffle", "external") and self.backend_error is not None:
+            await self._fault_loop(
+                f"{self.backend} backend misconfigured: {self.backend_error}"
+            )
             return
 
         if self.sniffle is not None:
@@ -1156,33 +1189,11 @@ class BLEFeeder:
                 self.sniffle.profile_mode,
                 plan,
             )
-            heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-            forwarder_task = asyncio.create_task(self._background_forwarder_loop())
-            sniffle_fault = None
-            try:
-                await self.sniffle.run(self.on_sniffle_advertisement)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                # Matches the HCI contract: a dead radio degrades the node, it
-                # does not silence it. Without this the process exits, systemd
-                # restarts it every 10s, and the server sees no heartbeat at
-                # all rather than ble_ok=False with a reason.
-                sniffle_fault = f"{type(e).__name__}: {e}"
-                log.error("Sniffle capture loop failed: %s", sniffle_fault)
-            finally:
-                heartbeat_task.cancel()
-                forwarder_task.cancel()
-                try:
-                    await heartbeat_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-                try:
-                    await forwarder_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            if sniffle_fault is not None:
-                await self._fault_loop(sniffle_fault)
+            fault = await self._run_owned_backend(
+                lambda: self.sniffle.run(self.on_sniffle_advertisement)
+            )
+            if fault is not None:
+                await self._fault_loop(fault)
             return
 
         if self.external is not None:
@@ -1190,21 +1201,11 @@ class BLEFeeder:
                 "Waiting for collector-owned Remote ID advertisements on %s...",
                 self.external.socket_path,
             )
-            heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-            forwarder_task = asyncio.create_task(self._background_forwarder_loop())
-            try:
-                await self.external.run(self.on_external_advertisement)
-            finally:
-                heartbeat_task.cancel()
-                forwarder_task.cancel()
-                try:
-                    await heartbeat_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-                try:
-                    await forwarder_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            fault = await self._run_owned_backend(
+                lambda: self.external.run(self.on_external_advertisement)
+            )
+            if fault is not None:
+                await self._fault_loop(fault)
             return
 
         # Adapter not healthy at startup — try the standard recovery sequence
@@ -1468,14 +1469,15 @@ def main():
 
     external_options = None
     if args.backend == "external":
+        # Raw strings on purpose, as with SNIFFLE_* above: ExternalBackend
+        # coerces and validates them so a bad value in config.env becomes one
+        # FAULT reason instead of an int() traceback out of main().
         external_options = {
-            "socket_path": os.environ.get(
-                "EXTERNAL_BLE_SOCKET",
-                "/run/droneaware/ble-input.sock",
-            ),
-            "socket_mode": int(os.environ.get("EXTERNAL_BLE_SOCKET_MODE", "0660"), 8),
+            "socket_path": os.environ.get("EXTERNAL_BLE_SOCKET")
+            or "/run/droneaware/ble-input.sock",
+            "socket_mode": os.environ.get("EXTERNAL_BLE_SOCKET_MODE") or "0660",
             "socket_group": os.environ.get("EXTERNAL_BLE_SOCKET_GROUP", ""),
-            "max_line_bytes": int(os.environ.get("EXTERNAL_BLE_MAX_LINE_BYTES", "8192")),
+            "max_line_bytes": os.environ.get("EXTERNAL_BLE_MAX_LINE_BYTES") or "8192",
         }
 
     feeder = BLEFeeder(

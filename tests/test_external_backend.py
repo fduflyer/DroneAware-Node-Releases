@@ -11,7 +11,12 @@ import tempfile
 import unittest
 from contextlib import suppress
 
-from external_backend import ExternalBackend, ExternalEventError, parse_external_event
+from external_backend import (
+    DEFAULT_SOCKET_PATH,
+    ExternalBackend,
+    ExternalEventError,
+    parse_external_event,
+)
 
 
 def valid_event() -> dict:
@@ -149,6 +154,28 @@ class ExternalBackendSafetyTests(unittest.IsolatedAsyncioTestCase):
                 await backend.run(lambda capture: True)
             with open(socket_path, encoding="utf-8") as placeholder:
                 self.assertEqual(placeholder.read(), "do not replace")
+
+
+class ExternalBackendConfigTests(unittest.TestCase):
+    def test_parses_octal_mode_from_config_env(self) -> None:
+        backend = ExternalBackend(socket_path="/run/x.sock", socket_mode="0640")
+        self.assertEqual(backend.socket_mode, 0o640)
+
+    def test_parses_max_line_bytes_from_config_env(self) -> None:
+        backend = ExternalBackend(socket_path="/run/x.sock", max_line_bytes="4096")
+        self.assertEqual(backend.max_line_bytes, 4096)
+
+    def test_names_the_setting_behind_an_unparseable_value(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            ExternalBackend(socket_path="/run/x.sock", socket_mode="rw-rw----")
+        self.assertIn("EXTERNAL_BLE_SOCKET_MODE", str(ctx.exception))
+
+    def test_empty_socket_path_falls_back_to_the_default(self) -> None:
+        self.assertEqual(ExternalBackend(socket_path="").socket_path, DEFAULT_SOCKET_PATH)
+
+    def test_rejects_relative_socket_path(self) -> None:
+        with self.assertRaises(ValueError):
+            ExternalBackend(socket_path="ble-input.sock")
 
 
 if __name__ == "__main__":
