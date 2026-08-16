@@ -13,6 +13,14 @@ OVERLAY="dtoverlay=disable-bt"
 log()  { echo "$*"; }
 fatal(){ log "FATAL: $1"; exit 1; }
 
+# Sniffle and external inputs do not use a Linux HCI controller. Leave the
+# onboard controller state alone when either backend is selected.
+BLE_BACKEND=$(sed -n 's/^BLE_BACKEND=//p' "$DA_CONFIG" 2>/dev/null | tail -1)
+if [[ "$BLE_BACKEND" == "sniffle" || "$BLE_BACKEND" == "external" ]]; then
+    log "BLE_BACKEND=${BLE_BACKEND}; skipping HCI adapter selection."
+    exit 0
+fi
+
 # ---------------------------------------------------------------------------
 # 1. Detect USB BT adapter
 #    A USB-connected hci device has its subsystem symlink pointing into /usb
