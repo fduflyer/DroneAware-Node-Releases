@@ -927,8 +927,20 @@ write_config() {
 
     cat > "${INSTALL_DIR}/config.env" <<EOF
 # ─── Hardware adapters ────────────────────────────────────────────────────
+BLE_BACKEND=hci
 BLE_ADAPTER=${BLE_ADAPTER}
 BLE_ADAPTER_MAC=${BLE_ADAPTER_MAC}
+# Optional Sniffle serial backend. See README before changing BLE_BACKEND.
+SNIFFLE_PYTHON=
+SNIFFLE_SERIAL=
+SNIFFLE_BAUD=2000000
+SNIFFLE_CHANNEL=37
+SNIFFLE_PROFILE_MODE=rotate
+SNIFFLE_CODED_SECONDS=30
+SNIFFLE_EXTENDED_SECONDS=15
+SNIFFLE_LEGACY_SECONDS=15
+SNIFFLE_SERIAL_TIMEOUT=0.5
+SNIFFLE_SYNC_TIMEOUT=5
 WIFI_ADAPTER=${WIFI_ADAPTER}
 
 # ─── Location & GPS ───────────────────────────────────────────────────────

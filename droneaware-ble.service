@@ -12,6 +12,7 @@ ExecStartPre=/usr/sbin/rfkill unblock bluetooth
 ExecStart=/opt/droneaware/ble_feeder \
     --node-id ${NODE_ID} \
     --server ${SERVER_URL} \
+    --backend ${BLE_BACKEND} \
     --adapter ${BLE_ADAPTER} \
     --adapter-mac ${BLE_ADAPTER_MAC} \
     --batch-size ${BATCH_SIZE} \

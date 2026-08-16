@@ -221,6 +221,34 @@ EOF
         info "Added v1.4.6 dual-band dwell time options to config.env"
     fi
 
+    # Optional Sniffle serial backend. Existing nodes stay on HCI unless an
+    # operator explicitly changes BLE_BACKEND after installing Sniffle.
+    if ! grep -q '^BLE_BACKEND=' "$cfg"; then
+        [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+        cat >> "$cfg" <<'EOF'
+
+# ─── BLE capture backend (Sniffle support) ───
+# hci     = BlueZ/Bleak with a Linux hciN controller (default)
+# sniffle = Sniffle firmware over a serial device. Sniffle is installed
+#           separately and is not bundled with DroneAware.
+BLE_BACKEND=hci
+SNIFFLE_PYTHON=
+SNIFFLE_SERIAL=
+SNIFFLE_BAUD=2000000
+SNIFFLE_CHANNEL=37
+# rotate = cycle coded/extended/legacy; coded-only = dedicate the radio
+# to the coded PHY (no coded blind window, no extended/legacy from this
+# receiver). See README.
+SNIFFLE_PROFILE_MODE=rotate
+SNIFFLE_CODED_SECONDS=30
+SNIFFLE_EXTENDED_SECONDS=15
+SNIFFLE_LEGACY_SECONDS=15
+SNIFFLE_SERIAL_TIMEOUT=0.5
+SNIFFLE_SYNC_TIMEOUT=5
+EOF
+        info "Added Sniffle BLE backend options to config.env"
+    fi
+
     # ─── WIFI_ADAPTER_MAC (added by droneaware update for v1.5.0+) ───
     # MAC-based adapter identification. WIFI_ADAPTER=wlanN is fragile:
     # kernel enumeration reshuffles wlanN assignments when USB ports get
@@ -1246,7 +1274,14 @@ if candidates:
     # node in a broken state (wrong service active, mode-detect thinks it's
     # already correct). Query config to decide which unit(s) to start.
     _start_wifi_services_for_current_mode
-    if hciconfig 2>/dev/null | grep -q "hci"; then
+    local ble_backend sniffle_serial
+    ble_backend=$(_cfg_get "${INSTALL_DIR}/config.env" BLE_BACKEND hci)
+    sniffle_serial=$(_cfg_get "${INSTALL_DIR}/config.env" SNIFFLE_SERIAL)
+    if [[ "$ble_backend" == "sniffle" && -e "$sniffle_serial" ]]; then
+        systemctl start droneaware-ble
+    elif [[ "$ble_backend" == "sniffle" ]]; then
+        warn "Sniffle serial device not found (${sniffle_serial:-not configured}) — skipping droneaware-ble"
+    elif hciconfig 2>/dev/null | grep -q "hci"; then
         systemctl start droneaware-ble
     else
         warn "No Bluetooth adapter detected — skipping droneaware-ble"
