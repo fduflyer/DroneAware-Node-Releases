@@ -236,10 +236,15 @@ SNIFFLE_PYTHON=
 SNIFFLE_SERIAL=
 SNIFFLE_BAUD=2000000
 SNIFFLE_CHANNEL=37
+# rotate = cycle coded/extended/legacy; coded-only = dedicate the radio
+# to the coded PHY (no coded blind window, no extended/legacy from this
+# receiver). See README.
+SNIFFLE_PROFILE_MODE=rotate
 SNIFFLE_CODED_SECONDS=30
 SNIFFLE_EXTENDED_SECONDS=15
 SNIFFLE_LEGACY_SECONDS=15
 SNIFFLE_SERIAL_TIMEOUT=0.5
+SNIFFLE_SYNC_TIMEOUT=5
 EOF
         info "Added Sniffle BLE backend options to config.env"
     fi

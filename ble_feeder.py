@@ -887,11 +887,17 @@ class BLEFeeder:
                  sniffle_options: dict | None = None):
         self.node_id      = node_id
         self.backend      = backend
-        self.sniffle      = (
-            SniffleBackend(**(sniffle_options or {}))
-            if backend == "sniffle"
-            else None
-        )
+        # Construction is deliberately not allowed to raise out of __init__.
+        # main() builds the feeder before asyncio.run(), so a bad SNIFFLE_*
+        # value would otherwise kill the process before the FAULT loop can
+        # start, and the node would go silent instead of reporting degraded.
+        self.sniffle      = None
+        self.sniffle_error: str | None = None
+        if backend == "sniffle":
+            try:
+                self.sniffle = SniffleBackend(**(sniffle_options or {}))
+            except Exception as e:
+                self.sniffle_error = str(e)
         self.adapter      = self.sniffle.label if self.sniffle else adapter
         self.wifi_adapter = wifi_adapter
         self.verbose      = verbose
@@ -1099,15 +1105,37 @@ class BLEFeeder:
         )
         _check_cli_freshness()
 
+        if self.backend not in ("hci", "sniffle"):
+            await self._fault_loop(
+                f"unknown BLE backend '{self.backend}' (expected hci or sniffle)"
+            )
+            return
+
+        if self.backend == "sniffle" and self.sniffle is None:
+            await self._fault_loop(f"Sniffle backend misconfigured: {self.sniffle_error}")
+            return
+
         if self.sniffle is not None:
+            plan = ", ".join(name for name, _ext, _cod, _dwell in self.sniffle.profiles)
             log.info(
-                "Scanning for Remote ID broadcasts with Sniffle "
-                "(coded, extended, and legacy BLE profiles)..."
+                "Scanning for Remote ID broadcasts with Sniffle (mode=%s, profiles: %s)...",
+                self.sniffle.profile_mode,
+                plan,
             )
             heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             forwarder_task = asyncio.create_task(self._background_forwarder_loop())
+            sniffle_fault = None
             try:
                 await self.sniffle.run(self.on_sniffle_advertisement)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Matches the HCI contract: a dead radio degrades the node, it
+                # does not silence it. Without this the process exits, systemd
+                # restarts it every 10s, and the server sees no heartbeat at
+                # all rather than ble_ok=False with a reason.
+                sniffle_fault = f"{type(e).__name__}: {e}"
+                log.error("Sniffle capture loop failed: %s", sniffle_fault)
             finally:
                 heartbeat_task.cancel()
                 forwarder_task.cancel()
@@ -1119,6 +1147,8 @@ class BLEFeeder:
                     await forwarder_task
                 except (asyncio.CancelledError, Exception):
                     pass
+            if sniffle_fault is not None:
+                await self._fault_loop(sniffle_fault)
             return
 
         # Adapter not healthy at startup — try the standard recovery sequence
@@ -1310,7 +1340,15 @@ def main():
         help="DroneAware server base URL"
     )
     parser.add_argument(
-        "--backend", choices=("hci", "sniffle"),
+        # No argparse choices= here on purpose. The unit file passes
+        # --backend ${BLE_BACKEND}, and systemd expands an unset variable to
+        # an empty argument, which choices= rejects with exit code 2. Every
+        # node installed before BLE_BACKEND existed in config.env is in that
+        # state until the config migration runs, so a strict choices= would
+        # take the BLE feeder down on upgrade. Empty means "not configured"
+        # and falls back to the default, matching how --adapter-mac already
+        # tolerates an unset ${BLE_ADAPTER_MAC}.
+        "--backend",
         default=os.environ.get("BLE_BACKEND", "hci").strip().lower() or "hci",
         help="BLE capture backend: hci (Bleak/BlueZ) or sniffle (serial)"
     )
@@ -1336,6 +1374,12 @@ def main():
     )
     args = parser.parse_args()
 
+    # An empty --backend means the unit passed an unset ${BLE_BACKEND}; treat
+    # that as "not configured" rather than as an error. An unrecognised value
+    # is a real operator mistake and is carried through to the FAULT loop, so
+    # the node reports ble_ok=False with the reason instead of exiting.
+    args.backend = (args.backend or "").strip().lower() or "hci"
+
     wifi_adapter = os.environ.get("WIFI_ADAPTER") or None
     token        = resolve_token()
 
@@ -1350,15 +1394,20 @@ def main():
 
     sniffle_options = None
     if args.backend == "sniffle":
+        # Raw strings on purpose: SniffleBackend coerces and validates them so
+        # a bad value in config.env becomes one FAULT reason instead of an
+        # int()/float() traceback out of main().
         sniffle_options = {
             "python_path": os.environ.get("SNIFFLE_PYTHON", ""),
             "serial_port": os.environ.get("SNIFFLE_SERIAL", ""),
-            "baudrate": int(os.environ.get("SNIFFLE_BAUD", "2000000")),
-            "channel": int(os.environ.get("SNIFFLE_CHANNEL", "37")),
-            "coded_seconds": float(os.environ.get("SNIFFLE_CODED_SECONDS", "30")),
-            "extended_seconds": float(os.environ.get("SNIFFLE_EXTENDED_SECONDS", "15")),
-            "legacy_seconds": float(os.environ.get("SNIFFLE_LEGACY_SECONDS", "15")),
-            "serial_timeout": float(os.environ.get("SNIFFLE_SERIAL_TIMEOUT", "0.5")),
+            "baudrate": os.environ.get("SNIFFLE_BAUD") or "2000000",
+            "channel": os.environ.get("SNIFFLE_CHANNEL") or "37",
+            "profile_mode": os.environ.get("SNIFFLE_PROFILE_MODE") or "rotate",
+            "coded_seconds": os.environ.get("SNIFFLE_CODED_SECONDS") or "30",
+            "extended_seconds": os.environ.get("SNIFFLE_EXTENDED_SECONDS") or "15",
+            "legacy_seconds": os.environ.get("SNIFFLE_LEGACY_SECONDS") or "15",
+            "serial_timeout": os.environ.get("SNIFFLE_SERIAL_TIMEOUT") or "0.5",
+            "sync_timeout": os.environ.get("SNIFFLE_SYNC_TIMEOUT") or "5",
         }
 
     feeder = BLEFeeder(

@@ -227,11 +227,34 @@ DroneAware's binary or installer.
    both Sniffle's `_1M` firmware variant and `SNIFFLE_BAUD=921600`.
 4. Restart the feeder with `sudo systemctl restart droneaware-bt-select droneaware-ble`.
 
-The default schedule listens for coded PHY for 30 seconds, extended
-advertisements for 15 seconds, and legacy advertisements for 15 seconds. These
-durations are configurable through `SNIFFLE_*_SECONDS`. One radio cannot hear
-all three profiles simultaneously, so repeated Remote ID broadcasts reduce but
-do not eliminate time-slicing misses.
+### Profile mode
+
+One radio cannot hear coded, extended, and legacy advertisements at the same
+time, so `SNIFFLE_PROFILE_MODE` decides how the single Sonoff is spent.
+
+`rotate` (default) listens for coded PHY for 30 seconds, extended
+advertisements for 15 seconds, and legacy advertisements for 15 seconds, each
+configurable through `SNIFFLE_*_SECONDS`. Repeated Remote ID broadcasts reduce
+but do not eliminate time-slicing misses.
+
+`coded-only` dedicates the radio to the coded PHY continuously. Rotation leaves
+coded unwatched for the whole extended plus legacy dwell, which is a
+deterministic blind window rather than a probabilistic miss, and some coded-PHY
+airframes are only ever heard there. Dedicating the Sonoff closes that window
+and gives up this receiver's coverage of the other two profiles, which is a
+good trade when an `hciN` controller is present alongside it to cover ordinary
+BLE. Set it with:
+
+```bash
+SNIFFLE_PROFILE_MODE=coded-only
+```
+
+At startup, and on every rotation profile change, the backend sends a unique
+marker and then reads only complete records until that marker returns, bounded
+by `SNIFFLE_SYNC_TIMEOUT` (default 5s). This drains advertisements captured
+under the previous profile without clearing the UART mid-record, and a marker
+that never arrives fails the capture loop rather than leaving a receiver that
+looks active but is frozen.
 
 Only one process can own the Sonoff serial port. This backend is for
 installations where DroneAware should own that port and perform the Sniffle

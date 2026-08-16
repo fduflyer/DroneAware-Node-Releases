@@ -9,7 +9,10 @@ directory, which keeps the projects and their licenses separate.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import logging
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -79,8 +82,94 @@ def extract_sniffle_advertisement(
     }
 
 
+def _as_number(name: str, value: Any, cast: Callable[[Any], Any]) -> Any:
+    """Coerce one config value, naming the setting when it is unusable.
+
+    Callers pass raw config.env strings so that every SNIFFLE_* validation
+    failure surfaces from one place as a ValueError the feeder can report as a
+    FAULT reason, rather than as an argparse or int() traceback at startup.
+    """
+    try:
+        return cast(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} is not a valid number: {value!r}") from None
+
+
+def _decode_complete_line(line: bytes) -> bytes | None:
+    """Decode one complete Sniffle record without trusting an unframed header."""
+    if not line.endswith(b"\r\n"):
+        return None
+    encoded = line[:-2]
+    if not encoded or len(encoded) % 4:
+        return None
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(decoded) < 2 or decoded[0] * 4 != len(encoded):
+        return None
+    return decoded
+
+
+def synchronize_hardware(
+    hardware: Any,
+    timeout_seconds: float,
+    *,
+    marker_factory: Callable[[int], bytes] = secrets.token_bytes,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Discard complete old records until our marker arrives, within a deadline.
+
+    Sniffle's own ``mark_and_flush()`` reads through a desynchronization path
+    that does not honor the serial timeout, so a lost marker reply can hang
+    profile rotation forever. Clearing the UART with ``reset_input_buffer()``
+    avoids that hang but can cut a partially received record in half, which
+    then surfaces as a parser framing error on the next read.
+
+    This keeps the bounded behavior without either failure mode: send a
+    cryptographically unique marker, then read only complete CRLF-delimited
+    records until that exact marker returns. Every attempt has a real
+    monotonic deadline, and exhausting it raises so the caller can fail fast
+    instead of leaving an apparently active but frozen receiver.
+    """
+    if timeout_seconds <= 0:
+        raise ValueError("sync timeout must be positive")
+
+    marker = marker_factory(16)
+    deadline = monotonic() + timeout_seconds
+    original_timeout = hardware.ser.timeout
+    discarded_lines = 0
+    invalid_lines = 0
+    hardware.cmd_marker(marker)
+    try:
+        while True:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise SerialTimeoutException(
+                    f"Sniffle marker was not received within {timeout_seconds:g}s"
+                )
+            hardware.ser.timeout = (
+                remaining
+                if original_timeout is None
+                else min(float(original_timeout), remaining)
+            )
+            line = hardware.ser.readline()
+            decoded = _decode_complete_line(line)
+            if decoded is None:
+                invalid_lines += 1
+                continue
+            if decoded[1] == 0x12 and len(decoded) >= 6 and decoded[6:] == marker:
+                return {
+                    "discarded_lines": discarded_lines,
+                    "invalid_lines": invalid_lines,
+                }
+            discarded_lines += 1
+    finally:
+        hardware.ser.timeout = original_timeout
+
+
 class SniffleBackend:
-    """Rotate one Sniffle radio across coded, extended, and legacy BLE."""
+    """Drive one Sniffle radio over the configured Remote ID BLE profiles."""
 
     def __init__(
         self,
@@ -93,17 +182,30 @@ class SniffleBackend:
         extended_seconds: float = 15.0,
         legacy_seconds: float = 15.0,
         serial_timeout: float = 0.5,
+        profile_mode: str = "rotate",
+        sync_timeout: float = 5.0,
     ) -> None:
         if not python_path:
             raise ValueError("SNIFFLE_PYTHON is required for the Sniffle backend")
         if not serial_port:
             raise ValueError("SNIFFLE_SERIAL is required for the Sniffle backend")
+        baudrate = _as_number("SNIFFLE_BAUD", baudrate, int)
+        channel = _as_number("SNIFFLE_CHANNEL", channel, int)
+        coded_seconds = _as_number("SNIFFLE_CODED_SECONDS", coded_seconds, float)
+        extended_seconds = _as_number("SNIFFLE_EXTENDED_SECONDS", extended_seconds, float)
+        legacy_seconds = _as_number("SNIFFLE_LEGACY_SECONDS", legacy_seconds, float)
+        serial_timeout = _as_number("SNIFFLE_SERIAL_TIMEOUT", serial_timeout, float)
+        sync_timeout = _as_number("SNIFFLE_SYNC_TIMEOUT", sync_timeout, float)
+        profile_mode = (profile_mode or "rotate").strip().lower() or "rotate"
         if channel not in (37, 38, 39):
             raise ValueError("SNIFFLE_CHANNEL must be 37, 38, or 39")
+        if profile_mode not in ("rotate", "coded-only"):
+            raise ValueError("SNIFFLE_PROFILE_MODE must be rotate or coded-only")
         for name, dwell in (
             ("SNIFFLE_CODED_SECONDS", coded_seconds),
             ("SNIFFLE_EXTENDED_SECONDS", extended_seconds),
             ("SNIFFLE_LEGACY_SECONDS", legacy_seconds),
+            ("SNIFFLE_SYNC_TIMEOUT", sync_timeout),
         ):
             if dwell <= 0:
                 raise ValueError(f"{name} must be greater than zero")
@@ -113,13 +215,26 @@ class SniffleBackend:
         self.baudrate = baudrate
         self.channel = channel
         self.serial_timeout = serial_timeout
-        self.profiles = (
-            ("bt5-coded", True, True, coded_seconds),
-            ("bt5-extended", True, False, extended_seconds),
-            ("bt4-legacy", False, False, legacy_seconds),
-        )
+        self.sync_timeout = sync_timeout
+        self.profile_mode = profile_mode
+        self.coded_seconds = coded_seconds
+        if profile_mode == "coded-only":
+            # Rotation leaves the coded PHY unwatched for the whole extended
+            # plus legacy dwell, which is a deterministic blind window for
+            # coded-PHY Remote ID traffic. Dedicating the radio removes that
+            # window at the cost of this receiver's coverage of the other two
+            # profiles, which an hciN controller alongside it still sees.
+            self.profiles = (("bt5-coded", True, True, None),)
+        else:
+            self.profiles = (
+                ("bt5-coded", True, True, coded_seconds),
+                ("bt5-extended", True, False, extended_seconds),
+                ("bt4-legacy", False, False, legacy_seconds),
+            )
         self.hardware: Any = None
         self.healthy = False
+        self.sync_count = 0
+        self.discarded_lines = 0
         self.current_profile: str | None = None
         self.last_source_mac: str | None = None
         self.source_mac_by_adi: dict[tuple[int, int], str] = {}
@@ -150,14 +265,14 @@ class SniffleBackend:
         hardware: Any,
         phy_mode: Any,
         sniffer_mode: Any,
-        profile: tuple[str, bool, bool, float],
+        profile: tuple[str, bool, bool, float | None],
     ) -> None:
         name, extended, coded, dwell = profile
         log.info(
-            "[Sniffle] profile=%s channel=%s dwell_seconds=%g",
+            "[Sniffle] profile=%s channel=%s dwell_seconds=%s",
             name,
             self.channel,
-            dwell,
+            "continuous" if dwell is None else f"{dwell:g}",
         )
         hardware.setup_sniffer(
             mode=sniffer_mode.PASSIVE_SCAN,
@@ -169,12 +284,13 @@ class SniffleBackend:
             phy_preload=phy_mode.PHY_2M,
             validate_crc=True,
         )
-        # Sniffle's mark_and_flush() uses a desynchronization read path that
-        # does not honor the serial timeout when a marker reply is lost. A
-        # missing reply can therefore freeze profile rotation indefinitely.
-        # Clearing already-buffered UART input provides the behavior needed
-        # here without entering that unbounded loop.
-        hardware.ser.reset_input_buffer()
+        # Drain records written under the previous profile before attributing
+        # anything to this one. synchronize_hardware() is bounded and reads
+        # only complete records, so a lost marker fails fast here rather than
+        # hanging rotation or truncating a partially received record.
+        result = synchronize_hardware(hardware, self.sync_timeout)
+        self.sync_count += 1
+        self.discarded_lines += result["discarded_lines"]
         self.current_profile = name
 
     def _fallback_mac(self, message: Any) -> str | None:
@@ -225,8 +341,14 @@ class SniffleBackend:
                         sniffer_mode,
                         profile,
                     )
-                    deadline = time.monotonic() + profile[3]
-                    while time.monotonic() < deadline:
+                    dwell = profile[3]
+                    if dwell is None:
+                        # coded-only dedicates the radio, so there is no dwell
+                        # to expire. A bounded test run still needs an exit,
+                        # so it borrows the configured coded dwell.
+                        dwell = self.coded_seconds if cycles is not None else None
+                    deadline = None if dwell is None else time.monotonic() + dwell
+                    while deadline is None or time.monotonic() < deadline:
                         try:
                             message = await asyncio.to_thread(
                                 self.hardware.recv_and_decode
