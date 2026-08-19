@@ -26,6 +26,7 @@ import struct
 import json
 import hashlib
 import logging
+import logging.handlers
 import argparse
 import socket
 import glob
@@ -37,12 +38,24 @@ import serial
 import requests
 
 # -- Logging -------------------------------------------------------------------
+# Hard ceiling on SD card usage. A plain FileHandler appends forever and
+# survives reboots, so a busy node grows this file without bound — and
+# continuous small writes are exactly what wears out SD cards, the same
+# concern that put the detection ring on tmpfs. Total footprint is the
+# active file plus LOG_BACKUPS rotations.
+LOG_MAX_BYTES = int(os.environ.get("DRONEAWARE_LOG_MAX_BYTES", 40_000_000))
+LOG_BACKUPS   = 3
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("/var/log/droneaware_wifi.log"),
+        logging.handlers.RotatingFileHandler(
+            "/var/log/droneaware_wifi.log",
+            maxBytes=LOG_MAX_BYTES // (LOG_BACKUPS + 1),
+            backupCount=LOG_BACKUPS,
+        ),
     ],
 )
 log = logging.getLogger("droneaware.wifi")
