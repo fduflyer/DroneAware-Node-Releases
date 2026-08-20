@@ -1279,6 +1279,55 @@ if candidates:
     echo ""
 }
 
+# v1.5.0.7: resolve a feeder's SELF-REPORTED health from its state file in
+# /run/droneaware/. systemd only knows whether the process is alive — a
+# feeder whose adapter vanished keeps looping in FAULT and stays "active"
+# indefinitely, which is how a node ran ~6 days with no 2.4 GHz coverage
+# while this command showed green.
+#
+# Echoes exactly one of:
+#   ok              feeder reports healthy and the file is fresh
+#   fault:<reason>  feeder reports itself unhealthy, with its own reason
+#   stale:<n>s      not refreshed in >180s (3 missed 60s heartbeats)
+#   unknown         no state file — a pre-v1.5.0.7 feeder, or one that has
+#                   not reached its first heartbeat yet. Callers MUST treat
+#                   this as "report liveness only", never as a fault, so a
+#                   node mid-upgrade is not shown as broken.
+_feeder_health() {
+    local svc="${1%.service}"
+    local files
+    case "$svc" in
+        droneaware-ble)     files="/run/droneaware/ble_state.json" ;;
+        droneaware-wifi-2g) files="/run/droneaware/wifi_state_2g.json" ;;
+        droneaware-wifi-5g) files="/run/droneaware/wifi_state_5g.json" ;;
+        # Single-adapter mode: one process emits BOTH band rows, so check
+        # both files and report the worst of the two.
+        droneaware-wifi)    files="/run/droneaware/wifi_state_2g.json /run/droneaware/wifi_state_5g.json" ;;
+        *)                  echo "unknown"; return 0 ;;
+    esac
+
+    python3 - "$files" <<'PY' 2>/dev/null || echo "unknown"
+import json, sys, time
+worst, seen = None, False
+for p in sys.argv[1].split():
+    try:
+        with open(p) as f:
+            s = json.load(f)
+    except Exception:
+        continue                       # missing/unreadable — treat as absent
+    seen = True
+    ok    = s.get("wifi_ok") if "wifi_ok" in s else s.get("ble_ok")
+    fault = s.get("wifi_fault") or s.get("ble_fault")
+    if not ok:                         # fault outranks stale
+        print("fault:%s" % (fault or "feeder reports not ok"))
+        sys.exit(0)
+    age = time.time() - (s.get("updated_at") or 0)
+    if age > 180:
+        worst = "stale:%ds" % int(age)
+print("unknown" if not seen else (worst or "ok"))
+PY
+}
+
 cmd_status() {
     require_root "status"
     echo ""
@@ -1316,7 +1365,27 @@ cmd_status() {
         local enabled
         enabled=$(systemctl is-enabled "$svc" 2>/dev/null)
         if [[ "$state" == "active" ]]; then
-            echo -e "  ${GREEN}●${NC}  ${svc}  (running)"
+            # v1.5.0.7: "active" is liveness, not health. A feeder whose
+            # adapter is gone enters its FAULT loop and keeps running, so
+            # systemd reports active forever — one node sat that way for
+            # ~6 days showing green here while the server correctly showed
+            # the band down. Read the feeder's own state file instead.
+            local health
+            health=$(_feeder_health "$svc")
+            case "$health" in
+                fault:*)
+                    echo -e "  ${RED}●${NC}  ${svc}  (running — FAULT: ${health#fault:})"
+                    ;;
+                stale:*)
+                    echo -e "  ${YELLOW}●${NC}  ${svc}  (running — state stale ${health#stale:}, feeder may be wedged)"
+                    ;;
+                *)
+                    # "ok", or "unknown" for a feeder that predates state
+                    # files. Unknown reports liveness only, as before —
+                    # that is honest rather than alarming mid-upgrade.
+                    echo -e "  ${GREEN}●${NC}  ${svc}  (running)"
+                    ;;
+            esac
         elif [[ "$enabled" == "not-found" ]]; then
             echo -e "  ${RED}●${NC}  ${svc}  (unit file missing — run 'sudo droneaware refresh')"
         else
