@@ -990,6 +990,11 @@ class BLEFeeder:
                     f"[Heartbeat] FAULT — ble_ok=False  reason={reason}  "
                     f"temp={temp_str}  cpu={cpu_pct_str}  load={load_str}"
                 )
+                # Publish before the token check: a node without a token
+                # still has an offline UI, and that is exactly the operator
+                # who most needs to be told the radio is down.
+                self._write_ble_state(False, getattr(self, "adapter", None),
+                                      fault=reason)
                 if not self.token:
                     continue
                 requests.post(
@@ -1093,6 +1098,52 @@ class BLEFeeder:
             except (asyncio.CancelledError, Exception):
                 pass
 
+    def _write_ble_state(self, ble_ok: bool, adapter: str | None,
+                         fault: str | None = None):
+        """Publish BLE health to /run/droneaware/ble_state.json.
+
+        Mirrors the per-band state files wifi_feeder already writes, so
+        local surfaces can read feeder-authored health instead of inferring
+        it from systemd. Previously the offline UI shelled out to
+        `systemctl is-active droneaware-ble` and swallowed any failure as
+        "BLE down" — so it could report the radio as not scanning while the
+        CLI, the server, and the detection stream all showed it healthy.
+        systemd only knows whether the process is alive; it cannot know
+        whether the adapter is up.
+
+        Written from BOTH the healthy heartbeat and the FAULT loop. A
+        faulted feeder that writes nothing is indistinguishable from a
+        healthy one, and consumers would fall back to systemd — which
+        happily reports "active" for a process looping in FAULT. That is
+        precisely the failure this removes, so the FAULT path matters more
+        than the healthy one.
+
+        Lives on tmpfs: no SD card wear, gone on reboot. Non-fatal by
+        design — a failed write costs one refresh, never the feeder.
+        """
+        path = "/run/droneaware/ble_state.json"
+        try:
+            os.makedirs("/run/droneaware", exist_ok=True)
+            state = {
+                "feeder":     "ble",
+                "adapter":    adapter,
+                # BLE listens on all three advertising channels at once;
+                # "lock" is the closest scan_mode analogue to the WiFi rows.
+                "scan_mode":  "lock",
+                "ble_ok":     ble_ok,
+                "ble_fault":  fault,
+                "seen_total": getattr(self, "count", 0),
+                "sent_total": getattr(getattr(self, "forwarder", None),
+                                      "sent_total", 0),
+                "updated_at": time.time(),
+            }
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, path)          # atomic — readers never see a partial file
+        except Exception:
+            pass
+
     async def _heartbeat_loop(self):
         """v1.4.8: heartbeat runs here, in a dedicated asyncio task, so it
         cannot be starved by scanner-callback processing. Sends the same
@@ -1115,6 +1166,7 @@ class BLEFeeder:
                 cpu_pct         = get_cpu_percent()
                 load_1m, load_5m, load_15m = get_cpu_load()
                 ble_ok, ble_adp = get_ble_health(self.adapter)
+                self._write_ble_state(ble_ok, ble_adp)
                 temp_str    = f"{cpu_temp}°C" if cpu_temp is not None else "n/a"
                 cpu_pct_str = f"{cpu_pct:.1f}%" if cpu_pct is not None else "n/a"
                 load_str    = f"{load_1m:.2f}" if load_1m is not None else "n/a"
