@@ -54,6 +54,7 @@ the feeders, the forwarder, or the wire format in any way.
 """
 import argparse
 import collections
+import datetime
 import json
 import logging
 import os
@@ -202,6 +203,18 @@ class DetectionStore:
         # current wall clock for events that somehow lack it (shouldn't
         # happen with LocalPublisher output, but defensive).
         ts = event.get("t")
+        if isinstance(ts, str):
+            # v1.5.0.8: pre-v1.5.0.8 ble_feeder emitted an ISO-8601 string
+            # here. This branch used to fall straight through to time.time(),
+            # so every replayed BLE event was stamped with ingest time — the
+            # exact "restarting web_ui made every old detection look LIVE"
+            # failure this method's docstring warns about, except it only ever
+            # hit BLE. Parse rather than discard: the tmpfs ring survives the
+            # upgrade, so ISO records keep replaying after the feeder is fixed.
+            try:
+                ts = datetime.datetime.fromisoformat(ts).timestamp()
+            except ValueError:
+                ts = None
         if not isinstance(ts, (int, float)):
             ts = time.time()
         with self._lock:

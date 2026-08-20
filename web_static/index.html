@@ -916,7 +916,7 @@
     }
     function isTestEvent(evt) {
       // cmd_test broadcasts use a recognizable ID prefix — adjust as needed
-      const id = (evt.id || "").toString().toUpperCase();
+      const id = (evt.serial_number || evt.faa_registration || evt.id || "").toString().toUpperCase();
       return id.startsWith("TEST-") || id.startsWith("DA-TEST") || (evt.mac || "").startsWith("00:00:00");
     }
 
@@ -1297,7 +1297,7 @@
         card.addEventListener("dblclick", () => openModal(mac));
         entry.card = card;
       }
-      const id = evt.id || evt.uas_id || mac;
+      const id = displayId(evt, mac);
 
       // Stats row: altitude · speed · node-id. Skip components that don't
       // have data so we don't render dangling '·' separators.
@@ -1418,16 +1418,51 @@
       return out;
     }
 
+    // ASTM permits one airframe to broadcast several ID types at once. A
+    // CTA-2063-A serial and a CAA registration commonly arrive interleaved
+    // from the same MAC — they are different facts about the same aircraft,
+    // not competing answers. Sharing one `id` field made the displayed
+    // identity flip to whichever Basic ID arrived last.
+    //
+    // Classify by id_type ONLY. Never infer from the string's shape: the
+    // server side has had two identity-flip incidents caused by regex
+    // classification, because registration formats vary by jurisdiction and
+    // cannot be enumerated. Types None / UTM Assigned / Session ID are
+    // dropped, matching server semantics.
+    const ID_TYPE_SERIAL = "Serial Number (ANSI/CTA-2063-A)";
+    const ID_TYPE_CAA    = "CAA Assigned";
+    function classifyIds(evt) {
+      if (!evt.id || !evt.id_type) return evt;
+      if (evt.id_type === ID_TYPE_SERIAL)        evt.serial_number = evt.id;
+      else if (evt.id_type === ID_TYPE_CAA)      evt.faa_registration = evt.id;
+      else { delete evt.id; delete evt.id_type; }
+      return evt;
+    }
+    function displayId(evt, mac) {
+      return evt.serial_number || evt.faa_registration || evt.id || evt.uas_id || mac;
+    }
+
     function handleEvent(evt) {
       const mac = evt.mac || evt.source_mac;
       if (!mac) return;
+      classifyIds(evt);
       // Use the broadcast timestamp (evt.t — when the feeder captured
       // the packet) for first_seen/last_seen, NOT Date.now(). Same
       // reason as the backend fix: replayed-at-startup events arrive
       // via SSE near-instantly but their real broadcast time may be
       // much older. Using Date.now() here would make 10-hour-old
       // events look LIVE.
-      const eventTs = (typeof evt.t === "number") ? evt.t : (Date.now() / 1000);
+      // v1.5.0.8: accept both shapes. Pre-v1.5.0.8 ble_feeder sent `t` as an
+      // ISO-8601 string, which failed the number check and fell through to
+      // Date.now() — so replayed BLE events rendered as LIVE regardless of
+      // age, exactly what the note above says not to do. The ring survives
+      // upgrades, so string timestamps keep arriving after the feeder is fixed.
+      let eventTs = evt.t;
+      if (typeof eventTs === "string") {
+        const parsed = Date.parse(eventTs);
+        eventTs = Number.isNaN(parsed) ? null : parsed / 1000;
+      }
+      if (typeof eventTs !== "number") eventTs = Date.now() / 1000;
       let entry = state.macs.get(mac);
       if (!entry) {
         entry = { event: evt, first_seen: eventTs, last_seen: eventTs, marker: null, card: null };
@@ -1438,6 +1473,14 @@
         // already know about — protects against out-of-order arrivals.
         if (eventTs > entry.last_seen) entry.last_seen = eventTs;
         if (eventTs < entry.first_seen) entry.first_seen = eventTs;
+      }
+      // Some manufacturers ship airframes on a fixed MAC, so one MAC can
+      // carry many distinct serials. Server-side keys on MAC alone, which
+      // collapses them into a single track — 34 airframes on one MAC has
+      // been observed in the fleet. Record what we see so the UI can say
+      // so rather than silently showing whichever arrived last.
+      if (evt.serial_number) {
+        (entry.serials || (entry.serials = new Set())).add(evt.serial_number);
       }
       updateMarker(mac);
       renderCard(mac);
@@ -1664,12 +1707,24 @@
       const entry = state.macs.get(mac);
       if (!entry) return "<div class='da-popup-inner'>—</div>";
       const evt = entry.event;
-      const id = evt.id || evt.uas_id || mac;
+      const id = displayId(evt, mac);
       const ageSec = (Date.now() / 1000) - entry.last_seen;
 
       // Make/model only shown when server-side enrichment has populated
       // these fields (item #9 in v1.4.0 punch list — not yet implemented).
       // Until then, the row is hidden so we don't show "Unknown · —".
+      // A MAC carrying more than one CTA-2063-A serial is a fixed-MAC fleet:
+      // several distinct airframes sharing one hardware address. The server
+      // keys on MAC alone, so they collapse into a single track. Say so
+      // rather than presenting the collapsed track as one confident aircraft.
+      const serialCount = entry.serials ? entry.serials.size : 0;
+      const multiSerialHTML = serialCount > 1 ? `
+        <div class="da-popup-row">
+          <span class="k">Note</span>
+          <span class="v">${serialCount} distinct serials on this MAC —
+            multiple aircraft may be shown as one</span>
+        </div>` : "";
+
       const hasMakeModel = evt.make || evt.model;
       const makeModelHTML = hasMakeModel ? `
         <div class="da-popup-makemodel">
@@ -1723,6 +1778,7 @@
             <div class="da-popup-specs-body">
               <span class="k">Radio</span><span class="v">${escapeHtml(radioTxt)}</span>
               <span class="k">Channel</span><span class="v">${evt.channel ?? "—"}</span>
+${multiSerialHTML}
               <span class="k">Msg type</span><span class="v">${escapeHtml(evt.type || "—")}</span>
               <span class="k">Heading</span><span class="v">${escapeHtml(headingTxt)}</span>
               <span class="k">Lat</span><span class="v">${(typeof evt.lat === "number") ? evt.lat.toFixed(6) : "—"}</span>

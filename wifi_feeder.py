@@ -2450,6 +2450,23 @@ class WiFiFeeder:
             self.hopper.notify_detection(channel)
 
     def run(self):
+        """v1.5.0.8: retry wrapper around the capture setup.
+
+        Previously the feeder entered `_fault_loop` and stayed there for the
+        life of the process. Plugging an adapter into a running node did
+        nothing — one node sat in FAULT for six minutes with a working,
+        driver-bound radio attached, and only recovered because an unrelated
+        `update` happened to restart the process. Without that restart it
+        would have stayed dark indefinitely, which is the same silent-failure
+        class as reporting liveness instead of health.
+
+        `_run_once` returns False when the adapter came back and setup should
+        be retried; True when it is finished for good.
+        """
+        while not self._run_once():
+            log.info("[RECOVERY] re-running capture setup with the recovered adapter")
+
+    def _run_once(self) -> bool:
         log.info(f"DroneAware WiFi Feeder - Node: {self.node_id}")
         _check_cli_freshness()
         target = self.hopper.target_channels
@@ -2472,16 +2489,16 @@ class WiFiFeeder:
             )
             log.error("BLE detection (if available) is unaffected and continues independently.")
             log.error("To restore WiFi: connect a USB monitor-mode adapter and re-run the installer.")
-            self._fault_loop("adapter not present")
-            return
+            # Returns True once the adapter reappears, so setup is retried
+            # rather than the process sitting dark until someone restarts it.
+            return not self._fault_loop("adapter not present")
 
         try:
             set_monitor_mode(self.iface)
         except Exception as e:
             log.error(f"Could not put {self.iface} into monitor mode: {e}")
             log.error("Entering FAULT mode — adapter likely does not support monitor mode.")
-            self._fault_loop("monitor mode unsupported")
-            return
+            return not self._fault_loop("monitor mode unsupported")
 
         self.hopper.start()
 
@@ -2512,6 +2529,10 @@ class WiFiFeeder:
                 f"[Summary] Beacon RID={self.count}  NAN frames={self.nan_count}  "
                 f"sent={self.forwarder.sent_total}  failed={self.forwarder.failed_total}"
             )
+        # Capture ended by KeyboardInterrupt/shutdown, not by a recoverable
+        # adapter fault. Tell run() we are finished — returning None here
+        # would read as falsy and restart setup in a tight loop.
+        return True
 
     # ------------------------------------------------------------------
     # v1.5.0 heartbeat schema — feeder split (wifi_2g / wifi_5g / scan_mode)
@@ -2707,16 +2728,64 @@ class WiFiFeeder:
         except requests.RequestException as e:
             log.warning(f"Heartbeat failed (feeder={payload.get('feeder', 'wifi[legacy]')}): {e}")
 
-    def _fault_loop(self, reason: str):
+    def _try_recover_adapter(self) -> bool:
+        """v1.5.0.8: re-resolve the configured adapter from inside FAULT.
+
+        Returns True once it is present again, so the caller can retry setup.
+
+        Also reports the case this cannot fix on its own: our configured MAC
+        is absent while some OTHER monitor-capable USB adapter is attached.
+        That is what an operator swapping a dead card for a new one produces
+        — the new MAC is not in config.env, so only `droneaware refresh` can
+        adopt it. Saying so turns an indefinite silent FAULT into an
+        instruction. The feeder deliberately does NOT adopt it itself:
+        config.env has one writer, and a feeder that picks its own adapter
+        would race the orchestrator and the peer band's feeder.
+        """
+        try:
+            iface = resolve_monitor_iface(self.iface, band=self.band)
+        except Exception:
+            iface = None
+        if iface and os.path.exists(f"/sys/class/net/{iface}"):
+            if iface != self.iface:
+                log.warning(
+                    f"[RECOVERY] adapter now resolves to {iface} "
+                    f"(was {self.iface or 'none'})"
+                )
+            self.iface = iface
+            log.warning("[RECOVERY] configured adapter present again — leaving FAULT mode")
+            return True
+
+        try:
+            others = [a for a in wclassifier_enumerate()
+                      if a.get("classification") == "usb-monitor"]
+        except Exception:
+            others = []
+        if others:
+            macs = ", ".join(a.get("mac", "?") for a in others[:3])
+            log.error(
+                "[FAULT] configured adapter is absent, but monitor-capable "
+                f"adapter(s) are attached ({macs}). They are not in config.env — "
+                "run 'sudo droneaware refresh' to adopt them."
+            )
+        return False
+
+    def _fault_loop(self, reason: str) -> bool:
         """
         Degraded loop entered when no usable WiFi adapter is present.
         Emits heartbeats with wifi_ok=False so the server marks the radio as FAULT.
         Performs no monitor-mode setup, no packet capture, no event forwarding.
+
+        v1.5.0.8: returns True when the adapter reappears. Before this the
+        loop never exited, so plugging a radio into a running node did
+        nothing until someone restarted the process.
         """
         log.warning(f"[FAULT] wifi feeder running in degraded mode: {reason}")
         while True:
             try:
                 time.sleep(60)
+                if self._try_recover_adapter():
+                    return True
                 log.info(
                     f"[Heartbeat] FAULT — wifi_ok=False  reason={reason}  "
                     f"uptime={int(time.time() - self.start_time)}s"
