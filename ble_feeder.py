@@ -981,16 +981,30 @@ class BLEFeeder:
                 pub_event["decoded"] = msg
                 self.publisher.publish(pub_event)
 
-    async def _fault_loop(self, reason: str):
+    async def _fault_loop(self, reason: str) -> bool:
         """
         Degraded loop entered when the BLE adapter is unhealthy or absent.
         Emits heartbeats with ble_ok=False so the server marks the radio as FAULT.
         Performs no BLE scanning. WiFi status (if measurable) is still reported.
+
+        v1.5.0.8: returns True once the adapter is healthy again, so the
+        caller can retry setup. Before this the loop never exited, so
+        swapping a Bluetooth dongle on a running node left BLE dark until
+        someone restarted the service — the same gap the WiFi feeder had.
         """
         log.warning(f"[FAULT] ble feeder running in degraded mode: {reason}")
         while True:
             try:
                 await asyncio.sleep(60)
+                # Re-check, and retry the standard recovery sequence: the
+                # common case is the onboard UART losing sync, which
+                # hciconfig down/up fixes without operator intervention.
+                healthy, _ = get_ble_health(self.adapter)
+                if not healthy:
+                    healthy = await _attempt_ble_recovery(self.adapter)
+                if healthy:
+                    log.warning("[RECOVERY] BLE adapter healthy again — leaving FAULT mode")
+                    return True
                 cpu_temp = get_cpu_temp()
                 cpu_pct  = get_cpu_percent()
                 load_1m, load_5m, load_15m = get_cpu_load()
@@ -1037,6 +1051,16 @@ class BLEFeeder:
                 log.warning(f"FAULT loop error: {e}")
 
     async def run(self):
+        """v1.5.0.8: retry wrapper, mirroring wifi_feeder.run().
+
+        `_run_once` returns False when the adapter recovered and setup should
+        be retried, True when finished. A loop rather than recursion: a
+        flapping adapter would otherwise add a stack frame per recovery.
+        """
+        while not await self._run_once():
+            log.info("[RECOVERY] restarting BLE scan setup with the recovered adapter")
+
+    async def _run_once(self) -> bool:
         log.info(f"DroneAware BLE Feeder - Node: {self.node_id}  Adapter: {self.adapter}")
         _check_cli_freshness()
 
@@ -1057,8 +1081,8 @@ class BLEFeeder:
             )
             log.error("WiFi detection (if available) is unaffected and continues independently.")
             log.error("To restore BLE: connect a working Bluetooth adapter and restart this service.")
-            await self._fault_loop("adapter not present (recovery attempted)")
-            return
+            # False tells run() to retry setup; True means finished for good.
+            return not await self._fault_loop("adapter not present (recovery attempted)")
 
         log.info(f"Scanning for Remote ID broadcasts (UUID 0xFFFA)...")
 
@@ -1108,6 +1132,10 @@ class BLEFeeder:
                 await heartbeat_task
             except (asyncio.CancelledError, Exception):
                 pass
+        # Scanning ended by shutdown, not by a recoverable adapter fault.
+        # Returning None here would read as falsy and restart setup in a
+        # tight loop — the same trap as on the WiFi side.
+        return True
 
     def _write_ble_state(self, ble_ok: bool, adapter: str | None,
                          fault: str | None = None):
