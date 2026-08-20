@@ -10,6 +10,87 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.5.0.7] — Unreleased
+
+Local reporting accuracy and bounded resources. Every surface on the node
+now reads health from the feeder that owns it, rather than inferring health
+from whether a process happens to be alive.
+
+### The offline UI could report BLE as down on a healthy node
+
+The web UI decided BLE health by running `systemctl is-active
+droneaware-ble` and treating any exception as "BLE down". It runs as an
+unprivileged user, so anything that made that subprocess fail became a red
+BLE row on a node that was scanning normally — reported by two operators
+whose CLI, server dashboard, and detection stream all disagreed with their
+own local UI.
+
+The deeper problem is that systemd only knows whether a process is alive.
+A feeder whose adapter has failed keeps running its FAULT loop, so
+`is-active` reports "active" indefinitely and the UI rendered green while
+the radio was dead.
+
+`ble_feeder` now publishes `/run/droneaware/ble_state.json` on the same
+pattern the WiFi feeder already uses for its per-band files: atomic
+replace, tmpfs so there is no SD card wear, an `updated_at` stamp for
+staleness, and non-fatal on error. It is written from the FAULT loop as
+well as the healthy heartbeat — a faulted feeder that writes nothing looks
+exactly like a healthy one — and before the token check in both, so nodes
+that have not enrolled still get a truthful local UI.
+
+The web UI reads that file and falls back to systemd only when it is
+absent, recording that the answer was inferred. If the fallback itself
+fails, the row is marked unknown and stale rather than shown as a
+confident colour it has not earned.
+
+### Faulted feeders showed green in `droneaware status`
+
+`status` reported systemd's view of each unit. A feeder whose adapter had
+been removed entered its FAULT loop and kept running, so the command showed
+green while the band was down — in one case for several days, while the
+server-side dashboard correctly showed the band as failed.
+
+`status` now reads each feeder's own state file and distinguishes a
+reported fault (red, with the feeder's own reason), a stale state file
+(amber — the feeder may be wedged), and healthy. A feeder that predates
+state files reports liveness only, as before, so a node midway through an
+upgrade is not shown as broken.
+
+### Distance rings were invisible on the light theme
+
+The offline map drew its range rings in a fixed cyan at low opacity for
+both themes, while the rest of the interface follows the active theme.
+Against the light basemap that is a contrast ratio of about 1.5:1 —
+effectively invisible, and reported by operators as being unable to see the
+rings at all.
+
+Ring colour and opacity now come from the active theme, giving roughly
+5.4:1 on the light theme, with a heavier stroke, a longer dash so the
+pattern reads as a line rather than dots, and larger semibold labels with a
+halo so they stay legible over both water and built-up areas.
+
+Because the map renders vector layers to a canvas, ring colours cannot be
+restyled by CSS the way the rest of the interface can. Switching themes
+previously left the rings drawn in the old theme's colour until something
+unrelated forced a redraw; theme changes now redraw them explicitly.
+
+### Feeder logs grew without bound
+
+Both feeders wrote to `/var/log/droneaware_*.log` through a handler that
+appends indefinitely and survives reboots, and nothing rotated them. On a
+long-running node this measured about 206 KB per day, dominated by routine
+heartbeat lines rather than detections — so growth continued at much the
+same rate whether or not the node was seeing traffic.
+
+Both now rotate with a hard 40 MB ceiling per feeder, roughly six months of
+history, overridable via `DRONEAWARE_LOG_MAX_BYTES`. No node in the field
+is near the cap; the ceiling matters for sustained bursts, where two log
+lines per detection could otherwise fill a small card in days.
+
+This is a rotation change only. The buffer that holds detections when the
+server is unreachable is separate, lives in memory, is bounded by its own
+setting, and is unaffected.
+
 ## [1.5.0.6] — Unreleased
 
 Installation and adapter-mode correctness. Five defects found in a code
