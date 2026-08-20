@@ -704,23 +704,49 @@ def _read_feeder_states() -> dict:
         except (OSError, ValueError, json.JSONDecodeError):
             pass
 
-    # BLE — placeholder until BLE feeder gets its own state file. Check
-    # systemd for a rough "is it running" signal.
+    # BLE — read feeder-authored state, exactly like the WiFi bands above.
+    # v1.5.0.7: ble_feeder now writes /run/droneaware/ble_state.json. This
+    # used to shell out to `systemctl is-active` unconditionally, which is
+    # liveness rather than health: a feeder looping in FAULT with a dead
+    # adapter is still "active", so the UI showed BLE green while the CLI
+    # and the server both correctly reported it down.
     try:
-        r = subprocess.run(
-            ["systemctl", "is-active", "droneaware-ble.service"],
-            capture_output=True, text=True, timeout=2,
-        )
-        active = r.stdout.strip() == "active"
-    except Exception:
-        active = False
-    out["ble"] = {
-        "feeder": "ble",
-        "iface": "hci0",   # conventional — actual adapter may vary
-        "scan_mode": "lock",  # BLE is always "listening on all channels" — closest to lock
-        "wifi_ok": active,  # borrowing the field name for uniform frontend rendering
-        "stale": False,
-    }
+        with open("/run/droneaware/ble_state.json") as f:
+            s = json.load(f)
+        age = time.time() - (s.get("updated_at") or 0)
+        s["age_sec"] = int(age)
+        s["stale"] = age > 180
+        # The frontend renders all three rows from one field name.
+        s["wifi_ok"] = bool(s.get("ble_ok"))
+        s["iface"] = s.get("adapter") or "hci0"
+        s["health_source"] = "feeder"
+        out["ble"] = s
+    except (OSError, ValueError, json.JSONDecodeError):
+        # No state file — either a pre-v1.5.0.7 ble_feeder, or one that has
+        # not reached its first heartbeat yet. Fall back to systemd, but do
+        # not present the result as health.
+        try:
+            r = subprocess.run(
+                ["systemctl", "is-active", "droneaware-ble.service"],
+                capture_output=True, text=True, timeout=2,
+            )
+            active = r.stdout.strip() == "active"
+            asked  = True
+        except Exception:
+            # Failing to ask is NOT a negative answer. The previous code
+            # swallowed any exception into active=False, so a systemctl
+            # that timed out or was refused under User=droneaware rendered
+            # as "BLE down" — reported by two operators.
+            active = False
+            asked  = False
+        out["ble"] = {
+            "feeder": "ble",
+            "iface": "hci0",      # conventional — actual adapter may vary
+            "scan_mode": "lock",  # BLE listens on all advertising channels
+            "wifi_ok": active,
+            "health_source": "systemd" if asked else "unknown",
+            "stale": not asked,   # unknown renders as stale, never as green
+        }
     return out
 
 

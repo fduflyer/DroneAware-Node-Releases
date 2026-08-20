@@ -39,6 +39,12 @@
       --status-warn:   #FB923C;
       --status-error:  #F87171;
       --status-idle:   #64748B;
+      /* Distance rings. Canvas-rendered, so JS reads these tokens rather
+         than CSS styling the stroke directly — but they live here so both
+         themes are defined in one place. */
+      --ring:          #00E5FF;
+      --ring-opacity:  0.45;
+      --ring-label:    rgba(0, 229, 255, 0.85);
     }
     [data-theme="day"] {
       --bg-primary:    #F7FAFD;
@@ -50,6 +56,11 @@
       --text-dim:      #475569;
       --text-muted:    #94A3B8;
       --accent:        #0BA5D9;
+      /* Cyan is near-invisible on a white basemap — the day ring is a
+         darker, more saturated teal so it reads against light tiles. */
+      --ring:          #0E7490;
+      --ring-opacity:  0.60;
+      --ring-label:    #0E7490;
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -438,13 +449,17 @@
     /* Distance-ring labels — small mile markers on each ring */
     .ring-label {
       font-family: ui-monospace, "SF Mono", "Cascadia Mono", monospace;
-      font-size: 9px;
-      color: rgba(0, 229, 255, 0.55);
+      font-size: 10px;
+      font-weight: 600;
+      color: var(--ring-label);
       background: transparent;
       border: none;
       padding: 0 4px;
       pointer-events: none;
-      text-shadow: 0 0 2px var(--bg-primary);
+      white-space: nowrap;
+      /* Doubled halo — labels cross both water and built-up areas, so a
+         single 2px shadow washes out over darker map features. */
+      text-shadow: 0 0 3px var(--bg-primary), 0 0 2px var(--bg-primary);
     }
 
     /* ========== Status bar (28px bottom) ========== */
@@ -954,6 +969,11 @@
 
       state.tileLayer = L.tileLayer(url, opts).addTo(state.map);
 
+      // Rings are Canvas-painted, so a theme swap does not restyle them the
+      // way it does the CSS-driven chrome. Redraw so the stroke colour
+      // follows the new basemap instead of staying tuned to the old one.
+      if (state.home) drawHomeView(state.home);
+
       // Listen for tile load failures on the CartoDB layer — first
       // failure swaps us to the local bundle. Covers the case where
       // navigator.onLine reports true but the browser can't actually
@@ -1030,6 +1050,20 @@
     const KM_METERS = 1000;
     const RING_COUNT = 10;
 
+    // Distance-ring stroke for the active theme. The map uses
+    // preferCanvas:true, so ring strokes are painted to a <canvas> and CSS
+    // cannot restyle them — JS has to read the tokens and pass them to
+    // Leaflet. Falls back to the dark-theme values if a token is missing.
+    function ringStyle() {
+      const cs = getComputedStyle(document.documentElement);
+      const color = (cs.getPropertyValue("--ring") || "").trim();
+      const op    = parseFloat(cs.getPropertyValue("--ring-opacity"));
+      return {
+        color:   color || "#00E5FF",
+        opacity: Number.isFinite(op) ? op : 0.45,
+      };
+    }
+
     function drawHomeView(home) {
       if (!home || home.lat == null || home.lon == null) {
         // No home location available — leave map at continental-US default
@@ -1051,16 +1085,18 @@
 
       const stepMeters = state.units === "metric" ? KM_METERS : MILE_METERS;
       const unitLabel  = state.units === "metric" ? "km" : "mi";
+      const ring       = ringStyle();
 
-      // Concentric distance rings, dashed cyan.
+      // Concentric distance rings, dashed. Colour comes from the active
+      // theme's tokens — see ringStyle().
       for (let i = 1; i <= RING_COUNT; i++) {
         L.circle(center, {
           radius: i * stepMeters,
-          color: "#00E5FF",
-          weight: 1,
-          opacity: 0.22,
+          color: ring.color,
+          weight: 1.2,
+          opacity: ring.opacity,
           fillOpacity: 0,
-          dashArray: "4 4",
+          dashArray: "6 5",
           interactive: false,
         }).addTo(state.homeLayer);
 
