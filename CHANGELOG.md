@@ -10,6 +10,63 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.5.0.8] — Unreleased
+
+Local reporting correctness, and radios that recover on their own.
+
+### A feeder stayed dark after its adapter came back
+
+Both feeders entered a degraded loop when their adapter was missing and
+never left it. Plugging a radio into a running node did nothing: one node
+sat in FAULT for six minutes with a working, driver-bound adapter attached,
+and only recovered because an unrelated update happened to restart the
+process. Without that restart it would have stayed dark indefinitely.
+
+Both feeders now re-check for their adapter once a minute while degraded and
+resume scanning when it returns, without a restart. The Bluetooth feeder
+also retries its standard recovery sequence each cycle, which auto-heals the
+onboard UART losing sync — a path that previously ran only once at startup.
+
+Where the adapter cannot be adopted automatically — a replacement card whose
+address is not yet in the node's configuration — the feeder now names the
+attached adapters and says to run `sudo droneaware refresh`, instead of
+repeating "adapter not present" indefinitely. It deliberately does not adopt
+an unconfigured adapter on its own: configuration has a single writer, and a
+feeder choosing its own radio would race the orchestrator and the other
+band's feeder.
+
+### Old Bluetooth detections reappeared as live after a restart
+
+The local web interface replays its detection history at startup. Wi-Fi
+detections kept their original capture time, but Bluetooth detections were
+re-stamped with the moment of replay — so after any restart the entire
+Bluetooth history rendered as current, never ageing out and never pruning,
+while Wi-Fi in the same view aged correctly.
+
+The two feeders were publishing the same timestamp field in different
+formats, and every consumer type-checked it. Both feeders now publish the
+same format, and the consumers accept either — necessary rather than
+belt-and-braces, since the history buffer survives the upgrade and keeps
+replaying older records afterwards.
+
+### A drone's displayed identity flipped between its two IDs
+
+An aircraft may broadcast more than one identifier at once — commonly a
+serial number alongside a registration. The interface merged them into a
+single field, so the displayed identity alternated depending on which
+arrived last. Measured against a live capture of one aircraft broadcasting
+both, the identity changed 749 times.
+
+Identity is now classified by the broadcast ID type, and the two are kept as
+separate values that never compete. Classification is by the declared type
+only, never by matching the shape of the string: registration formats vary
+by jurisdiction and cannot be enumerated.
+
+The interface also now says when a single hardware address is carrying more
+than one aircraft serial. Some manufacturers ship airframes on a shared
+address, and since detections are grouped by address, those aircraft appear
+as one track. Saying so is more honest than showing whichever arrived last.
+
 ## [1.5.0.7] — Unreleased
 
 Local reporting accuracy and bounded resources. Every surface on the node
