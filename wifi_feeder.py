@@ -649,10 +649,11 @@ def _wclassifier_readlink_base(path: str) -> str | None:
 
 def _wclassifier_parse_bands(iw_info: str) -> list:
     """Parse `iw phy info` output for supported bands (2.4 / 5) via
-    frequency list. Frequencies appear as '* 2412.0 MHz [1] (...)' lines."""
+    frequency list. Depending on the iw/kernel version, frequencies appear
+    as either '* 2412 MHz [1] (...)' or '* 2412.0 MHz [1] (...)' lines."""
     bands = set()
     for line in iw_info.splitlines():
-        m = re.search(r"\*\s+(\d{4})\.\d+\s+MHz\s+\[\d+\]", line)
+        m = re.search(r"\*\s+(\d{4})(?:\.\d+)?\s+MHz\s+\[\d+\]", line)
         if not m:
             continue
         freq = int(m.group(1))
