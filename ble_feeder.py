@@ -935,6 +935,17 @@ class BLEFeeder:
         event = {
             "node_id":              self.node_id,
             "observed_at":          datetime.now(timezone.utc).isoformat(),
+            # v1.5.0.8: epoch float alongside the ISO string. LocalPublisher
+            # publishes `"t": event.get("timestamp") or event.get("observed_at")`
+            # — wifi_feeder sets "timestamp" so its `t` is a float, while this
+            # feeder set only "observed_at", so its `t` was an ISO string.
+            # Consumers type-check `t` for a number, so every BLE event failed
+            # the check and was re-stamped with ingest time: after any web_ui
+            # restart the whole replayed BLE history rendered as LIVE, never
+            # ageing and never pruning, while WiFi aged correctly. Setting this
+            # makes both feeders emit the same type. "observed_at" is retained
+            # unchanged for existing external consumers.
+            "timestamp":            time.time(),
             "observed_monotonic":   time.monotonic(),
             "radio":                "ble",
             "source_mac":           device.address,

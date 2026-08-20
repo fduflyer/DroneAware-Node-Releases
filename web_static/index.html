@@ -1427,7 +1427,17 @@
       // via SSE near-instantly but their real broadcast time may be
       // much older. Using Date.now() here would make 10-hour-old
       // events look LIVE.
-      const eventTs = (typeof evt.t === "number") ? evt.t : (Date.now() / 1000);
+      // v1.5.0.8: accept both shapes. Pre-v1.5.0.8 ble_feeder sent `t` as an
+      // ISO-8601 string, which failed the number check and fell through to
+      // Date.now() — so replayed BLE events rendered as LIVE regardless of
+      // age, exactly what the note above says not to do. The ring survives
+      // upgrades, so string timestamps keep arriving after the feeder is fixed.
+      let eventTs = evt.t;
+      if (typeof eventTs === "string") {
+        const parsed = Date.parse(eventTs);
+        eventTs = Number.isNaN(parsed) ? null : parsed / 1000;
+      }
+      if (typeof eventTs !== "number") eventTs = Date.now() / 1000;
       let entry = state.macs.get(mac);
       if (!entry) {
         entry = { event: evt, first_seen: eventTs, last_seen: eventTs, marker: null, card: null };
