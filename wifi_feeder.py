@@ -2581,8 +2581,14 @@ class WiFiFeeder:
                     lat    = msg.get("latitude", "")
                     lon    = msg.get("longitude", "")
                     detail = f"UAS-ID={uas_id}" if uas_id else f"lat={lat} lon={lon}" if lat else ""
+                    # The channel comes from the radiotap header, so it is the
+                    # frequency the frame was actually received on rather than
+                    # the one the hopper believes it tuned to. That makes this
+                    # line the ground truth for whether the scan plan is doing
+                    # what it claims — which channels get visited, and which
+                    # one a camp is holding.
                     log.info(
-                        f"[WiFi-Beacon] MAC={addr2}  RSSI={rssi}dBm  "
+                        f"[WiFi-Beacon] ch{channel}  MAC={addr2}  RSSI={rssi}dBm  "
                         f"Type={mtype}  {detail}"
                     )
                 self.forwarder.add(event)
@@ -2596,7 +2602,7 @@ class WiFiFeeder:
             raw = body.hex().upper()
 
             if self.verbose:
-                log.info(f"[WiFi-NAN] MAC={addr2}  RSSI={rssi}dBm  raw={raw[:40]}...")
+                log.info(f"[WiFi-NAN] ch{channel}  MAC={addr2}  RSSI={rssi}dBm  raw={raw[:40]}...")
 
             event = {
                 "node_id":   self.node_id,
