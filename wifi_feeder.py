@@ -1485,6 +1485,17 @@ class DualBandHopper(threading.Thread):
         self.dwell_2g_s = self._parse_dwell("WIFI_DWELL_2G_SEC", self.DEFAULT_DWELL_2G_S)
         self.dwell_5g_s = self._parse_dwell("WIFI_DWELL_5G_SEC", self.DEFAULT_DWELL_5G_S)
 
+        # The sticky window must outlive a full dwell leg. A detection can
+        # only be evaluated at the *end* of the leg it was heard on, so a
+        # beacon arriving in the first moment of a 3s leg is already 3s old
+        # when it is looked at — with a fixed 3.0s window it expires exactly
+        # as it is read, and sticky mode never engages. Derive a floor from
+        # the longest leg instead of hardcoding one.
+        self.ACTIVE_WINDOW = max(
+            self.ACTIVE_WINDOW,
+            max(self.dwell_2g_s, self.dwell_5g_s) + 1.0,
+        )
+
         # If off-channel sweep is enabled but 2G budget can't accommodate
         # the 2×PEEK_S reserved for ch1+ch11, disable sweep rather than
         # produce a nonsensical schedule.
@@ -1531,6 +1542,9 @@ class DualBandHopper(threading.Thread):
     def _sleep_s(self, seconds: float) -> bool:
         return self._stop.wait(timeout=seconds)
 
+    def _recent_detection(self) -> bool:
+        return (time.time() - self.last_detection_time) < self.ACTIVE_WINDOW
+
     def run(self):
         if self.fixed_channel is not None:
             log.info(f"Dual-band hopper: FIXED_CHANNEL={self.fixed_channel} — locking, no hop")
@@ -1544,13 +1558,13 @@ class DualBandHopper(threading.Thread):
             f"Dual-band hopper started: "
             f"{self.dwell_2g_s}s ch{self.PRIMARY_CHANNEL_2G} + "
             f"{self.dwell_5g_s}s ch{self.PRIMARY_CHANNEL_5G} "
-            f"({cycle_s}s cycle), off-channel canary {canary}"
+            f"({cycle_s}s cycle), sticky window {self.ACTIVE_WINDOW}s, "
+            f"off-channel canary {canary}"
         )
         prev_mode = "sweep"
 
         while not self._stop.is_set():
-            in_active = (time.time() - self.last_detection_time) < self.ACTIVE_WINDOW
-            mode      = "sticky" if in_active else "sweep"
+            mode = "sticky" if self._recent_detection() else "sweep"
 
             if mode != prev_mode:
                 log.debug(f"DualBand hopper: {prev_mode}→{mode}")
@@ -1572,20 +1586,38 @@ class DualBandHopper(threading.Thread):
                     if self._sleep_s(self.STICKY_PEEK_MS / 1000.0):
                         return
             else:
+                # Re-check for a live detection before *leaving* each channel.
+                # A beacon can only ever be heard on the channel we are tuned
+                # to, so the decision to stay has to be made here, at the end
+                # of the leg — not at the top of the next iteration, by which
+                # point we have already spent a full dwell_5g_s tuned away
+                # from the channel that produced it. That retune is what made
+                # sticky mode a poll instead of a trigger.
                 if self.off_channel_sweep:
                     # 2G budget minus 2×PEEK_S reserved for ch1+ch11
                     primary_2g_s = self.dwell_2g_s - 2 * self.PEEK_S
                     self._set(self.PRIMARY_CHANNEL_2G)
                     if self._sleep_s(primary_2g_s):
                         break
+                    if self._recent_detection():
+                        continue
+                    peek_hit = False
                     for ch in self.PEEK_CHANNELS_2G:
                         self._set(ch)
                         if self._sleep_s(self.PEEK_S):
                             return
+                        if self._recent_detection():
+                            peek_hit = True
+                            break
+                    if peek_hit:
+                        continue
                 else:
                     self._set(self.PRIMARY_CHANNEL_2G)
                     if self._sleep_s(self.dwell_2g_s):
                         break
+
+                if self._recent_detection():
+                    continue
 
                 self._set(self.PRIMARY_CHANNEL_5G)
                 if self._sleep_s(self.dwell_5g_s):
