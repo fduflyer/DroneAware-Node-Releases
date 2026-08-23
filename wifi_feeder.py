@@ -1221,168 +1221,6 @@ class ChannelHopper(threading.Thread):
         self._stop.set()
 
 
-class AdaptiveChannelHopper(threading.Thread):
-    """
-    Two-mode channel hopper biased to ASTM F3411-mandated channels.
-
-    Spec basis: F3411 + opendroneid-core-c require 1 Hz Wi-Fi Beacon RID
-    broadcasts on channel 6 (2.4 GHz) or 149 (5 GHz). Off-channel broadcasts
-    must be at 5 Hz, which no manufacturer accepts.
-
-    Sweep mode (default — WIFI_OFF_CHANNEL_SWEEP=false):
-      100% dwell on channel 6. This is a compliant-operator detection platform;
-      fleet data shows ch1/ch11 carry zero unique drones (all off-band captures
-      are ch6 drift), so spending no time there is the empirically correct
-      default.
-
-    Sweep mode with off-channel canary (WIFI_OFF_CHANNEL_SWEEP=true, advanced):
-      ~80% on channel 6, brief peeks at 1 and 11 to surface any non-standard
-      transmitters that emerge in the future.
-
-    Sticky mode (active detection within ACTIVE_WINDOW):
-      Hold on the channel that produced the detection. Forced peek every
-      STICKY_PEEK_INTERVAL cycles to avoid lockout of other airspace.
-    """
-
-    # Defaults — overridable via config.env (v1.2.0+)
-    PRIMARY_CHANNEL       = 6
-    PEEK_CHANNELS         = [1, 11]
-    ACTIVE_WINDOW         = 3.0     # seconds — sticky-mode reset threshold
-
-    SWEEP_PRIMARY_MS      = 800
-    SWEEP_PEEK_MS         = 50
-    SWEEP_PRIMARY_TAIL_MS = 100     # → total sweep cycle ≈ 1000ms
-
-    STICKY_DWELL_MS       = 950
-    STICKY_PEEK_INTERVAL  = 10
-    STICKY_PEEK_MS        = 25
-
-    def __init__(self, iface: str):
-        super().__init__(daemon=True)
-        self.iface                  = iface
-        self.current_channel        = self.PRIMARY_CHANNEL
-        self.last_detection_time    = 0.0
-        self.last_detection_channel = self.PRIMARY_CHANNEL
-        self.sticky_cycle_count     = 0
-        self._stop                  = threading.Event()
-
-        # config.env overrides — log invalid values as warnings and fall back
-        def _parse_int(name: str, default):
-            raw = os.environ.get(name, "").strip()
-            if not raw:
-                return default
-            try:
-                return int(raw)
-            except ValueError:
-                log.warning(f"{name}={raw!r} is not an integer — using default {default}")
-                return default
-
-        def _parse_float(name: str, default):
-            raw = os.environ.get(name, "").strip()
-            if not raw:
-                return default
-            try:
-                return float(raw)
-            except ValueError:
-                log.warning(f"{name}={raw!r} is not a number — using default {default}")
-                return default
-
-        self.fixed_channel    = _parse_int("FIXED_CHANNEL", None)
-        self.active_window    = _parse_float("ACTIVE_WINDOW_SEC", self.ACTIVE_WINDOW)
-        self.sweep_primary_ms = _parse_int("DWELL_CH6_MS",  self.SWEEP_PRIMARY_MS)
-        self.sweep_peek_ms    = _parse_int("DWELL_PEEK_MS", self.SWEEP_PEEK_MS)
-
-        sweep_raw = os.environ.get("WIFI_OFF_CHANNEL_SWEEP", "false").strip().lower()
-        self.off_channel_sweep = sweep_raw in ("true", "1", "yes", "on")
-
-        # Guard against zero/negative dwells that would spin the loop
-        if self.sweep_primary_ms <= 0:
-            log.warning(f"DWELL_CH6_MS={self.sweep_primary_ms} invalid — using {self.SWEEP_PRIMARY_MS}")
-            self.sweep_primary_ms = self.SWEEP_PRIMARY_MS
-        if self.sweep_peek_ms < 0:
-            log.warning(f"DWELL_PEEK_MS={self.sweep_peek_ms} invalid — using {self.SWEEP_PEEK_MS}")
-            self.sweep_peek_ms = self.SWEEP_PEEK_MS
-
-    def notify_detection(self, channel: int | None):
-        """Called by the feeder when an RID packet is received."""
-        self.last_detection_time = time.time()
-        if channel is not None:
-            self.last_detection_channel = channel
-
-    @property
-    def target_channels(self) -> list:
-        if self.fixed_channel is not None:
-            return [self.fixed_channel]
-        chans = [self.PRIMARY_CHANNEL]
-        if self.off_channel_sweep:
-            chans.extend(self.PEEK_CHANNELS)
-        return chans
-
-    def _set(self, ch: int):
-        set_channel(self.iface, ch)
-        self.current_channel = ch
-
-    def _sleep_ms(self, ms: int) -> bool:
-        """Sleep for ms milliseconds, returning True if stop was signaled."""
-        return self._stop.wait(timeout=ms / 1000.0)
-
-    def run(self):
-        # FIXED_CHANNEL: lock to one channel forever (DFR / single-drone monitoring)
-        if self.fixed_channel is not None:
-            log.info(f"Adaptive hopper: FIXED_CHANNEL={self.fixed_channel} — locking, no hop")
-            self._set(self.fixed_channel)
-            self._stop.wait()
-            return
-
-        log.info(
-            f"Adaptive hopper started: primary=ch{self.PRIMARY_CHANNEL}, "
-            f"peek={self.PEEK_CHANNELS if self.off_channel_sweep else '[]'}, "
-            f"ACTIVE_WINDOW={self.active_window}s, "
-            f"DWELL_CH6_MS={self.sweep_primary_ms}, DWELL_PEEK_MS={self.sweep_peek_ms}"
-        )
-        prev_mode = "sweep"
-
-        while not self._stop.is_set():
-            in_active = (time.time() - self.last_detection_time) < self.active_window
-            mode      = "sticky" if in_active else "sweep"
-
-            if mode != prev_mode:
-                log.debug(f"Hopper: {prev_mode}→{mode}")
-                if mode == "sweep":
-                    self.sticky_cycle_count = 0
-                prev_mode = mode
-
-            if mode == "sticky":
-                self._set(self.last_detection_channel)
-                if self._sleep_ms(self.STICKY_DWELL_MS):
-                    break
-                self.sticky_cycle_count += 1
-
-                if self.sticky_cycle_count % self.STICKY_PEEK_INTERVAL == 0:
-                    for ch in self.PEEK_CHANNELS:
-                        self._set(ch)
-                        if self._sleep_ms(self.STICKY_PEEK_MS):
-                            return
-            else:
-                # Sweep cycle: primary → (optional peek1 → peek2 → primary_tail).
-                # Default is compliant-only (no peeks) — set WIFI_OFF_CHANNEL_SWEEP=true
-                # to surface non-standard transmitters on ch1/ch11.
-                self._set(self.PRIMARY_CHANNEL)
-                if self._sleep_ms(self.sweep_primary_ms):
-                    break
-                if self.off_channel_sweep:
-                    for ch in self.PEEK_CHANNELS:
-                        self._set(ch)
-                        if self._sleep_ms(self.sweep_peek_ms):
-                            return
-                    self._set(self.PRIMARY_CHANNEL)
-                    if self._sleep_ms(self.SWEEP_PRIMARY_TAIL_MS):
-                        break
-
-    def stop(self):
-        self._stop.set()
-
-
 class LockedChannelHopper(threading.Thread):
     """Lock the adapter to one channel permanently — no dwelling, no hopping.
 
@@ -1559,8 +1397,7 @@ class ScanPlanHopper(threading.Thread):
         self._last_frame = {}    # channel -> timestamp of most recent frame
         self._camp_ch    = None
 
-        # Retained for the legacy interface (_run_once logs it, and the
-        # AdaptiveChannelHopper contract includes it).
+        # Retained for the interface the other hopper classes share.
         self.last_detection_time    = 0.0
         self.last_detection_channel = self.current_channel
 
@@ -1592,8 +1429,9 @@ class ScanPlanHopper(threading.Thread):
         self.camp_release = (self.plan == "a")
 
         # Populated by _build_plan() once the interface can be queried.
-        self._explore  = []
+        self._explore   = []
         self._explore_i = 0
+        self._social    = None
 
     @staticmethod
     def _parse_num(var: str, default: float) -> float:
@@ -1625,18 +1463,30 @@ class ScanPlanHopper(threading.Thread):
             dropped = [c for c in candidates if c not in supported]
             if dropped:
                 log.info(f"Scan plan: PHY does not advertise {dropped} — excluded from explore")
+            # Same filter on the social legs. A 2.4-only adapter runs this
+            # same plan with the ch149 leg simply absent — ch6 plus a
+            # rotation over 1/5/9/11 — rather than needing a hopper of its
+            # own, and nothing spends dwell on a channel the radio cannot
+            # actually tune to.
+            self._social = [(c, d) for c, d in self._planned_social_legs()
+                            if c in supported]
+            missing = [c for c, _ in self._planned_social_legs() if c not in supported]
+            if missing:
+                log.info(f"Scan plan: PHY does not advertise social {missing} — leg dropped")
         else:
             log.warning(
                 "Scan plan: could not read supported channels from the PHY — "
-                "using the full explore list unfiltered"
+                "using the full channel list unfiltered"
             )
             self._explore = list(candidates)
+            self._social  = self._planned_social_legs()
 
         if not self._explore:
             log.warning("Scan plan: no explore channels available — social channels only")
+        if not self._social:
+            log.warning("Scan plan: no social channels available — explore only")
 
-    @property
-    def _social_legs(self) -> list:
+    def _planned_social_legs(self) -> list:
         if self.plan == "b":
             # Plan B's partner owns ch6 outright; giving any of B's time to
             # 2.4's social channel would duplicate coverage the pair already
@@ -1646,6 +1496,11 @@ class ScanPlanHopper(threading.Thread):
             (self.SOCIAL_2G, self.dwell_social_2g_s),
             (self.SOCIAL_5G, self.dwell_social_5g_s),
         ]
+
+    @property
+    def _social_legs(self) -> list:
+        """Social legs the radio can actually tune to (see _build_plan)."""
+        return self._social if self._social is not None else self._planned_social_legs()
 
     @property
     def target_channels(self) -> list:
@@ -1771,10 +1626,17 @@ class ScanPlanHopper(threading.Thread):
                 return False
         return False
 
-    def _other_band_social(self, camp_ch: int) -> tuple:
-        if camp_ch <= 14:
-            return (self.SOCIAL_5G, self.dwell_social_5g_s)
-        return (self.SOCIAL_2G, self.dwell_social_2g_s)
+    def _other_band_social(self, camp_ch: int):
+        """The other band's social leg, or None if this radio can't reach it.
+
+        None on a single-band adapter, where the camp release becomes an
+        explore visit alone.
+        """
+        want = self.SOCIAL_5G if camp_ch <= 14 else self.SOCIAL_2G
+        for ch, dwell in self._social_legs:
+            if ch == want:
+                return (ch, dwell)
+        return None
 
     def _camp(self) -> bool:
         """Hold the camped channel. Returns True if the thread should stop."""
@@ -1803,17 +1665,20 @@ class ScanPlanHopper(threading.Thread):
                 return False
 
             if self.camp_release and (time.time() - camp_start) >= self.camp_release_interval_s:
-                other, dwell = self._other_band_social(ch)
-                left = time.time()
-                self._set(other)
-                if self._sleep_s(dwell):
-                    return True
-                if self._armed(other):
-                    # The other band is live too. Move the camp rather than
-                    # returning to a channel that may have gone quiet.
-                    log.info(f"Camp: ch{other} active during release — moving camp")
-                    self._camp_ch = other
-                    return False
+                left  = time.time()
+                other = self._other_band_social(ch)
+                if other is not None:
+                    och, dwell = other
+                    self._set(och)
+                    if self._sleep_s(dwell):
+                        return True
+                    if self._armed(och):
+                        # The other band is live too. Move the camp rather
+                        # than returning to a channel that may have gone
+                        # quiet.
+                        log.info(f"Camp: ch{och} active during release — moving camp")
+                        self._camp_ch = och
+                        return False
 
                 # Advance the explore rotation during the release as well.
                 # Without this a camp blinds the node to every off-social
@@ -2642,10 +2507,15 @@ class WiFiFeeder:
 
                 if enable_5g:
                     log.info("Hopper mode: scan plan A — single dual-band adapter")
-                    self.hopper = ScanPlanHopper(iface, plan="a")
                 else:
-                    log.info("Hopper mode: adaptive (sweep + sticky, channel-6 biased)")
-                    self.hopper = AdaptiveChannelHopper(iface)
+                    # Same plan, 2.4 GHz only. The ch149 leg drops out
+                    # because the PHY does not advertise it, leaving ch6
+                    # plus a rotation over 1/5/9/11. Before v1.5.1 these
+                    # adapters ran a hopper of their own that sat on ch6
+                    # 100% of the time and never visited another channel —
+                    # which is how a Parrot on ch5 stays invisible.
+                    log.info("Hopper mode: scan plan A — 2.4 GHz only adapter")
+                self.hopper = ScanPlanHopper(iface, plan="a")
         self.count       = 0
         self.nan_count   = 0
         self._scanning   = False

@@ -85,15 +85,6 @@ EOF
 # true  — force-enable (warns and falls back if adapter doesn't support 5 GHz)
 # false — force-disable (stay on 2.4 GHz only even if adapter is dual-band)
 WIFI_5G_ENABLED=auto
-
-# Off-channel sweep (advanced opt-in). When enabled, the hopper adds brief
-# peeks at ch1 and ch11 (1 sec each per cycle) to surface any non-standard
-# transmitters that might appear on those channels in the future.
-# Empirical fleet data shows ~0% real ch1/ch11 broadcasts today (all observed
-# off-band captures are ch6 drift), so the default is OFF — the platform spends
-# 100% of cycle time on the channels where compliant RID actually transmits.
-# Enable only if you specifically want to chase non-compliant transmitters.
-WIFI_OFF_CHANNEL_SWEEP=false
 EOF
         info "Added v1.2.2 5 GHz scanning options to config.env"
     fi
@@ -177,48 +168,100 @@ EOF
         info "Added v1.4.0 LocalPublisher UDP targets option to config.env"
     fi
 
-    # v1.4.6 — configurable dual-band dwell times
-    # NOTE: this migration is documentation-only; wifi_feeder uses env-var
-    # defaults when the keys are absent. Writing the keys here surfaces
-    # the knobs in config.env so operators can discover + tune them.
-    if ! grep -q '^WIFI_DWELL_2G_SEC=' "$cfg"; then
-        [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
-        cat >> "$cfg" <<'EOF'
+    # The v1.4.6 WIFI_DWELL_2G_SEC / WIFI_DWELL_5G_SEC migration was removed
+    # in v1.5.1. It wrote two keys into every config.env that the feeder no
+    # longer reads, so on a fresh install the block below would only have had
+    # to comment them straight back out again. Nodes that already have them
+    # keep them (commented, with any tuned value carried across) — see below.
 
-# ─── Dual-band dwell times (added by droneaware update for v1.4.6+) ───
-# Applies ONLY in single-adapter mode with a dual-band card (droneaware-
-# wifi.service, one physical adapter alternating between bands). The
-# feeder cycles: WIFI_DWELL_2G_SEC on ch6 → WIFI_DWELL_5G_SEC on ch149
-# → repeat. Total cycle = sum of the two.
+    # v1.5.1 — the scan model replaces the ch6/ch149 alternation, and the
+    # feeder no longer reads WIFI_DWELL_2G_SEC / WIFI_DWELL_5G_SEC at all.
+    # Every node installed since v1.4.6 has those two keys sitting in
+    # config.env, so without this migration an operator who had deliberately
+    # weighted the split would silently be moved back to stock on update and
+    # have no way to tell. Carry any tuned value across into the new key, and
+    # comment the old ones out so they stop looking live.
+    if ! grep -q '^WIFI_DWELL_SOCIAL_2G_SEC=' "$cfg"; then
+        [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+
+        local old_2g old_5g new_2g new_5g
+        old_2g="$(_cfg_get "$cfg" WIFI_DWELL_2G_SEC)"
+        old_5g="$(_cfg_get "$cfg" WIFI_DWELL_5G_SEC)"
+        new_2g=4.0
+        new_5g=2.0
+
+        # 3 and 2 were the v1.4.6 stock values — those are the old defaults,
+        # not a preference, so they get replaced. Anything else was a
+        # deliberate edit and is preserved.
+        if [[ -n "$old_2g" && "$old_2g" != "3" ]]; then new_2g="$old_2g"; fi
+        if [[ -n "$old_5g" && "$old_5g" != "2" ]]; then new_5g="$old_5g"; fi
+
+        cat >> "$cfg" <<EOF
+
+# ─── Scan model (added by droneaware update for v1.5.1+) ───
+# Replaces WIFI_DWELL_2G_SEC / WIFI_DWELL_5G_SEC, which only ever let the
+# node see two channels — ch6 and ch149. A drone transmitting anywhere else
+# could not be detected however long it flew overhead.
 #
-# IGNORED in v1.5.0+ dual-adapter mode (droneaware-wifi-2g +
-# droneaware-wifi-5g services): each adapter is dedicated to one band
-# and locked to its channel — no dwelling, no hopping. Adjusting
-# these values does nothing when two monitor-capable USB adapters are
-# present. Run 'sudo droneaware refresh' to detect current mode.
+# The node now sweeps both bands. Dwell is deliberately INVERSE to how fast
+# a transmitter beacons:
 #
-# Also ignored on single-band-only setups (2.4-only adapter, no 5 GHz
-# card): feeder hops within 2.4 GHz, no dwell alternation to schedule.
+#   social channels (ch6, ch149)   1 Hz    long visits — one beacon a
+#                                          second, so a short visit misses
+#   everything else               >=5 Hz   short visits — a 1s visit gives
+#                                          five to eight chances to decode
 #
-# v1.4.6 slashed defaults from 20s / 10s (30s cycle) to 3s / 2s
-# (5s cycle) after operator feedback: a drone at 20 m/s cruise covers
-# 400m in 20s, exceeding typical 100-300m urban RID detection range.
-# The old defaults let drones fly through detection range on the
-# "wrong" band and never be seen. Channel-switch overhead is
-# milliseconds; more-frequent switching is the better trade.
+# That is not arbitrary. A compliant aircraft beacons on the social channel
+# no matter which channel its video and control link are using, and the
+# standard only lets it broadcast somewhere else if it raises its rate to
+# at least 5 Hz. So the rest of the band is cheap to cover, and the sweep
+# only has to FIND an aircraft — camping is what captures it.
 #
-# Tune the split to weight toward one band. Examples:
-#   Skydio-DFR-heavy area (weight toward 5 GHz):
-#     WIFI_DWELL_2G_SEC=1  WIFI_DWELL_5G_SEC=4
-#   DJI-heavy area (weight toward 2.4 GHz, still fast cycle):
-#     WIFI_DWELL_2G_SEC=4  WIFI_DWELL_5G_SEC=1
-#   Fastest reasonable cycle (~2 broadcasts per band per cycle):
-#     WIFI_DWELL_2G_SEC=2  WIFI_DWELL_5G_SEC=2
-# For 100% lock to one band, use FIXED_CHANNEL=6 or FIXED_CHANNEL=149.
-WIFI_DWELL_2G_SEC=3
-WIFI_DWELL_5G_SEC=2
+# Single dual-band adapter:  ${new_2g}s ch6 -> ${new_5g}s ch149 -> 1s one other
+# channel, rotating through 153/157/161/165 and 1/5/9/11.
+# Two adapters: one holds ch6 outright, the other sweeps everything else.
+#
+# Raising WIFI_DWELL_SOCIAL_2G_SEC weights the node toward 2.4 GHz (most
+# DJI), raising WIFI_DWELL_SOCIAL_5G_SEC weights it toward 5 GHz (Skydio,
+# Parrot). For a 100% lock to one channel use FIXED_CHANNEL=6 or 149.
+WIFI_DWELL_SOCIAL_2G_SEC=$new_2g
+WIFI_DWELL_SOCIAL_5G_SEC=$new_5g
+WIFI_DWELL_EXPLORE_SEC=1.0
+
+# Camping: hold the channel once a drone is heard on it, instead of
+# carrying on sweeping past it.
+#   TRIGGER_FRAMES / TRIGGER_WINDOW_SEC  frames needed to engage. Two
+#       within two seconds — one stray decode must not be able to pin the
+#       radio to an empty channel.
+#   SILENCE_SEC   let go after this long with nothing heard. The timer is
+#       per-channel and any frame resets it, so a second aircraft arriving
+#       keeps the node camped after the first one lands.
+#   RELEASE_INTERVAL_SEC  single-adapter only: how often to break off and
+#       check the other band. A lone radio camped on ch6 hears nothing at
+#       all from 5 GHz in between, so this is what stops one drone from
+#       hiding every other drone. Ignored with two adapters, where the
+#       sweeping adapter camps indefinitely because its partner never
+#       leaves ch6.
+WIFI_CAMP_TRIGGER_FRAMES=2
+WIFI_CAMP_TRIGGER_WINDOW_SEC=2.0
+WIFI_CAMP_SILENCE_SEC=6.0
+WIFI_CAMP_RELEASE_INTERVAL_SEC=9.5
 EOF
-        info "Added v1.4.6 dual-band dwell time options to config.env"
+        # WIFI_OFF_CHANNEL_SWEEP is gone as well. It was an opt-in that added
+        # brief peeks at ch1 and ch11, defaulted off on the grounds that fleet
+        # data showed nothing there — which was circular, since the fleet only
+        # ever scanned ch6. ch1/5/9/11 are now always in the rotation.
+        sed -i \
+            -e 's/^WIFI_DWELL_2G_SEC=\(.*\)$/# WIFI_DWELL_2G_SEC=\1   # superseded in v1.5.1 by WIFI_DWELL_SOCIAL_2G_SEC/' \
+            -e 's/^WIFI_DWELL_5G_SEC=\(.*\)$/# WIFI_DWELL_5G_SEC=\1   # superseded in v1.5.1 by WIFI_DWELL_SOCIAL_5G_SEC/' \
+            -e 's/^WIFI_OFF_CHANNEL_SWEEP=\(.*\)$/# WIFI_OFF_CHANNEL_SWEEP=\1   # retired in v1.5.1 — ch1\/5\/9\/11 are always scanned now/' \
+            "$cfg"
+
+        if [[ "$new_2g" != "4.0" || "$new_5g" != "2.0" ]]; then
+            info "Added v1.5.1 scan model options to config.env (kept your tuned dwell: ${new_2g}s / ${new_5g}s)"
+        else
+            info "Added v1.5.1 scan model options to config.env"
+        fi
     fi
 
     # ─── WIFI_ADAPTER_MAC (added by droneaware update for v1.5.0+) ───
