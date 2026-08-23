@@ -77,9 +77,9 @@ EOF
         cat >> "$cfg" <<'EOF'
 
 # ─── 5 GHz scanning (added by droneaware update for v1.2.2+) ───
-# Single dual-band adapter runs a 30s cycle (ASTM-compliant channels only):
-#   20s ch6 (2.4 GHz RID) → 10s ch149 (5 GHz RID).
-# Requires the adapter to expose channel 149 in monitor mode.
+# Whether to scan 5 GHz at all. Requires the adapter to expose channel 149
+# in monitor mode. The channel plan itself is set further down, under the
+# scan model keys.
 #
 # auto  — detect dual-band capability at startup (recommended)
 # true  — force-enable (warns and falls back if adapter doesn't support 5 GHz)
@@ -1783,7 +1783,7 @@ def build_beacon(src_mac, payload):
     frame = radiotap + fc + dur + da + src_mac + src_mac + bytes([0x00, 0x00]) + body
     return frame
 
-# Flight path: paper-airplane shape (simplified) centred on node location
+# Flight path: paper-airplane shape (simplified) centered on node location
 # Offsets in degrees (~0.0001 deg ≈ 11m)
 R = 0.0004   # ~44m radius
 waypoints = []
@@ -1791,13 +1791,13 @@ waypoints = []
 waypoints.append((lat + R*1.5, lon))
 # Right wing tip
 waypoints.append((lat - R*0.5, lon + R*1.2))
-# Tail centre
+# Tail center
 waypoints.append((lat - R*0.8, lon))
 # Left wing tip
 waypoints.append((lat - R*0.5, lon - R*1.2))
 # Back to nose
 waypoints.append((lat + R*1.5, lon))
-# Tight circle around centre to finish
+# Tight circle around center to finish
 for i in range(8):
     angle = math.radians(i * 45)
     waypoints.append((lat + R*0.4*math.sin(angle), lon + R*0.4*math.cos(angle)))
@@ -1860,21 +1860,29 @@ try:
             counts[ch] = counts.get(ch, 0) + 1
 except FileNotFoundError:
     pass
-print(total, counts.get(6, 0), counts.get(149, 0))
+# v1.5.1 scans every channel in the plan, not just ch6 and ch149, so report
+# by band with the per-channel breakdown behind it, rather than naming two
+# channels that are no longer the only ones in play.
+chans = {c: n for c, n in counts.items() if isinstance(c, int)}
+b24 = sum(n for c, n in chans.items() if c <= 14)
+b5  = sum(n for c, n in chans.items() if c > 14)
+detail = " ".join(f"ch{c}={n}" for c, n in sorted(chans.items()))
+print(total, b24, b5, detail or "-")
 PYJSON
 )
 
-    local total ch6 ch149
-    read -r total ch6 ch149 <<< "${stats:-0 0 0}"
+    local total b24 b5 detail
+    read -r total b24 b5 detail <<< "${stats:-0 0 0 -}"
 
     if [[ "$total" -eq 0 ]]; then
         warn "No local detection found yet — the server may still be processing."
         warn "Check your My Nodes page in 30 seconds."
     else
         info "Local detection confirmed — ${total} events captured"
-        echo "       2.4 GHz (ch  6) : ${ch6}"
-        echo "       5 GHz  (ch 149) : ${ch149}"
-        if [[ "$ch6" -gt 0 && "$ch149" -gt 0 ]]; then
+        echo "       2.4 GHz : ${b24}"
+        echo "       5 GHz   : ${b5}"
+        [[ "$detail" != "-" ]] && echo "       by channel : ${detail}"
+        if [[ "$b24" -gt 0 && "$b5" -gt 0 ]]; then
             info "Both bands receiving — radio fully functional."
         fi
     fi

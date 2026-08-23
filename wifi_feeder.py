@@ -667,7 +667,7 @@ def _wclassifier_parse_bands(iw_info: str) -> list:
 
     Both the leading bullet and the decimal are now optional; "NNNN MHz [N]"
     is distinctive enough on its own. Disabled channels still count toward
-    band capability, which is unchanged behaviour — the question here is
+    band capability, which is unchanged behavior — the question here is
     what the radio can physically do, not what regulatory currently allows.
     """
     bands = set()
