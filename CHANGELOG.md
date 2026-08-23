@@ -10,6 +10,48 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.5.0.9] — Unreleased
+
+A single fix. Nodes running the currently supported OS could report having
+no WiFi adapter at all while one was connected and working.
+
+### A working adapter was reported as absent, and scanning quietly degraded
+
+The feeder and the CLI both determine which bands an adapter supports by
+reading the frequency list from `iw`. That output is formatted slightly
+differently depending on the version of `iw` installed:
+
+    older releases   * 2412 MHz [1] (30.0 dBm)
+    newer releases   * 2412.0 MHz [1] (20.0 dBm)
+
+Both parsers required the decimal, so on the older format they found no
+frequencies and concluded the adapter supported no bands at all.
+
+The visible symptom was both bands showing "Absent — no capable adapter"
+in the local interface, on `droneaware status`, and on the node's page,
+even though the adapter was present, in monitor mode, and reported by the
+same command that said it was absent.
+
+The more serious effect was not visible at all. With no band information,
+no adapter roles are assigned, and the feeder falls back to its legacy
+channel plan — an even sweep of channels 1 through 11 at a fifth of a
+second each. That is shorter than the interval between Remote ID
+broadcasts, so most visits to a channel end before anything is
+transmitted, and the great majority of the time is spent on channels that
+carry almost no Remote ID traffic. Affected nodes were still running, but
+detecting a small fraction of what they should, and reporting nothing in a
+way that resembles quiet airspace rather than a fault.
+
+Both parsers now accept either format. A node whose adapter is correctly
+detected will report its bands correctly on all three surfaces after the
+update, which re-runs hardware detection automatically.
+
+Separately, if the frequency list is ever unreadable in future, the feeder
+now says so plainly. Previously an empty result was silent, and surfaced
+only as two contradictory warnings about the same adapter — that it was
+2.4 GHz-only and 5 GHz-only at the same time — which is what made this
+difficult to recognize from a log.
+
 ## [1.5.0.8] — Unreleased
 
 Local reporting correctness, and radios that recover on their own.

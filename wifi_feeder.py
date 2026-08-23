@@ -648,11 +648,31 @@ def _wclassifier_readlink_base(path: str) -> str | None:
 
 
 def _wclassifier_parse_bands(iw_info: str) -> list:
-    """Parse `iw phy info` output for supported bands (2.4 / 5) via
-    frequency list. Frequencies appear as '* 2412.0 MHz [1] (...)' lines."""
+    r"""Parse `iw phy info` output for supported bands (2.4 / 5) via
+    frequency list.
+
+    The frequency format varies by iw version and the previous pattern
+    required a decimal that older releases do not print:
+
+        iw 6.9  (trixie)    * 2412.0 MHz [1] (20.0 dBm)
+        iw 5.19 (bookworm)  * 2412 MHz [1] (30.0 dBm)
+
+    Requiring "\d{4}\.\d+" matched only the newer form, so on Bookworm —
+    the supported platform — this returned an empty list for every adapter.
+    That is not a cosmetic failure: with no bands, no roles are assigned,
+    both bands report "absent" as though no radio were present, and the
+    feeder falls back to the legacy flat 1-11 hopper at 0.2s dwell, which
+    is below the 1 Hz beacon interval. Nodes looked like quiet airspace
+    rather than misconfigured ones.
+
+    Both the leading bullet and the decimal are now optional; "NNNN MHz [N]"
+    is distinctive enough on its own. Disabled channels still count toward
+    band capability, which is unchanged behaviour — the question here is
+    what the radio can physically do, not what regulatory currently allows.
+    """
     bands = set()
     for line in iw_info.splitlines():
-        m = re.search(r"\*\s+(\d{4})\.\d+\s+MHz\s+\[\d+\]", line)
+        m = re.search(r"(\d{4})(?:\.\d+)?\s+MHz\s+\[\d+\]", line)
         if not m:
             continue
         freq = int(m.group(1))
@@ -660,6 +680,17 @@ def _wclassifier_parse_bands(iw_info: str) -> list:
             bands.add("2.4")
         elif 5000 <= freq <= 6000:
             bands.add("5")
+    if not bands and iw_info.strip():
+        # Non-empty iw output that yielded no frequencies means the format
+        # changed again. Say so: an empty band list is otherwise silent and
+        # surfaces only as two contradictory warnings ("2.4GHz-only" AND
+        # "5GHz-only" for the same adapter), which is how this went
+        # undiagnosed in the field.
+        log.warning(
+            "[classifier] could not parse any frequencies from iw output — "
+            "band detection unavailable, adapter roles may be wrong. "
+            "Check `iw phy <phy> info` formatting for this iw version."
+        )
     return sorted(bands)
 
 

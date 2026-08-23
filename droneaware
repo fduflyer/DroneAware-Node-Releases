@@ -586,9 +586,17 @@ def _link(p):
     except OSError: return None
 
 def _bands(info):
+    # iw frequency format varies by version and the old pattern required a
+    # decimal that Bookworm's iw 5.19 does not print:
+    #   iw 6.9  (trixie)   * 2412.0 MHz [1]
+    #   iw 5.19 (bookworm) * 2412 MHz [1]
+    # Requiring the decimal returned no bands at all on the supported
+    # platform, so no adapter roles were assigned. Bullet and decimal are
+    # both optional now. Keep in sync with _wclassifier_parse_bands in
+    # wifi_feeder.py — the CLI and the feeder must agree about the hardware.
     b = set()
     for line in info.splitlines():
-        m = re.search(r"\*\s+(\d{4})\.\d+\s+MHz\s+\[\d+\]", line)
+        m = re.search(r"(\d{4})(?:\.\d+)?\s+MHz\s+\[\d+\]", line)
         if m:
             f = int(m.group(1))
             if 2400 <= f <= 2500: b.add("2.4")
