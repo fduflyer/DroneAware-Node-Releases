@@ -1384,16 +1384,24 @@ class AdaptiveChannelHopper(threading.Thread):
 
 
 class LockedChannelHopper(threading.Thread):
-    """v1.5.0 dual-adapter mode: lock the adapter to one channel
-    permanently. Used when the wifi_feeder process is spawned with
-    `--band=5g` (locks to channel 149) so that a dedicated adapter
-    stays continuously tuned to the 5 GHz RID channel — no dwelling,
-    no hopping.
+    """Lock the adapter to one channel permanently — no dwelling, no hopping.
+
+    v1.5.1 uses this for the ch6 half of a dual-adapter pair (`--band=2g`),
+    where it is the highest-value radio on the node: ~90% of everything we
+    have ever detected is on ch6, and this adapter never leaves it. Its
+    partner (`--band=5g`, a ScanPlanHopper on plan B) sweeps everything else
+    and is free to camp indefinitely precisely because this one never moves.
 
     Contract-compatible with the other hopper classes (start/stop,
     current_channel, target_channels, notify_detection). notify_detection
     is a no-op because there's nothing to switch to.
     """
+
+    # Re-assert the channel periodically. `iw set channel` is idempotent and
+    # costs a few milliseconds, which is a cheap guard against a driver reset
+    # or an stray retune silently parking the node's primary radio somewhere
+    # useless for the rest of the process lifetime.
+    REASSERT_S = 30.0
 
     def __init__(self, iface: str, channel: int):
         super().__init__(daemon=True)
@@ -1406,8 +1414,8 @@ class LockedChannelHopper(threading.Thread):
     def run(self):
         set_channel(self.iface, self.channel)
         log.info(f"Locked channel hopper: {self.iface} → ch{self.channel} (no hop)")
-        # Set once, then block. No tuning needed for the lifetime of the process.
-        self._stop.wait()
+        while not self._stop.wait(timeout=self.REASSERT_S):
+            set_channel(self.iface, self.channel)
 
     def stop(self):
         self._stop.set()
@@ -1416,60 +1424,145 @@ class LockedChannelHopper(threading.Thread):
         pass
 
 
-class DualBandHopper(threading.Thread):
+class ScanPlanHopper(threading.Thread):
     """
-    Fast-cycle hopper for dual-band adapters (2.4 GHz + 5 GHz).
+    v1.5.1 scan model — social-weighted sweep with a camp trigger.
 
-    Sweep mode default (WIFI_OFF_CHANNEL_SWEEP=false):
-        WIFI_DWELL_2G_SEC ch6 → WIFI_DWELL_5G_SEC ch149
-        Defaults: 3s + 2s = 5s cycle.
+    Replaces the v1.4.6 two-channel alternation (ch6 ⇄ ch149, nothing else
+    ever visited). The plan below rests on manufacturer-published channel
+    behavior, deliberately NOT on our own detection history: we can only
+    ever have counted drones on channels we were already scanning, so
+    narrowing the plan toward our own top channels would be circular.
 
-    Sweep mode with off-channel canary (WIFI_OFF_CHANNEL_SWEEP=true, advanced):
-        (WIFI_DWELL_2G_SEC - 2) ch6 → 1s ch1 → 1s ch11 → WIFI_DWELL_5G_SEC ch149
+    Two published facts drive the whole design.
 
-    Sticky mode (detection within ACTIVE_WINDOW): hold on the detected channel.
-    Periodic peek at the other band's primary every STICKY_PEEK_INTERVAL cycles.
+    1. The C2 link and the RID beacon channel are decoupled. An aircraft
+       flying its control link on ch157 still beacons on the social channel
+       — ch6 on 2.4 GHz, ch149 on 5 GHz — by tuning away for ~10 ms once a
+       second and deliberately withholding the channel-switch announcement
+       so its controller does not follow (Skydio patent US 12,559,265).
+       Where the video sits tells you nothing about where the beacon sits.
 
-    v1.4.6 slashed default dwell times from 20s / 10s (30s cycle) to 3s / 2s
-    (5s cycle) after operator feedback that the old defaults let drones fly
-    through detection range unseen — a drone at 20 m/s cruise covers 400m in
-    20 seconds, exceeding typical 100-300m urban RID detection range on the
-    "wrong" band. Channel-switch overhead is milliseconds; sitting on one
-    band for 20s to avoid it was clearly the wrong trade. Both defaults are
-    tunable now via env vars for operators who want to weight toward one
-    band (e.g., Skydio-DFR hunting on 5 GHz).
+    2. F3411 lets a transmitter leave the social channel only if it raises
+       its beacon rate to >=5 Hz. So dwell is *inversely* proportional to
+       broadcast rate: social channels need long visits because they carry
+       one beacon per second, and every other channel needs only a brief
+       one because anything transmitting there is transmitting fast.
 
-    Empirical data (project_detection_data memory): ch1/ch11 carry zero unique
-    drones — all off-band captures are ch6 drift. Default is compliant-only;
-    advanced users can enable peeks via WIFI_OFF_CHANNEL_SWEEP=true to surface
-    any future non-standard transmitters.
+    The consequence is that covering the rest of the band is cheap. A 1 s
+    visit to an off-social channel yields 5-8 chances to decode; a 1 s visit
+    to ch6 yields one. The sweep only has to ACQUIRE — camping captures.
+
+    Plan A — single dual-band adapter (WIFI_SCAN_PLAN=a, the default):
+
+        ch6      4.0s   every cycle
+        ch149    2.0s   every cycle
+        explore  1.0s   one per cycle, rotating        7.0s cycle
+
+    ch6 keeps ~57% of airtime because that is where nearly everything we
+    have ever seen has been; the explore slot is funded out of ch149, not
+    out of ch6. A full explore rotation takes ~56 s.
+
+    Plan B — the sweeping half of a dual-adapter pair (WIFI_SCAN_PLAN=b):
+
+        ch149    2.0s
+        explore  1.0s each, all of them               10.0s cycle
+
+    No ch6 leg at all, because the paired adapter holds ch6 100% of the
+    time and never retunes. That is the entire payoff of a second radio,
+    and it is why plan B also camps indefinitely (see below).
+
+    Camping
+    -------
+    On detection the hopper stops sweeping and holds the channel.
+
+      entry   two RID frames on the same channel within
+              WIFI_CAMP_TRIGGER_WINDOW_SEC — one stray decode must not be
+              able to pin the radio for the next several seconds
+      exit    no frames on the camped channel for WIFI_CAMP_SILENCE_SEC.
+              The timer is scoped to the channel and reset by any frame, so
+              a second aircraft arriving keeps the camp alive after the
+              first one lands
+      release plan A only: every WIFI_CAMP_RELEASE_INTERVAL_SEC, give the
+              other band one full social leg plus the next explore channel,
+              then resume the camp. A single radio camped on ch6 otherwise
+              gets literally zero frames from anywhere else for as long as
+              the camp lasts — including from a second aircraft sitting on
+              an off-social channel. Plan B has no release at all, because
+              its partner never leaves ch6.
+
+    Time spent away on a release leg is not counted against the camp's
+    silence timer — otherwise a 1 Hz camp could be dropped by its own
+    release.
+
+    Known gap: a transmitter beaconing at 1 Hz on an off-social channel
+    (out of spec — leaving social requires >=5 Hz) yields at most one frame
+    per explore visit and so never arms the camp. It is still decoded,
+    forwarded, and reported; it just does not get the radio held for it.
     """
 
-    PRIMARY_CHANNEL_2G    = 6
-    PRIMARY_CHANNEL_5G    = 149
-    PEEK_CHANNELS_2G      = [1, 11]
-    ACTIVE_WINDOW         = 3.0
+    SOCIAL_2G = 6
+    SOCIAL_5G = 149
 
-    # Fallback constants used when env vars unset or invalid.
-    DEFAULT_DWELL_2G_S    = 3.0
-    DEFAULT_DWELL_5G_S    = 2.0
-    PEEK_S                = 1.0
+    # Explore candidates, filtered at runtime against what the PHY actually
+    # advertises — that filter is what lets one list serve every regulatory
+    # domain and every adapter.
+    #
+    # 5 GHz is U-NII-3 only, for now:
+    #   U-NII-1 (36-48)   indoor-restricted and low power, and a compliant
+    #                     transmitter beacons on 149 regardless of where its
+    #                     C2 link sits, so there is little reason to expect
+    #                     RID there. Revisit if one ever turns up.
+    #   DFS (52-144)      an aircraft must run a 60 s channel-availability
+    #                     check to use it and vacate on radar detect;
+    #                     Skydio's own UI charges about a minute to enable
+    #                     it. Manufacturers visibly design around this band.
+    #   U-NII-4 (169-177) some MT76 adapters advertise it, but the power
+    #                     rules are unverified. Left out until checked.
+    #
+    # 2.4 GHz goes past 1/6/11 because Parrot's published table is 5 MHz
+    # steps from ch1 through ch11 — which is exactly how an ANAFI turned up
+    # on ch5. ch13 is listed but only ever survives the PHY filter on
+    # EU-regulatory adapters, which is the point of filtering rather than
+    # hardcoding.
+    EXPLORE_5G_CANDIDATES = [153, 157, 161, 165]
+    EXPLORE_2G_CANDIDATES = [1, 5, 9, 11, 13]
 
-    STICKY_DWELL_MS       = 950
-    STICKY_PEEK_INTERVAL  = 10
-    STICKY_PEEK_MS        = 25
+    DEFAULT_DWELL_SOCIAL_2G_S = 4.0
+    DEFAULT_DWELL_SOCIAL_5G_S = 2.0
+    DEFAULT_DWELL_EXPLORE_S   = 1.0
 
-    def __init__(self, iface: str):
+    DEFAULT_CAMP_TRIGGER_FRAMES     = 2
+    DEFAULT_CAMP_TRIGGER_WINDOW_S   = 2.0
+    DEFAULT_CAMP_SILENCE_S          = 6.0
+    DEFAULT_CAMP_RELEASE_INTERVAL_S = 9.5
+
+    # Sleep granularity while camped. Nothing retunes on this tick — it is
+    # only how often the silence and release timers get looked at.
+    CAMP_POLL_S = 0.5
+
+    def __init__(self, iface: str, plan: str = "a"):
         super().__init__(daemon=True)
-        self.iface                  = iface
-        self.current_channel        = self.PRIMARY_CHANNEL_2G
-        self.last_detection_time    = 0.0
-        self.last_detection_channel = self.PRIMARY_CHANNEL_2G
-        self.sticky_cycle_count     = 0
-        self._stop                  = threading.Event()
+        self.iface = iface
+        self.plan  = (plan or "a").strip().lower()
+        if self.plan not in ("a", "b"):
+            log.warning(f"WIFI_SCAN_PLAN={plan!r} unrecognized — using plan a")
+            self.plan = "a"
 
-        sweep_raw = os.environ.get("WIFI_OFF_CHANNEL_SWEEP", "false").strip().lower()
-        self.off_channel_sweep = sweep_raw in ("true", "1", "yes", "on")
+        self.current_channel = self.SOCIAL_2G if self.plan == "a" else self.SOCIAL_5G
+        self._stop = threading.Event()
+
+        # Detection bookkeeping, written from the capture thread and read
+        # from the hopper thread, hence the lock.
+        self._lock       = threading.Lock()
+        self._hits       = {}    # channel -> [timestamps inside the trigger window]
+        self._last_frame = {}    # channel -> timestamp of most recent frame
+        self._camp_ch    = None
+
+        # Retained for the legacy interface (_run_once logs it, and the
+        # AdaptiveChannelHopper contract includes it).
+        self.last_detection_time    = 0.0
+        self.last_detection_channel = self.current_channel
 
         raw = os.environ.get("FIXED_CHANNEL", "").strip()
         try:
@@ -1478,37 +1571,32 @@ class DualBandHopper(threading.Thread):
             log.warning(f"FIXED_CHANNEL={raw!r} is not an integer — ignoring")
             self.fixed_channel = None
 
-        # v1.4.6: WIFI_DWELL_2G_SEC / WIFI_DWELL_5G_SEC override the class
-        # defaults so operators can weight toward one band. Skydio-DFR
-        # areas might want WIFI_DWELL_5G_SEC=5 WIFI_DWELL_2G_SEC=1;
-        # DJI-heavy areas might want the reverse.
-        self.dwell_2g_s = self._parse_dwell("WIFI_DWELL_2G_SEC", self.DEFAULT_DWELL_2G_S)
-        self.dwell_5g_s = self._parse_dwell("WIFI_DWELL_5G_SEC", self.DEFAULT_DWELL_5G_S)
+        self.dwell_social_2g_s = self._parse_num(
+            "WIFI_DWELL_SOCIAL_2G_SEC", self.DEFAULT_DWELL_SOCIAL_2G_S)
+        self.dwell_social_5g_s = self._parse_num(
+            "WIFI_DWELL_SOCIAL_5G_SEC", self.DEFAULT_DWELL_SOCIAL_5G_S)
+        self.dwell_explore_s = self._parse_num(
+            "WIFI_DWELL_EXPLORE_SEC", self.DEFAULT_DWELL_EXPLORE_S)
 
-        # The sticky window must outlive a full dwell leg. A detection can
-        # only be evaluated at the *end* of the leg it was heard on, so a
-        # beacon arriving in the first moment of a 3s leg is already 3s old
-        # when it is looked at — with a fixed 3.0s window it expires exactly
-        # as it is read, and sticky mode never engages. Derive a floor from
-        # the longest leg instead of hardcoding one.
-        self.ACTIVE_WINDOW = max(
-            self.ACTIVE_WINDOW,
-            max(self.dwell_2g_s, self.dwell_5g_s) + 1.0,
-        )
+        self.camp_trigger_frames = int(self._parse_num(
+            "WIFI_CAMP_TRIGGER_FRAMES", self.DEFAULT_CAMP_TRIGGER_FRAMES))
+        self.camp_trigger_window_s = self._parse_num(
+            "WIFI_CAMP_TRIGGER_WINDOW_SEC", self.DEFAULT_CAMP_TRIGGER_WINDOW_S)
+        self.camp_silence_s = self._parse_num(
+            "WIFI_CAMP_SILENCE_SEC", self.DEFAULT_CAMP_SILENCE_S)
+        self.camp_release_interval_s = self._parse_num(
+            "WIFI_CAMP_RELEASE_INTERVAL_SEC", self.DEFAULT_CAMP_RELEASE_INTERVAL_S)
 
-        # If off-channel sweep is enabled but 2G budget can't accommodate
-        # the 2×PEEK_S reserved for ch1+ch11, disable sweep rather than
-        # produce a nonsensical schedule.
-        if self.off_channel_sweep and self.dwell_2g_s <= 2 * self.PEEK_S:
-            log.warning(
-                f"WIFI_DWELL_2G_SEC={self.dwell_2g_s}s is too small for "
-                f"off-channel peeks ({2 * self.PEEK_S}s reserved for ch1+ch11). "
-                "Disabling WIFI_OFF_CHANNEL_SWEEP for this run."
-            )
-            self.off_channel_sweep = False
+        # Plan B's partner adapter never leaves ch6, so plan B never has to
+        # give the other band a turn.
+        self.camp_release = (self.plan == "a")
+
+        # Populated by _build_plan() once the interface can be queried.
+        self._explore  = []
+        self._explore_i = 0
 
     @staticmethod
-    def _parse_dwell(var: str, default: float) -> float:
+    def _parse_num(var: str, default: float) -> float:
         raw = os.environ.get(var, "").strip()
         if not raw:
             return default
@@ -1518,22 +1606,54 @@ class DualBandHopper(threading.Thread):
                 raise ValueError("must be positive")
             return val
         except ValueError as e:
-            log.warning(f"{var}={raw!r} invalid ({e}) — using default {default}s")
+            log.warning(f"{var}={raw!r} invalid ({e}) — using default {default}")
             return default
 
-    def notify_detection(self, channel: int | None):
-        self.last_detection_time = time.time()
-        if channel is not None:
-            self.last_detection_channel = channel
+    def _build_plan(self):
+        """Filter the explore candidates against what the PHY advertises.
+
+        A 5 GHz-only card drops the 2.4 entries, a US card drops ch13, an
+        adapter with an unusual regulatory domain drops whatever it cannot
+        tune. If the query fails entirely, fall back to the full candidate
+        list and let set_channel fail per-channel rather than scanning
+        nothing at all.
+        """
+        supported = _supported_channels(self.iface) if self.iface else set()
+        candidates = self.EXPLORE_5G_CANDIDATES + self.EXPLORE_2G_CANDIDATES
+        if supported:
+            self._explore = [c for c in candidates if c in supported]
+            dropped = [c for c in candidates if c not in supported]
+            if dropped:
+                log.info(f"Scan plan: PHY does not advertise {dropped} — excluded from explore")
+        else:
+            log.warning(
+                "Scan plan: could not read supported channels from the PHY — "
+                "using the full explore list unfiltered"
+            )
+            self._explore = list(candidates)
+
+        if not self._explore:
+            log.warning("Scan plan: no explore channels available — social channels only")
+
+    @property
+    def _social_legs(self) -> list:
+        if self.plan == "b":
+            # Plan B's partner owns ch6 outright; giving any of B's time to
+            # 2.4's social channel would duplicate coverage the pair already
+            # has 100% of.
+            return [(self.SOCIAL_5G, self.dwell_social_5g_s)]
+        return [
+            (self.SOCIAL_2G, self.dwell_social_2g_s),
+            (self.SOCIAL_5G, self.dwell_social_5g_s),
+        ]
 
     @property
     def target_channels(self) -> list:
         if self.fixed_channel is not None:
             return [self.fixed_channel]
-        chans = [self.PRIMARY_CHANNEL_2G, self.PRIMARY_CHANNEL_5G]
-        if self.off_channel_sweep:
-            chans.extend(self.PEEK_CHANNELS_2G)
-        return chans
+        social = [ch for ch, _ in self._social_legs]
+        explore = self._explore or (self.EXPLORE_5G_CANDIDATES + self.EXPLORE_2G_CANDIDATES)
+        return social + explore
 
     def _set(self, ch: int):
         set_channel(self.iface, ch)
@@ -1542,86 +1662,186 @@ class DualBandHopper(threading.Thread):
     def _sleep_s(self, seconds: float) -> bool:
         return self._stop.wait(timeout=seconds)
 
-    def _recent_detection(self) -> bool:
-        return (time.time() - self.last_detection_time) < self.ACTIVE_WINDOW
+    # -- detection bookkeeping ------------------------------------------------
+
+    def notify_detection(self, channel: int | None):
+        """Called from the capture thread for every decoded RID frame."""
+        now = time.time()
+        if channel is None:
+            channel = self.current_channel
+
+        self.last_detection_time    = now
+        self.last_detection_channel = channel
+
+        with self._lock:
+            self._last_frame[channel] = now
+            hits = [t for t in self._hits.get(channel, ())
+                    if now - t <= self.camp_trigger_window_s]
+            hits.append(now)
+            self._hits[channel] = hits
+
+    def _armed(self, ch: int) -> bool:
+        """True once enough frames have landed on ch inside the trigger window."""
+        now = time.time()
+        with self._lock:
+            hits = [t for t in self._hits.get(ch, ())
+                    if now - t <= self.camp_trigger_window_s]
+            self._hits[ch] = hits
+        return len(hits) >= self.camp_trigger_frames
+
+    def _last_frame_ts(self, ch: int) -> float:
+        with self._lock:
+            return self._last_frame.get(ch, 0.0)
+
+    # -- scanning -------------------------------------------------------------
 
     def run(self):
         if self.fixed_channel is not None:
-            log.info(f"Dual-band hopper: FIXED_CHANNEL={self.fixed_channel} — locking, no hop")
+            log.info(f"Scan plan: FIXED_CHANNEL={self.fixed_channel} — locking, no hop")
             self._set(self.fixed_channel)
             self._stop.wait()
             return
 
-        canary = "enabled" if self.off_channel_sweep else "disabled"
-        cycle_s = self.dwell_2g_s + self.dwell_5g_s
+        self._build_plan()
+
+        social = " + ".join(f"{d}s ch{c}" for c, d in self._social_legs)
+        if self.plan == "a":
+            cycle = sum(d for _, d in self._social_legs) + self.dwell_explore_s
+            explore_desc = (
+                f"1 of {len(self._explore)} explore @ {self.dwell_explore_s}s "
+                f"(full rotation {len(self._explore) * cycle:.0f}s)"
+            )
+        else:
+            cycle = (sum(d for _, d in self._social_legs)
+                     + len(self._explore) * self.dwell_explore_s)
+            explore_desc = f"all {len(self._explore)} explore @ {self.dwell_explore_s}s"
         log.info(
-            f"Dual-band hopper started: "
-            f"{self.dwell_2g_s}s ch{self.PRIMARY_CHANNEL_2G} + "
-            f"{self.dwell_5g_s}s ch{self.PRIMARY_CHANNEL_5G} "
-            f"({cycle_s}s cycle), sticky window {self.ACTIVE_WINDOW}s, "
-            f"off-channel canary {canary}"
+            f"Scan plan {self.plan.upper()} started: {social} + {explore_desc} "
+            f"({cycle:.1f}s cycle); camp after {self.camp_trigger_frames} frames/"
+            f"{self.camp_trigger_window_s}s, release on {self.camp_silence_s}s silence"
+            + (f", other-band leg every {self.camp_release_interval_s}s"
+               if self.camp_release else ", no release (partner holds ch6)")
         )
-        prev_mode = "sweep"
 
         while not self._stop.is_set():
-            mode = "sticky" if self._recent_detection() else "sweep"
-
-            if mode != prev_mode:
-                log.debug(f"DualBand hopper: {prev_mode}→{mode}")
-                if mode == "sweep":
-                    self.sticky_cycle_count = 0
-                prev_mode = mode
-
-            if mode == "sticky":
-                self._set(self.last_detection_channel)
-                if self._sleep_s(self.STICKY_DWELL_MS / 1000.0):
+            if self._camp_ch is None:
+                if self._sweep_cycle():
                     break
-                self.sticky_cycle_count += 1
+            elif self._camp():
+                break
 
-                if self.sticky_cycle_count % self.STICKY_PEEK_INTERVAL == 0:
-                    other = (self.PRIMARY_CHANNEL_5G
-                             if self.last_detection_channel in (1, 6, 11)
-                             else self.PRIMARY_CHANNEL_2G)
-                    self._set(other)
-                    if self._sleep_s(self.STICKY_PEEK_MS / 1000.0):
-                        return
+    def _leg(self, ch: int, dwell: float) -> str:
+        """Tune to ch for dwell seconds.
+
+        Returns "stop", "camp" (enough frames landed here to hold), or "next".
+        The camp check happens at the END of the leg, while still tuned to
+        the channel that produced the frames — deciding at the top of the
+        next iteration instead would mean retuning away first, which is the
+        bug that made the old sticky mode a poll rather than a trigger.
+        """
+        self._set(ch)
+        if self._sleep_s(dwell):
+            return "stop"
+        if self._armed(ch):
+            return "camp"
+        return "next"
+
+    def _sweep_cycle(self) -> bool:
+        """One pass over the plan. Returns True if the thread should stop."""
+        legs = list(self._social_legs)
+
+        if self._explore:
+            if self.plan == "a":
+                # One explore channel per cycle, rotating, so the social
+                # channels keep their share and the rest of the band still
+                # gets visited.
+                legs.append((self._explore[self._explore_i % len(self._explore)],
+                             self.dwell_explore_s))
+                self._explore_i += 1
             else:
-                # Re-check for a live detection before *leaving* each channel.
-                # A beacon can only ever be heard on the channel we are tuned
-                # to, so the decision to stay has to be made here, at the end
-                # of the leg — not at the top of the next iteration, by which
-                # point we have already spent a full dwell_5g_s tuned away
-                # from the channel that produced it. That retune is what made
-                # sticky mode a poll instead of a trigger.
-                if self.off_channel_sweep:
-                    # 2G budget minus 2×PEEK_S reserved for ch1+ch11
-                    primary_2g_s = self.dwell_2g_s - 2 * self.PEEK_S
-                    self._set(self.PRIMARY_CHANNEL_2G)
-                    if self._sleep_s(primary_2g_s):
-                        break
-                    if self._recent_detection():
-                        continue
-                    peek_hit = False
-                    for ch in self.PEEK_CHANNELS_2G:
-                        self._set(ch)
-                        if self._sleep_s(self.PEEK_S):
-                            return
-                        if self._recent_detection():
-                            peek_hit = True
-                            break
-                    if peek_hit:
-                        continue
-                else:
-                    self._set(self.PRIMARY_CHANNEL_2G)
-                    if self._sleep_s(self.dwell_2g_s):
-                        break
+                legs.extend((ch, self.dwell_explore_s) for ch in self._explore)
 
-                if self._recent_detection():
-                    continue
+        for ch, dwell in legs:
+            result = self._leg(ch, dwell)
+            if result == "stop":
+                return True
+            if result == "camp":
+                self._camp_ch = ch
+                log.info(f"Camp: ch{ch} — holding")
+                return False
+        return False
 
-                self._set(self.PRIMARY_CHANNEL_5G)
-                if self._sleep_s(self.dwell_5g_s):
-                    break
+    def _other_band_social(self, camp_ch: int) -> tuple:
+        if camp_ch <= 14:
+            return (self.SOCIAL_5G, self.dwell_social_5g_s)
+        return (self.SOCIAL_2G, self.dwell_social_2g_s)
+
+    def _camp(self) -> bool:
+        """Hold the camped channel. Returns True if the thread should stop."""
+        ch = self._camp_ch
+        self._set(ch)
+
+        last_seen = self._last_frame_ts(ch)
+        # Seconds spent off ch since the last frame landed on it. Subtracted
+        # from the silence measurement so a release leg cannot end its own
+        # camp.
+        off_s      = 0.0
+        camp_start = time.time()
+
+        while not self._stop.is_set():
+            if self._sleep_s(self.CAMP_POLL_S):
+                return True
+
+            seen = self._last_frame_ts(ch)
+            if seen > last_seen:
+                last_seen = seen
+                off_s     = 0.0
+
+            if (time.time() - last_seen) - off_s > self.camp_silence_s:
+                log.info(f"Camp: ch{ch} quiet for {self.camp_silence_s}s — resuming sweep")
+                self._camp_ch = None
+                return False
+
+            if self.camp_release and (time.time() - camp_start) >= self.camp_release_interval_s:
+                other, dwell = self._other_band_social(ch)
+                left = time.time()
+                self._set(other)
+                if self._sleep_s(dwell):
+                    return True
+                if self._armed(other):
+                    # The other band is live too. Move the camp rather than
+                    # returning to a channel that may have gone quiet.
+                    log.info(f"Camp: ch{other} active during release — moving camp")
+                    self._camp_ch = other
+                    return False
+
+                # Advance the explore rotation during the release as well.
+                # Without this a camp blinds the node to every off-social
+                # channel for as long as it lasts: a second aircraft on
+                # ch157 would never be seen while the first one holds ch6,
+                # because the release only ever visits the other band's
+                # *social* channel. Frames heard here are decoded and
+                # forwarded normally — the camp deliberately does NOT move
+                # to an explore channel, since the camped channel is the one
+                # already known to be carrying traffic.
+                #
+                # This costs a 3.0s absence instead of 2.0s (three missed
+                # beacons on a 1 Hz camp rather than two), in exchange for
+                # sweeping the whole band every ~76s while camped instead of
+                # never. That trade was made deliberately.
+                if self._explore:
+                    ech = self._explore[self._explore_i % len(self._explore)]
+                    self._explore_i += 1
+                    if ech != ch:
+                        self._set(ech)
+                        if self._sleep_s(self.dwell_explore_s):
+                            return True
+
+                off_s += time.time() - left
+                self._set(ch)
+                camp_start = time.time()
+
+        return True
 
     def stop(self):
         self._stop.set()
@@ -2375,15 +2595,24 @@ class WiFiFeeder:
         self.publisher   = LocalPublisher()
 
         # v1.5.0 dual-adapter mode overrides hopper choice explicitly.
-        # --band=2g runs a dedicated 2.4 GHz hopper (no 5 GHz work at all).
-        # --band=5g locks to channel 149 (no dwelling, no 2.4 GHz work).
-        # --band=auto keeps the single-adapter behavior (may dwell or lock).
+        # v1.5.1 splits the pair into complementary roles instead of giving
+        # each adapter one band to itself:
+        #   --band=2g  holds ch6 outright, 100% of the time, forever. No
+        #              retune, no camp logic, no state machine at all. ~90%
+        #              of everything we have ever detected is on ch6, so one
+        #              radio permanently parked there is the single highest
+        #              value use of a second adapter.
+        #   --band=5g  sweeps everything else — ch149 plus the explore set,
+        #              across both bands — and camps INDEFINITELY on a lock,
+        #              because its partner never stops covering ch6. That
+        #              unlimited camp is the whole payoff of the pair.
+        # --band=auto keeps the single-adapter behavior (may sweep or lock).
         if band == "2g":
-            log.info(f"Hopper mode: 2g-only dedicated (band={band}, --band=2g)")
-            self.hopper = AdaptiveChannelHopper(iface)
+            log.info(f"Hopper mode: ch{ScanPlanHopper.SOCIAL_2G} locked, 100% (band={band})")
+            self.hopper = LockedChannelHopper(iface, ScanPlanHopper.SOCIAL_2G)
         elif band == "5g":
-            log.info(f"Hopper mode: 5g locked to ch149 (band={band}, --band=5g)")
-            self.hopper = LockedChannelHopper(iface, 149)
+            log.info(f"Hopper mode: scan plan B — sweeps all non-ch6 (band={band})")
+            self.hopper = ScanPlanHopper(iface, plan="b")
         else:
             # band == "auto" — existing single-adapter logic
             # ADAPTIVE_DWELL=false reverts to legacy flat 1–11 hop (A/B testing)
@@ -2412,8 +2641,8 @@ class WiFiFeeder:
                         log.info(f"Single-band adapter on {iface} — 2.4 GHz only")
 
                 if enable_5g:
-                    log.info("Hopper mode: dual-band (ch6 + ch149)")
-                    self.hopper = DualBandHopper(iface)
+                    log.info("Hopper mode: scan plan A — single dual-band adapter")
+                    self.hopper = ScanPlanHopper(iface, plan="a")
                 else:
                     log.info("Hopper mode: adaptive (sweep + sticky, channel-6 biased)")
                     self.hopper = AdaptiveChannelHopper(iface)
