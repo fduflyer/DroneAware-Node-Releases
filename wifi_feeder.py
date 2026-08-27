@@ -34,6 +34,7 @@ import os
 import re
 import sys
 import collections
+import uuid
 import serial
 import requests
 
@@ -1857,6 +1858,11 @@ class Forwarder:
         self.failed_total      = 0
         self.dropped_total     = 0
         self._warned_high      = False  # one-shot, resets when buffer drains
+        # v1.5.0.10: the batch currently being delivered, held across retries
+        # as (idempotency_key, batch) so every attempt sends byte-identical
+        # data under the same key. None when nothing is in flight.
+        self._inflight         = None
+        self._inflight_bytes   = 0
         self._lock             = threading.Lock()
 
     def add(self, event: dict):
@@ -1874,9 +1880,35 @@ class Forwarder:
             # now handled entirely by the background _flush_loop thread
             # via should_flush() + flush().
 
+    @property
+    def held_events(self) -> int:
+        """Events the forwarder still owns — buffered plus any in flight.
+
+        A batch being retried has left the deque but has not been delivered,
+        so reporting len(buffer) alone would understate what the node is
+        actually holding for exactly as long as delivery is failing.
+        """
+        with self._lock:
+            n = len(self.buffer)
+            if self._inflight is not None:
+                n += len(self._inflight[1])
+            return n
+
+    @property
+    def held_bytes(self) -> int:
+        with self._lock:
+            return self.buffer_bytes + self._inflight_bytes
+
     def should_flush(self) -> bool:
         """Advisory: True if a flush is due. Called from background thread."""
         with self._lock:
+            if self._inflight is not None:
+                # A batch is waiting to be retried. It must be offered again
+                # even when the buffer behind it is empty, or a failed upload
+                # would sit in flight forever with nothing to trigger it. The
+                # interval governs the pace so a persistent failure does not
+                # spin.
+                return time.time() - self.last_flush >= self.flush_interval
             if not self.buffer:
                 return False
             if len(self.buffer) >= self.batch_size:
@@ -1896,11 +1928,15 @@ class Forwarder:
         BLE-side analog of the phillyrox saturation and would do the
         same here under a fixed WiFi RID source."""
         with self._lock:
-            if not self.buffer:
-                return
-            batch = list(self.buffer)
-            self.buffer.clear()
-            self.buffer_bytes = 0
+            if self._inflight is None:
+                if not self.buffer:
+                    return
+                batch = list(self.buffer)
+                self.buffer.clear()
+                self.buffer_bytes = 0
+                self._inflight = (uuid.uuid4().hex, batch)
+                self._inflight_bytes = sum(size for _, size in batch)
+            key, batch = self._inflight
             self.last_flush = time.time()
 
         # Network POST OUTSIDE the lock — main thread's add() can keep
@@ -1909,33 +1945,72 @@ class Forwarder:
         payload = {"node_id": self.node_id, "events": events}
         try:
             headers = {"X-Node-Token": self.token} if self.token else {}
+            # Stamped once when the batch was assembled and carried through
+            # every retry of it, so the server can recognize a replay from
+            # the header alone and drop it before decoding the body.
+            headers["Idempotency-Key"] = key
             r = requests.post(self.url, json=payload, headers=headers, timeout=5)
             r.raise_for_status()
+            with self._lock:
+                self._inflight = None
+                self._inflight_bytes = 0
             self.sent_total += len(events)
             log.debug(f"Forwarded {len(events)} events ({self.sent_total} total)")
         except requests.RequestException as e:
+            # A 4xx will never be accepted however many times it is offered,
+            # and retrying it forever would block every batch queued behind
+            # it. 408 and 429 are the exceptions — both explicitly ask to be
+            # retried. Everything else (timeout, connection reset, 5xx) is
+            # transient or ambiguous, so the batch stays in flight and goes
+            # back out unchanged under the same key.
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            permanent = (status is not None
+                         and 400 <= status < 500
+                         and status not in (408, 429))
             with self._lock:
-                for event, size in reversed(batch):
-                    self.buffer.appendleft((event, size))
-                    self.buffer_bytes += size
                 self.failed_total += len(events)
+                if permanent:
+                    self.dropped_total += len(batch)
+                    self._inflight = None
+                    self._inflight_bytes = 0
                 self._evict_to_cap_locked()
             log.warning(
                 f"Forward failed: {e}  "
-                f"(buffered={len(self.buffer)}, "
+                f"({'dropped — not retryable' if permanent else 'held for retry'}, "
+                f"buffered={len(self.buffer)}, "
                 f"buffer_bytes={self.buffer_bytes}, "
+                f"inflight={len(batch) if not permanent else 0}, "
                 f"failed_total={self.failed_total}, "
                 f"dropped_total={self.dropped_total})"
             )
 
     def _evict_to_cap_locked(self):
-        """Drop oldest events until buffer_bytes <= max_buffer_bytes. Logs
-        threshold crossings (one warning per fill, one info on drain)."""
+        """Drop oldest events until held bytes <= max_buffer_bytes. Logs
+        threshold crossings (one warning per fill, one info on drain).
+
+        The in-flight batch counts toward the cap and sheds first. It is the
+        oldest data the forwarder holds, so dropping it first preserves the
+        drop-oldest-on-overflow behavior that the deque eviction below has
+        always had — and without counting it at all, a batch stuck in flight
+        through a long outage would sit outside the memory bound entirely
+        while the buffer behind it kept filling.
+        """
+        if (self._inflight is not None
+                and self.buffer_bytes + self._inflight_bytes > self.max_buffer_bytes):
+            stuck = len(self._inflight[1])
+            self.dropped_total += stuck
+            self._inflight = None
+            self._inflight_bytes = 0
+            log.warning(
+                f"Forwarder: dropped in-flight batch of {stuck} events — "
+                "buffer cap reached while it was being retried"
+            )
         while self.buffer_bytes > self.max_buffer_bytes and len(self.buffer) > 1:
             _, size = self.buffer.popleft()
             self.buffer_bytes -= size
             self.dropped_total += 1
-        pct = (self.buffer_bytes * 100) // self.max_buffer_bytes if self.max_buffer_bytes else 0
+        held = self.buffer_bytes + self._inflight_bytes
+        pct = (held * 100) // self.max_buffer_bytes if self.max_buffer_bytes else 0
         if pct >= self.warn_pct and not self._warned_high:
             log.warning(
                 f"Forwarder buffer at {pct}% of {self.max_buffer_bytes // 1_000_000} MB cap "
@@ -3015,7 +3090,7 @@ class WiFiFeeder:
                     f"[Heartbeat] Beacon RID={self.count}  NAN={self.nan_count}  "
                     f"sent={self.forwarder.sent_total}  failed={self.forwarder.failed_total}  "
                     f"dropped={self.forwarder.dropped_total}  "
-                    f"buffered={len(self.forwarder.buffer)}  "
+                    f"buffered={self.forwarder.held_events}  "
                     f"restarts={self.restart_count}  "
                     f"cpu={cpu_pct_str}  load={load_str}"
                 )
@@ -3046,8 +3121,8 @@ class WiFiFeeder:
                             "lat":          lat,
                             "lon":          lon,
                             # v1.4.8 telemetry additions — mirror BLE.
-                            "buffered":            len(self.forwarder.buffer),
-                            "buffered_bytes":      self.forwarder.buffer_bytes,
+                            "buffered":            self.forwarder.held_events,
+                            "buffered_bytes":      self.forwarder.held_bytes,
                             "dropped_total":       self.forwarder.dropped_total,
                             "sent_total":          self.forwarder.sent_total,
                             "restarts_since_boot": self.restart_count,
