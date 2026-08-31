@@ -40,3 +40,8 @@ __pycache__/
 # Runtime config (contains secrets — keep out of git)
 config.env
 *.env
+
+# Development simulators (scanplan-sim.py, sticky-trigger-sim.py). These run
+# feeder classes against a fake clock to check scan behavior without a radio.
+# The repo root is what the build packages, so they stay untracked.
+*-sim.py

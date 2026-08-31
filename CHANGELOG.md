@@ -10,6 +10,213 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.5.1] — Unreleased
+
+How the node chooses what to listen to. Until now it scanned two channels
+and held still for a drone only by accident; it now sweeps both bands and
+stops on what it hears.
+
+### A detection did not hold the channel it was heard on
+
+The node is supposed to stop sweeping when it hears a drone and stay on
+that channel for as long as the aircraft is transmitting. It decided
+whether to do so once per cycle, at the top of the loop, and then ran a
+full sweep leg regardless of the answer.
+
+A broadcast arriving part-way through a leg was therefore acted on only
+after the radio had already retuned away from the channel that produced
+it. By the time the node noticed it had heard something, it had spent a
+full dwell somewhere else. Holding still engaged, but always one leg late,
+which is not distinguishable from never engaging at all.
+
+There was a second reason it could not engage. The window counted from the
+moment of the broadcast, but a broadcast can only be examined at the end of
+the leg it arrived in — so one arriving early in a three-second leg was
+already three seconds old when it was first looked at, and a
+three-second window had expired exactly as it was read.
+
+The node now re-checks before leaving a channel rather than after, so the
+decision to stay is made while still tuned to the channel that heard the
+aircraft, and the window is derived from the configured dwell instead of
+being fixed. Flown against a control on the same aircraft in the same
+session, the corrected version captured a third more broadcasts.
+
+### The node only ever scanned two channels
+
+Scanning covered channel 6 and channel 149 and nothing else. A drone
+transmitting anywhere else could not be detected however long it flew
+overhead, and nothing in the node's output distinguished that from empty
+airspace.
+
+Two things about how aircraft actually behave set the replacement. A
+compliant aircraft broadcasts its Remote ID on a designated channel — 6 on
+2.4 GHz, 149 on 5 GHz — regardless of which channel its video and control
+link are using, by briefly tuning away about once a second. Where the video
+sits says nothing about where the Remote ID sits. And an aircraft is only
+permitted to broadcast somewhere other than those channels if it raises its
+rate to at least five times a second.
+
+Those two facts together mean the time a channel deserves is inversely
+proportional to how fast anything on it transmits. The designated channels
+need long visits, because they carry one broadcast per second and a short
+visit lands between two of them. Every other channel needs only a brief
+one, because anything transmitting there is transmitting fast: a
+one-second visit to one of them gives five to eight chances to hear
+something, against a single chance on channel 6.
+
+Covering the rest of the band is therefore far cheaper than it appears,
+and the sweep only has to find an aircraft — stopping on it is what
+actually collects the broadcasts. A node with one dual-band adapter now
+spends four seconds on channel 6, two on channel 149, and one second on
+one other channel, rotating through 153, 157, 161 and 165 on 5 GHz and 1,
+5, 9 and 11 on 2.4 GHz. Channel 6 keeps the majority of the time, which is
+where nearly everything ever detected has been; the second spent exploring
+comes out of channel 149's share, not channel 6's.
+
+A node with two adapters now splits the work rather than giving each
+adapter a band. One holds channel 6 outright, permanently, and never
+retunes for any reason. The other sweeps everything else, and because its
+partner never stops covering channel 6, it can stop on an aircraft and
+stay there indefinitely. The adapter holding channel 6 also re-asserts it
+periodically, so a driver reset cannot silently park the node's primary
+radio somewhere useless for the rest of the session.
+
+Stopping on a detection now requires two broadcasts on the same channel
+within two seconds, so a single stray decode cannot pin the radio to an
+empty channel. The node lets go after a period of silence, measured per
+channel and reset by any broadcast, so a second aircraft arriving keeps it
+there after the first one lands. With a single adapter it breaks off
+briefly at intervals to check the other band and the next channel in the
+rotation, because one radio held on channel 6 hears nothing at all from
+anywhere else in the meantime — that is what stops one drone from
+concealing every other drone.
+
+Which channels exist is read from the adapter at startup rather than
+assumed, so nodes in regions where channel 13 is permitted pick it up
+automatically, and adapters that cannot tune part of the plan simply skip
+it. Channels requiring radar detection are deliberately excluded:
+manufacturers avoid them because an aircraft must run a lengthy
+availability check before use and abandon the channel mid-flight if radar
+appears.
+
+### The same detections were uploaded over and over
+
+A node that failed to upload a batch put it back at the front of its send
+buffer and tried again. By then more detections had arrived, so the retry
+was a larger batch than the one that failed, and the one after that larger
+still. No two attempts ever carried the same contents.
+
+That matters because an upload failure is usually ambiguous rather than
+clean. The node waits five seconds for a reply; a reply that arrives late
+is still a reply, and the detections in it were delivered. The node cannot
+tell that apart from a genuine failure, so it sent them again — and because
+each attempt carried different contents, nothing at either end could
+recognize the second attempt as a repeat of the first.
+
+One node re-sent the same observations for two and a half hours before
+recovering on its own. Nothing was lost and nothing was wrong with its
+detections; it simply spent hours of its own bandwidth re-delivering work
+it had already completed, with no indication anything was amiss.
+
+A batch is now assembled once, labeled, and re-sent unchanged under that
+same label until it is delivered. Anything already received can be
+recognized and discarded without being processed twice. Retrying after a
+genuine outage is unchanged and still correct — what stops is re-sending
+deliveries that already succeeded.
+
+Both the Wi-Fi and Bluetooth feeders were affected and both are fixed. They
+keep separate upload paths, so leaving one of them alone would have left
+half the problem in place.
+
+### The channel a detection arrived on was not recorded in the log
+
+Every detection recorded its Wi-Fi address, signal strength, message type
+and identifier, but not which channel it came in on. The channel was
+already being reported and stored — it was simply missing from the one
+place someone watching a live flight would look.
+
+That made the node's scanning behavior impossible to check from a log.
+Whether the scan was visiting the channels it was supposed to, and which
+channel it had settled on after finding an aircraft, could only be inferred
+from the node's own account of what it intended to do.
+
+The channel now appears on every detection line, taken from the radio's
+report of where the signal was actually received rather than from where
+the scanner believed it was listening. If those two ever disagree, this is
+what shows it.
+
+### The channel plan can now be configured
+
+Which channel a node treats as primary, and which channels it sweeps, could
+previously only be changed by rebuilding the firmware. A node placed
+somewhere with unusual traffic could not be pointed at it.
+
+Four settings now cover this. The primary channel for each band can be
+changed or switched off entirely, in which case it is swept like any other
+channel rather than given a long dedicated visit. The sweep list for each
+band can be replaced outright, which is how a node covers frequencies
+outside the standard plan. Leaving a setting empty keeps the default, as
+everywhere else in the configuration file; clearing a band requires saying
+so explicitly, so it cannot happen by accident.
+
+Everything configured is still checked against what the adapter can
+actually tune to, so an impossible entry is dropped rather than wasting
+scanning time.
+
+### Scan timings now describe what the node really does
+
+Changing channel is not instant, and how long it takes varies enormously
+between adapters. Measured across three dual-band USB adapters on one
+bench, the time a radio spends unable to receive while it retunes ranged
+from 22 milliseconds to just over a second — a forty-seven-fold spread
+between parts sold for the same purpose, including a forty-seven-fold
+difference between two models from the same manufacturer.
+
+The scan timings were written as though this cost were zero. Every visit to
+a channel actually takes the intended time plus a retune, so a plan that
+behaved as designed on a quick adapter quietly became a much slower plan on
+a slow one, and nothing said so.
+
+The effect is not small. Flown against the same aircraft from the same
+table with identical software, a node captured half of the broadcasts on
+one adapter and nearly three quarters on another. The difference was
+entirely the radio.
+
+Each node now times its own adapter at startup and reports the cycle it
+will really run rather than the one its settings describe. Where a channel
+visit is mostly retune, it says so, along with how much of each cycle the
+radio spends unable to listen. Scanning behavior is unchanged — this is the
+difference between a log that states an intention and one that states an
+outcome, and it was the absence of the second that let the discrepancy go
+unnoticed.
+
+### 2.4 GHz-only adapters scanned one channel and nothing else
+
+Adapters without 5 GHz support ran on separate logic that stayed on
+channel 6 one hundred percent of the time and never visited another
+channel. It could be configured to glance at channels 1 and 11, but this
+was off by default, on the grounds that no traffic had been observed
+there — a conclusion that could only ever confirm itself, since those
+nodes were scanning channel 6 and nothing else. At least one published
+aircraft transmits in five-channel steps from 1 through 11, and one has
+been detected on channel 5.
+
+These adapters also never received the correction described above, so a
+detection could not hold the channel on them at all.
+
+They now run the same plan as every other adapter, with the 5 GHz legs
+absent because the radio does not advertise them — channel 6 for the
+majority of the time, plus a rotation through 1, 5, 9 and 11.
+
+### Dwell settings moved to new keys
+
+The two settings controlling how long the node spends on each band no
+longer describe how it works, and have been replaced. Any value that had
+been deliberately changed is carried across to the new setting on update;
+the old entries are left in place, commented, so it is clear what happened
+to them. The opt-in that added glances at channels 1 and 11 is retired,
+since those channels are now always scanned.
+
 ## [1.5.0.9] — Unreleased
 
 A single fix. Nodes running the currently supported OS could report having
