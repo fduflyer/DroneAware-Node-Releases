@@ -99,6 +99,97 @@ manufacturers avoid them because an aircraft must run a lengthy
 availability check before use and abandon the channel mid-flight if radar
 appears.
 
+### The same detections were uploaded over and over
+
+A node that failed to upload a batch put it back at the front of its send
+buffer and tried again. By then more detections had arrived, so the retry
+was a larger batch than the one that failed, and the one after that larger
+still. No two attempts ever carried the same contents.
+
+That matters because an upload failure is usually ambiguous rather than
+clean. The node waits five seconds for a reply; a reply that arrives late
+is still a reply, and the detections in it were delivered. The node cannot
+tell that apart from a genuine failure, so it sent them again — and because
+each attempt carried different contents, nothing at either end could
+recognize the second attempt as a repeat of the first.
+
+One node re-sent the same observations for two and a half hours before
+recovering on its own. Nothing was lost and nothing was wrong with its
+detections; it simply spent hours of its own bandwidth re-delivering work
+it had already completed, with no indication anything was amiss.
+
+A batch is now assembled once, labeled, and re-sent unchanged under that
+same label until it is delivered. Anything already received can be
+recognized and discarded without being processed twice. Retrying after a
+genuine outage is unchanged and still correct — what stops is re-sending
+deliveries that already succeeded.
+
+Both the Wi-Fi and Bluetooth feeders were affected and both are fixed. They
+keep separate upload paths, so leaving one of them alone would have left
+half the problem in place.
+
+### The channel a detection arrived on was not recorded in the log
+
+Every detection recorded its Wi-Fi address, signal strength, message type
+and identifier, but not which channel it came in on. The channel was
+already being reported and stored — it was simply missing from the one
+place someone watching a live flight would look.
+
+That made the node's scanning behavior impossible to check from a log.
+Whether the scan was visiting the channels it was supposed to, and which
+channel it had settled on after finding an aircraft, could only be inferred
+from the node's own account of what it intended to do.
+
+The channel now appears on every detection line, taken from the radio's
+report of where the signal was actually received rather than from where
+the scanner believed it was listening. If those two ever disagree, this is
+what shows it.
+
+### The channel plan can now be configured
+
+Which channel a node treats as primary, and which channels it sweeps, could
+previously only be changed by rebuilding the firmware. A node placed
+somewhere with unusual traffic could not be pointed at it.
+
+Four settings now cover this. The primary channel for each band can be
+changed or switched off entirely, in which case it is swept like any other
+channel rather than given a long dedicated visit. The sweep list for each
+band can be replaced outright, which is how a node covers frequencies
+outside the standard plan. Leaving a setting empty keeps the default, as
+everywhere else in the configuration file; clearing a band requires saying
+so explicitly, so it cannot happen by accident.
+
+Everything configured is still checked against what the adapter can
+actually tune to, so an impossible entry is dropped rather than wasting
+scanning time.
+
+### Scan timings now describe what the node really does
+
+Changing channel is not instant, and how long it takes varies enormously
+between adapters. Measured across three dual-band USB adapters on one
+bench, the time a radio spends unable to receive while it retunes ranged
+from 22 milliseconds to just over a second — a forty-seven-fold spread
+between parts sold for the same purpose, including a forty-seven-fold
+difference between two models from the same manufacturer.
+
+The scan timings were written as though this cost were zero. Every visit to
+a channel actually takes the intended time plus a retune, so a plan that
+behaved as designed on a quick adapter quietly became a much slower plan on
+a slow one, and nothing said so.
+
+The effect is not small. Flown against the same aircraft from the same
+table with identical software, a node captured half of the broadcasts on
+one adapter and nearly three quarters on another. The difference was
+entirely the radio.
+
+Each node now times its own adapter at startup and reports the cycle it
+will really run rather than the one its settings describe. Where a channel
+visit is mostly retune, it says so, along with how much of each cycle the
+radio spends unable to listen. Scanning behavior is unchanged — this is the
+difference between a log that states an intention and one that states an
+outcome, and it was the absence of the second that let the discrepancy go
+unnoticed.
+
 ### 2.4 GHz-only adapters scanned one channel and nothing else
 
 Adapters without 5 GHz support ran on separate logic that stayed on
