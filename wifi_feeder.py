@@ -1429,10 +1429,31 @@ class ScanPlanHopper(threading.Thread):
         # give the other band a turn.
         self.camp_release = (self.plan == "a")
 
+        # The channel plan is configurable. Which channel counts as "social"
+        # can be changed or switched off entirely, and either band's explore
+        # list can be replaced outright.
+        #
+        # Setting a social channel to 0 demotes it to an ordinary explore
+        # member — the plan then treats it exactly as it treats any off-social
+        # channel. That matters because the aircraft we can most easily fly
+        # broadcast on social channels, while the ones we most need to find do
+        # not, and a node aimed at the latter should not be spending a long
+        # dedicated dwell on the former.
+        #
+        # Replacing an explore list is how a node covers DFS or any other
+        # range without a new build. Whatever is listed is still filtered
+        # against what the PHY actually advertises, so an impossible entry
+        # drops out rather than wasting dwell.
+        self.social_2g  = self._parse_channel("WIFI_SOCIAL_2G_CHANNEL", self.SOCIAL_2G)
+        self.social_5g  = self._parse_channel("WIFI_SOCIAL_5G_CHANNEL", self.SOCIAL_5G)
+        self.explore_5g = self._parse_channels("WIFI_EXPLORE_5G", self.EXPLORE_5G_CANDIDATES)
+        self.explore_2g = self._parse_channels("WIFI_EXPLORE_2G", self.EXPLORE_2G_CANDIDATES)
+
         # Populated by _build_plan() once the interface can be queried.
         self._explore   = []
         self._explore_i = 0
         self._social    = None
+        self.retune_s   = 0.0
 
     @staticmethod
     def _parse_num(var: str, default: float) -> float:
@@ -1448,6 +1469,79 @@ class ScanPlanHopper(threading.Thread):
             log.warning(f"{var}={raw!r} invalid ({e}) — using default {default}")
             return default
 
+    @staticmethod
+    def _parse_channel(var: str, default: int) -> int:
+        """A single channel number. 0 or 'none' switches the leg off."""
+        raw = os.environ.get(var, "").strip().lower()
+        if not raw:
+            return default
+        if raw in ("0", "none", "off"):
+            return 0
+        try:
+            return int(raw)
+        except ValueError:
+            log.warning(f"{var}={raw!r} is not a channel number — using {default}")
+            return default
+
+    @staticmethod
+    def _parse_channels(var: str, default: list) -> list:
+        """A comma-separated channel list that REPLACES the default.
+
+        Empty means "use the default", matching how every other key in
+        config.env behaves. To scan NOTHING in a band — a 5 GHz-only hunting
+        node, say — set it to "none" explicitly, so clearing a band is always
+        a deliberate act rather than a side effect of a blank line.
+        """
+        raw = os.environ.get(var, "").strip()
+        if not raw:
+            return list(default)
+        if raw.lower() in ("none", "off"):
+            return []
+        out = []
+        for part in raw.replace(" ", "").split(","):
+            if not part:
+                continue
+            try:
+                out.append(int(part))
+            except ValueError:
+                log.warning(f"{var}: ignoring non-numeric entry {part!r}")
+        if not out:
+            log.warning(f"{var}={raw!r} yielded no channels — using default")
+            return list(default)
+        return out
+
+    def _measure_retune(self) -> float:
+        """Time how long this radio takes to change channel.
+
+        Retuning is not free and the cost is wildly hardware-dependent —
+        measured across three dual-band USB adapters it spanned 22 ms to
+        1007 ms, a 47x range. The radio is deaf for that whole time, and
+        _sleep_s(dwell) only starts counting once the tune returns, so every
+        leg really costs dwell + retune. A plan whose numbers were chosen on
+        a fast adapter quietly becomes a different plan on a slow one.
+
+        Measuring it here lets the startup log state the true cycle rather
+        than the intended one, and lets us warn when a configured dwell is
+        mostly retune. Costs well under a second at startup.
+        """
+        pool = [c for c, _ in self._planned_social_legs() if c] + list(self._explore)
+        pool = [c for c in pool if c]
+        if len(pool) < 2 or not self.iface:
+            return 0.0
+        a, b = pool[0], pool[1]
+        samples = []
+        try:
+            for _ in range(3):
+                set_channel(self.iface, a)
+                t0 = time.time()
+                set_channel(self.iface, b)
+                samples.append(time.time() - t0)
+        except Exception as e:
+            log.warning(f"Scan plan: could not measure retune cost ({e})")
+            return 0.0
+        samples.sort()
+        return samples[len(samples) // 2]
+
     def _build_plan(self):
         """Filter the explore candidates against what the PHY advertises.
 
@@ -1458,7 +1552,12 @@ class ScanPlanHopper(threading.Thread):
         nothing at all.
         """
         supported = _supported_channels(self.iface) if self.iface else set()
-        candidates = self.EXPLORE_5G_CANDIDATES + self.EXPLORE_2G_CANDIDATES
+        # A channel that already has a social leg must not also appear in the
+        # rotation, or it gets visited twice per cycle and quietly takes
+        # airtime from everything else.
+        social_ch = {c for c, _ in self._planned_social_legs() if c}
+        candidates = [c for c in (self.explore_5g + self.explore_2g)
+                      if c not in social_ch]
         if supported:
             self._explore = [c for c in candidates if c in supported]
             dropped = [c for c in candidates if c not in supported]
@@ -1488,15 +1587,18 @@ class ScanPlanHopper(threading.Thread):
             log.warning("Scan plan: no social channels available — explore only")
 
     def _planned_social_legs(self) -> list:
+        """Social legs before the PHY filter. A channel of 0 is switched off."""
         if self.plan == "b":
             # Plan B's partner owns ch6 outright; giving any of B's time to
             # 2.4's social channel would duplicate coverage the pair already
             # has 100% of.
-            return [(self.SOCIAL_5G, self.dwell_social_5g_s)]
-        return [
-            (self.SOCIAL_2G, self.dwell_social_2g_s),
-            (self.SOCIAL_5G, self.dwell_social_5g_s),
-        ]
+            legs = [(self.social_5g, self.dwell_social_5g_s)]
+        else:
+            legs = [
+                (self.social_2g, self.dwell_social_2g_s),
+                (self.social_5g, self.dwell_social_5g_s),
+            ]
+        return [(c, d) for c, d in legs if c]
 
     @property
     def _social_legs(self) -> list:
@@ -1559,25 +1661,51 @@ class ScanPlanHopper(threading.Thread):
             return
 
         self._build_plan()
+        self.retune_s = self._measure_retune()
 
+        # Every leg costs its dwell PLUS a retune, because the radio is deaf
+        # while it tunes and _sleep_s only starts counting afterwards. Report
+        # the cycle the node will ACTUALLY run, not the one the numbers
+        # describe — a plan tuned on a fast adapter silently becomes a much
+        # slower plan on a slow one, and a log that states the intended figure
+        # hides exactly that.
+        r = self.retune_s
         social = " + ".join(f"{d}s ch{c}" for c, d in self._social_legs)
+        n_social = len(self._social_legs)
         if self.plan == "a":
             cycle = sum(d for _, d in self._social_legs) + self.dwell_explore_s
+            legs_per_cycle = n_social + 1
+            rotation = len(self._explore) * (cycle + legs_per_cycle * r)
             explore_desc = (
                 f"1 of {len(self._explore)} explore @ {self.dwell_explore_s}s "
-                f"(full rotation {len(self._explore) * cycle:.0f}s)"
+                f"(full rotation {rotation:.0f}s)"
             )
         else:
             cycle = (sum(d for _, d in self._social_legs)
                      + len(self._explore) * self.dwell_explore_s)
+            legs_per_cycle = n_social + len(self._explore)
             explore_desc = f"all {len(self._explore)} explore @ {self.dwell_explore_s}s"
+        true_cycle = cycle + legs_per_cycle * r
         log.info(
             f"Scan plan {self.plan.upper()} started: {social} + {explore_desc} "
-            f"({cycle:.1f}s cycle); camp after {self.camp_trigger_frames} frames/"
+            f"({true_cycle:.1f}s cycle incl. {1000*r:.0f}ms retune x{legs_per_cycle}); "
+            f"camp after {self.camp_trigger_frames} frames/"
             f"{self.camp_trigger_window_s}s, release on {self.camp_silence_s}s silence"
             + (f", other-band leg every {self.camp_release_interval_s}s"
                if self.camp_release else ", no release (partner holds ch6)")
         )
+        # A leg that is mostly retune is not really scanning that channel.
+        shortest = min([d for _, d in self._social_legs] + [self.dwell_explore_s])
+        if r > 0 and r > 0.25 * shortest:
+            log.warning(
+                f"Scan plan: this radio takes {1000*r:.0f}ms to change channel, which is "
+                f"{100*r/shortest:.0f}% of the shortest {shortest}s leg — it spends "
+                f"{100*legs_per_cycle*r/true_cycle:.0f}% of each cycle deaf. That is a "
+                "property of the radio, not the plan: a faster adapter is the only fix that "
+                "does not also lengthen the rotation. Lengthening the dwell reduces the share "
+                "spent deaf but visits each channel less often, which lowers the chance of "
+                "catching a short pass."
+            )
 
         while not self._stop.is_set():
             if self._camp_ch is None:
