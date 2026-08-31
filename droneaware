@@ -264,6 +264,46 @@ EOF
         fi
     fi
 
+    # v1.5.1 — which channels the plan covers. Separate block from the dwell
+    # keys above because a node that already took those (an early v1.5.1
+    # build) would never re-enter that guard, and these would stay invisible
+    # on exactly the nodes most likely to want them.
+    if ! grep -q '^WIFI_SOCIAL_5G_CHANNEL=' "$cfg"; then
+        [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+        cat >> "$cfg" <<'EOF'
+
+# ─── Which channels to scan (added by droneaware update for v1.5.1+) ───
+# The dwell settings above say how LONG to listen. These say WHERE.
+#
+# Each band has one primary channel, given a long dedicated visit because
+# that is where a compliant aircraft broadcasts regardless of which channel
+# its video and control link are using. Set a primary to 0 and it stops
+# being privileged — it is then swept like any other channel. Useful for a
+# node aimed at aircraft that do not use the primary at all.
+WIFI_SOCIAL_2G_CHANNEL=6
+WIFI_SOCIAL_5G_CHANNEL=149
+
+# The sweep list for each band. Leave empty for the default:
+#   2.4 GHz   1, 5, 9, 11 (and 13 where permitted)
+#   5 GHz     153, 157, 161, 165
+# Set a comma-separated list to replace a band's sweep outright — this is
+# how a node covers frequencies outside the standard plan, for example the
+# radar-detection channels between 52 and 144:
+#   WIFI_EXPLORE_5G=36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165
+# Set to "none" to scan nothing in a band. Clearing one has to be said
+# explicitly so it cannot happen by leaving a line blank.
+#
+# Anything listed is still checked against what your adapter can actually
+# tune to, so an entry it cannot reach is dropped rather than wasting time.
+# Adding channels lengthens the rotation: the node visits each one less
+# often, which lowers the chance of catching a brief overflight. The
+# feeder log reports the real cycle at startup — check it after editing.
+WIFI_EXPLORE_2G=
+WIFI_EXPLORE_5G=
+EOF
+        info "Added v1.5.1 channel plan options to config.env"
+    fi
+
     # ─── WIFI_ADAPTER_MAC (added by droneaware update for v1.5.0+) ───
     # MAC-based adapter identification. WIFI_ADAPTER=wlanN is fragile:
     # kernel enumeration reshuffles wlanN assignments when USB ports get
