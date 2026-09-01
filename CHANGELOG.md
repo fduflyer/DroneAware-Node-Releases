@@ -292,6 +292,25 @@ gap in a track; a node blind to four channels whenever anything is flying
 is the behavior this release set out to remove. Setting `WIFI_EXPLORE_2G`
 to `none` restores the old arrangement and pins that adapter to channel 6.
 
+### Two-adapter nodes reported the wrong scanning state
+
+Each adapter on a two-adapter node reported itself as locked to a single
+channel. That was accurate when the setting was introduced, because those
+adapters genuinely did sit on one channel each and never moved. This release
+gives them a plan that covers a whole band, so the description stopped being
+true — a node sweeping twenty-one channels was still describing itself as
+parked on one.
+
+Neither of the other existing values fitted either. The one meaning "shares
+its time between bands" is wrong for an adapter dedicated to a single band,
+and would have understated the coverage rather than overstating it.
+
+There is now a further state for an adapter that owns a band outright and
+covers it by rotating through its channels. Which state a node reports is
+worked out from the plan it actually built, so an adapter genuinely pinned
+to one channel — by `FIXED_CHANNEL`, or by clearing a band's sweep list —
+still reports itself as locked.
+
 ### Turning off a designated channel removed it from the plan entirely
 
 Setting a band's designated channel to 0 was documented as demoting it —
