@@ -1307,9 +1307,31 @@ class ScanPlanHopper(threading.Thread):
         ch149    2.0s
         explore  1.0s each, all of them               10.0s cycle
 
-    No ch6 leg at all, because the paired adapter holds ch6 100% of the
-    time and never retunes. That is the entire payoff of a second radio,
-    and it is why plan B also camps indefinitely (see below).
+    No ch6 leg, and no 2.4 explore channels either — its partner runs plan C
+    and owns that band outright. B therefore sweeps 5 GHz only, which is both
+    four legs shorter per rotation and free of the cross-band retunes those
+    legs used to cost.
+
+    Plan C — the ch6 half of the pair (WIFI_SCAN_PLAN=c):
+
+    ch6 for WIFI_DWELL_SOCIAL_2G_PAIRED_SEC, then ONE 2.4 explore channel for
+    WIFI_DWELL_EXPLORE_SEC, rotating. At the 9.0/1.0 defaults that is one
+    second in ten away from ch6.
+
+    This radio used to sit on ch6 at 100% duty forever. ch6 carries 1 Hz, so
+    holding it costs nothing to hold and the spare seconds were simply idle;
+    meanwhile its partner was crossing bands to cover 1/5/9/11. Moving that
+    work here shortens the 5 GHz rotation by about 16%.
+
+    The 10% of ch6 time given up is an EMPTY-SKY figure. The camp trigger
+    pins this radio to ch6 as soon as an aircraft is actually transmitting
+    there, so an overflight sees ~100% duty and the real cost is bounded by
+    one explore leg of acquisition delay — a single missed beacon at 1 Hz.
+    That is the entire argument for this plan, and it fails if the camp does
+    not engage.
+
+    Plan B still camps indefinitely: C returns to ch6 every cycle, so the
+    pair never leaves 2.4 unattended for more than one explore leg.
 
     Camping
     -------
@@ -1318,10 +1340,12 @@ class ScanPlanHopper(threading.Thread):
       entry   two RID frames on the same channel within
               WIFI_CAMP_TRIGGER_WINDOW_SEC — one stray decode must not be
               able to pin the radio for the next several seconds
-      exit    no frames on the camped channel for WIFI_CAMP_SILENCE_SEC.
-              The timer is scoped to the channel and reset by any frame, so
-              a second aircraft arriving keeps the camp alive after the
-              first one lands
+      exit    no frames on the camped channel for WIFI_CAMP_SILENCE_SEC on a
+              social channel, or WIFI_CAMP_SILENCE_OFFSOCIAL_SEC anywhere
+              else — a 1 Hz social camp needs patience, an off-social camp
+              at >=5 Hz does not. The timer is scoped to the channel and
+              reset by any frame, so a second aircraft arriving keeps the
+              camp alive after the first one lands
       release plan A only: every WIFI_CAMP_RELEASE_INTERVAL_SEC, give the
               other band one full social leg plus the next explore channel,
               then resume the camp. A single radio camped on ch6 otherwise
@@ -1347,34 +1371,94 @@ class ScanPlanHopper(threading.Thread):
     # advertises — that filter is what lets one list serve every regulatory
     # domain and every adapter.
     #
-    # 5 GHz is U-NII-3 only, for now:
+    # 5 GHz is U-NII-3 plus DFS:
     #   U-NII-1 (36-48)   indoor-restricted and low power, and a compliant
     #                     transmitter beacons on 149 regardless of where its
     #                     C2 link sits, so there is little reason to expect
     #                     RID there. Revisit if one ever turns up.
-    #   DFS (52-144)      an aircraft must run a 60 s channel-availability
-    #                     check to use it and vacate on radar detect;
-    #                     Skydio's own UI charges about a minute to enable
-    #                     it. Manufacturers visibly design around this band.
+    #   DFS (52-144)      INCLUDED. Excluded through v1.5.0 on the theory
+    #                     that the 60 s channel-availability check and the
+    #                     vacate-on-radar rule made the band unattractive
+    #                     enough that manufacturers designed around it. Two
+    #                     independent catches falsified that: ch144 (67
+    #                     frames, one pass) and ch56 (5 of 7 flights at a
+    #                     contributor site). DFS binds TRANSMITTERS, not
+    #                     receivers — a monitor-mode radio does not radiate,
+    #                     and the PHY filter already keeps these channels
+    #                     wherever the adapter advertises them.
     #   U-NII-4 (169-177) some MT76 adapters advertise it, but the power
     #                     rules are unverified. Left out until checked.
+    #
+    # The list is deliberately NOT narrowed to the channels we have actually
+    # caught aircraft on. We can only ever have counted drones on channels we
+    # were already scanning, so pruning toward our own history is circular —
+    # that is the exact reasoning that kept DFS out for two releases.
     #
     # 2.4 GHz goes past 1/6/11 because Parrot's published table is 5 MHz
     # steps from ch1 through ch11 — which is exactly how an ANAFI turned up
     # on ch5. ch13 is listed but only ever survives the PHY filter on
     # EU-regulatory adapters, which is the point of filtering rather than
     # hardcoding.
-    EXPLORE_5G_CANDIDATES = [153, 157, 161, 165]
-    EXPLORE_2G_CANDIDATES = [1, 5, 9, 11, 13]
+    #
+    # COST: 20 explore channels at the 1.0 s default dwell puts plan B's
+    # rotation near 26 s, and plan A visits one explore channel per pass so
+    # its full-band sweep grows in proportion. WIFI_DWELL_EXPLORE_SEC=0.5
+    # roughly halves it; WIFI_EXPLORE_5G replaces the list outright.
+    # The social channels appear in these lists too. While a channel HAS a
+    # social leg, _build_plan drops it from the rotation so it is not visited
+    # twice per cycle. Setting WIFI_SOCIAL_5G_CHANNEL=0 therefore demotes
+    # ch149 to an ordinary explore channel, which is what the config comment
+    # has always promised. Without the entries here that setting silently
+    # removed the channel from the plan altogether.
+    EXPLORE_5G_CANDIDATES = [149, 153, 157, 161, 165,
+                             52, 56, 60, 64,
+                             100, 104, 108, 112, 116, 120, 124, 128,
+                             132, 136, 140, 144]
+    EXPLORE_2G_CANDIDATES = [1, 5, 6, 9, 11, 13]
 
     DEFAULT_DWELL_SOCIAL_2G_S = 4.0
-    DEFAULT_DWELL_SOCIAL_5G_S = 2.0
+    # Plan C only. The paired ch6 radio gives up one second in ten to sweep
+    # 2.4, so 9.0 against a 1.0 s explore dwell. It is a separate number from
+    # plan A's 4.0 s because the two are answering different questions: plan
+    # A is splitting one radio across two bands, plan C is deciding how much
+    # of a dedicated ch6 radio's time can be spared.
+    DEFAULT_DWELL_SOCIAL_2G_PAIRED_S = 9.0
+    # ch149 gets an ORDINARY-length visit, not a 1 Hz-sized one. The long
+    # dwell was there for social-mode transmitters beaconing once a second,
+    # and after several releases of watching ch149 with ~28% of plan A's
+    # airtime the only 1 Hz aircraft ever seen on it was a Skydio X2 — low
+    # volume, discontinued, superseded by the X10. Everything else observed
+    # on ch149 runs 3 Hz or faster, which a 1.0 s visit catches 3+ times.
+    #
+    # Unlike the DFS exclusion this negative is trustworthy: we were looking
+    # hard AT this channel, so seeing almost nothing means something. The DFS
+    # mistake was concluding absence from channels we never scanned at all.
+    #
+    # ch149 still keeps a leg, so plan A visits it every cycle rather than
+    # once per rotation. That is about revisit RATE, which the X2 evidence
+    # says nothing about — see WIFI_SOCIAL_5G_CHANNEL=0 to drop it into the
+    # ordinary rotation entirely.
+    DEFAULT_DWELL_SOCIAL_5G_S = 1.0
     DEFAULT_DWELL_EXPLORE_S   = 1.0
 
     DEFAULT_CAMP_TRIGGER_FRAMES     = 2
     DEFAULT_CAMP_TRIGGER_WINDOW_S   = 2.0
-    DEFAULT_CAMP_SILENCE_S          = 6.0
-    DEFAULT_CAMP_RELEASE_INTERVAL_S = 9.5
+    # Silence before a camp is released, split by channel class because the
+    # two classes beacon at very different rates.
+    #
+    #   social      1 Hz, so 6.0 s is six missed beacons. Shortening it here
+    #               would drop live camps on ordinary fading.
+    #   off-social  >=5 Hz per F3411, 3-8 Hz observed in the field, so 3.0 s
+    #               is nine or more missed beacons — enough to call it lost.
+    #
+    # The off-social value is the one that matters for mid-flight channel
+    # hops, which are real and confirmed: 165->153 and 56->165 on two
+    # separate contributor flights. When an aircraft hops, the camped channel
+    # simply goes quiet, and every second of that timer is dead air before
+    # the sweep resumes hunting for it.
+    DEFAULT_CAMP_SILENCE_S           = 6.0
+    DEFAULT_CAMP_SILENCE_OFFSOCIAL_S = 3.0
+    DEFAULT_CAMP_RELEASE_INTERVAL_S  = 9.5
 
     # Sleep granularity while camped. Nothing retunes on this tick — it is
     # only how often the silence and release timers get looked at.
@@ -1384,7 +1468,7 @@ class ScanPlanHopper(threading.Thread):
         super().__init__(daemon=True)
         self.iface = iface
         self.plan  = (plan or "a").strip().lower()
-        if self.plan not in ("a", "b"):
+        if self.plan not in ("a", "b", "c"):
             log.warning(f"WIFI_SCAN_PLAN={plan!r} unrecognized — using plan a")
             self.plan = "a"
 
@@ -1411,6 +1495,8 @@ class ScanPlanHopper(threading.Thread):
 
         self.dwell_social_2g_s = self._parse_num(
             "WIFI_DWELL_SOCIAL_2G_SEC", self.DEFAULT_DWELL_SOCIAL_2G_S)
+        self.dwell_social_2g_paired_s = self._parse_num(
+            "WIFI_DWELL_SOCIAL_2G_PAIRED_SEC", self.DEFAULT_DWELL_SOCIAL_2G_PAIRED_S)
         self.dwell_social_5g_s = self._parse_num(
             "WIFI_DWELL_SOCIAL_5G_SEC", self.DEFAULT_DWELL_SOCIAL_5G_S)
         self.dwell_explore_s = self._parse_num(
@@ -1422,12 +1508,17 @@ class ScanPlanHopper(threading.Thread):
             "WIFI_CAMP_TRIGGER_WINDOW_SEC", self.DEFAULT_CAMP_TRIGGER_WINDOW_S)
         self.camp_silence_s = self._parse_num(
             "WIFI_CAMP_SILENCE_SEC", self.DEFAULT_CAMP_SILENCE_S)
+        self.camp_silence_offsocial_s = self._parse_num(
+            "WIFI_CAMP_SILENCE_OFFSOCIAL_SEC", self.DEFAULT_CAMP_SILENCE_OFFSOCIAL_S)
         self.camp_release_interval_s = self._parse_num(
             "WIFI_CAMP_RELEASE_INTERVAL_SEC", self.DEFAULT_CAMP_RELEASE_INTERVAL_S)
 
-        # Plan B's partner adapter never leaves ch6, so plan B never has to
-        # give the other band a turn.
-        self.camp_release = (self.plan == "a")
+        # A camp has to be broken periodically whenever this radio is the only
+        # one covering more than one channel worth returning to. Plan B is the
+        # exception: its partner is always on ch6, so B can hold a lock
+        # forever. Plan C needs the release — camped on a 2.4 explore channel
+        # it would otherwise starve ch6, which is the channel it exists for.
+        self.camp_release = (self.plan in ("a", "c"))
 
         # The channel plan is configurable. Which channel counts as "social"
         # can be changed or switched off entirely, and either band's explore
@@ -1452,6 +1543,7 @@ class ScanPlanHopper(threading.Thread):
         # Populated by _build_plan() once the interface can be queried.
         self._explore   = []
         self._explore_i = 0
+        self._release_i = 0
         self._social    = None
         self.retune_s   = 0.0
 
@@ -1556,8 +1648,24 @@ class ScanPlanHopper(threading.Thread):
         # rotation, or it gets visited twice per cycle and quietly takes
         # airtime from everything else.
         social_ch = {c for c, _ in self._planned_social_legs() if c}
-        candidates = [c for c in (self.explore_5g + self.explore_2g)
-                      if c not in social_ch]
+        if self.plan == "b" and self.social_2g:
+            # Plan B's partner adapter sits on ch6 permanently and never
+            # retunes, so B must not spend rotation time there. It has no ch6
+            # social leg of its own to dedupe against, so the exclusion has to
+            # be stated rather than falling out of the dedupe above.
+            social_ch.add(self.social_2g)
+        # The pair splits the spectrum: B sweeps 5 GHz, C sweeps 2.4. Before
+        # plan C existed, B carried the 2.4 explore channels too and its
+        # partner sat motionless on ch6 — so the sweeping radio spent four of
+        # every twenty-four legs on a band the other radio was already in,
+        # and paid a cross-band retune each way to get there.
+        if self.plan == "b":
+            band_candidates = list(self.explore_5g)
+        elif self.plan == "c":
+            band_candidates = list(self.explore_2g)
+        else:
+            band_candidates = self.explore_5g + self.explore_2g
+        candidates = [c for c in band_candidates if c not in social_ch]
         if supported:
             self._explore = [c for c in candidates if c in supported]
             dropped = [c for c in candidates if c not in supported]
@@ -1589,10 +1697,13 @@ class ScanPlanHopper(threading.Thread):
     def _planned_social_legs(self) -> list:
         """Social legs before the PHY filter. A channel of 0 is switched off."""
         if self.plan == "b":
-            # Plan B's partner owns ch6 outright; giving any of B's time to
-            # 2.4's social channel would duplicate coverage the pair already
-            # has 100% of.
+            # Plan B's partner owns ch6; giving any of B's time to 2.4's
+            # primary channel would duplicate coverage the pair already has.
             legs = [(self.social_5g, self.dwell_social_5g_s)]
+        elif self.plan == "c":
+            # Plan C is the ch6 half of the pair. ch6 is its only primary,
+            # and it never touches 5 GHz — the partner owns that band.
+            legs = [(self.social_2g, self.dwell_social_2g_paired_s)]
         else:
             legs = [
                 (self.social_2g, self.dwell_social_2g_s),
@@ -1651,6 +1762,19 @@ class ScanPlanHopper(threading.Thread):
         with self._lock:
             return self._last_frame.get(ch, 0.0)
 
+    def _silence_for(self, ch: int) -> float:
+        """How long ch may stay quiet before the camp on it is released.
+
+        Social channels get the long timer because they carry 1 Hz; anything
+        else is transmitting at >=5 Hz to be off social at all, so it can be
+        declared lost much sooner. Uses the CONFIGURED social channels, not
+        the class defaults, so a node that has moved or disabled a social
+        channel gets the timer that matches what it is actually watching.
+        """
+        if ch in (self.social_2g, self.social_5g):
+            return self.camp_silence_s
+        return self.camp_silence_offsocial_s
+
     # -- scanning -------------------------------------------------------------
 
     def run(self):
@@ -1672,7 +1796,7 @@ class ScanPlanHopper(threading.Thread):
         r = self.retune_s
         social = " + ".join(f"{d}s ch{c}" for c, d in self._social_legs)
         n_social = len(self._social_legs)
-        if self.plan == "a":
+        if self.plan in ("a", "c"):
             cycle = sum(d for _, d in self._social_legs) + self.dwell_explore_s
             legs_per_cycle = n_social + 1
             rotation = len(self._explore) * (cycle + legs_per_cycle * r)
@@ -1690,8 +1814,9 @@ class ScanPlanHopper(threading.Thread):
             f"Scan plan {self.plan.upper()} started: {social} + {explore_desc} "
             f"({true_cycle:.1f}s cycle incl. {1000*r:.0f}ms retune x{legs_per_cycle}); "
             f"camp after {self.camp_trigger_frames} frames/"
-            f"{self.camp_trigger_window_s}s, release on {self.camp_silence_s}s silence"
-            + (f", other-band leg every {self.camp_release_interval_s}s"
+            f"{self.camp_trigger_window_s}s, release on {self.camp_silence_s}s silence "
+            f"(social) / {self.camp_silence_offsocial_s}s (off-social)"
+            + (f", primary leg every {self.camp_release_interval_s}s"
                if self.camp_release else ", no release (partner holds ch6)")
         )
         # A leg that is mostly retune is not really scanning that channel.
@@ -1735,10 +1860,11 @@ class ScanPlanHopper(threading.Thread):
         legs = list(self._social_legs)
 
         if self._explore:
-            if self.plan == "a":
-                # One explore channel per cycle, rotating, so the social
+            if self.plan in ("a", "c"):
+                # One explore channel per cycle, rotating, so the primary
                 # channels keep their share and the rest of the band still
-                # gets visited.
+                # gets visited. This is what makes plan C "one second in
+                # ten" rather than a flat sweep across 2.4.
                 legs.append((self._explore[self._explore_i % len(self._explore)],
                              self.dwell_explore_s))
                 self._explore_i += 1
@@ -1755,17 +1881,25 @@ class ScanPlanHopper(threading.Thread):
                 return False
         return False
 
-    def _other_band_social(self, camp_ch: int):
-        """The other band's social leg, or None if this radio can't reach it.
+    def _release_social_leg(self, camp_ch: int):
+        """The primary channel to visit on a camp release, or None.
 
-        None on a single-band adapter, where the camp release becomes an
-        explore visit alone.
+        Any primary leg this radio has that is not the camped channel, taken
+        in rotation so that a plan with two of them does not starve one. None
+        on a single-band adapter, or when the camp is already sitting on the
+        only primary — the release is then an explore visit alone.
+
+        This used to ask specifically for the OTHER BAND's primary, which
+        silently returned None for a plan whose only primary is in the same
+        band as the camp. Plan C camped on ch5 would have gone right back to
+        ch5 forever, starving the one channel it exists to watch.
         """
-        want = self.SOCIAL_5G if camp_ch <= 14 else self.SOCIAL_2G
-        for ch, dwell in self._social_legs:
-            if ch == want:
-                return (ch, dwell)
-        return None
+        others = [(c, d) for c, d in self._social_legs if c != camp_ch]
+        if not others:
+            return None
+        leg = others[self._release_i % len(others)]
+        self._release_i += 1
+        return leg
 
     def _camp(self) -> bool:
         """Hold the camped channel. Returns True if the thread should stop."""
@@ -1773,6 +1907,7 @@ class ScanPlanHopper(threading.Thread):
         self._set(ch)
 
         last_seen = self._last_frame_ts(ch)
+        silence_s = self._silence_for(ch)
         # Seconds spent off ch since the last frame landed on it. Subtracted
         # from the silence measurement so a release leg cannot end its own
         # camp.
@@ -1788,14 +1923,14 @@ class ScanPlanHopper(threading.Thread):
                 last_seen = seen
                 off_s     = 0.0
 
-            if (time.time() - last_seen) - off_s > self.camp_silence_s:
-                log.info(f"Camp: ch{ch} quiet for {self.camp_silence_s}s — resuming sweep")
+            if (time.time() - last_seen) - off_s > silence_s:
+                log.info(f"Camp: ch{ch} quiet for {silence_s}s — resuming sweep")
                 self._camp_ch = None
                 return False
 
             if self.camp_release and (time.time() - camp_start) >= self.camp_release_interval_s:
                 left  = time.time()
-                other = self._other_band_social(ch)
+                other = self._release_social_leg(ch)
                 if other is not None:
                     och, dwell = other
                     self._set(och)
@@ -2665,19 +2800,20 @@ class WiFiFeeder:
         # v1.5.0 dual-adapter mode overrides hopper choice explicitly.
         # v1.5.1 splits the pair into complementary roles instead of giving
         # each adapter one band to itself:
-        #   --band=2g  holds ch6 outright, 100% of the time, forever. No
-        #              retune, no camp logic, no state machine at all. ~90%
-        #              of everything we have ever detected is on ch6, so one
-        #              radio permanently parked there is the single highest
-        #              value use of a second adapter.
-        #   --band=5g  sweeps everything else — ch149 plus the explore set,
-        #              across both bands — and camps INDEFINITELY on a lock,
-        #              because its partner never stops covering ch6. That
-        #              unlimited camp is the whole payoff of the pair.
+        #   --band=2g  plan C: ch6 for nine seconds in ten, then one 2.4
+        #              explore channel, camping on ch6 the moment anything
+        #              actually transmits there. ~90% of everything we have
+        #              ever detected is on ch6, so this radio's job is still
+        #              ch6 — it just stops idling on a 1 Hz channel during
+        #              the silence between beacons.
+        #   --band=5g  plan B: sweeps 5 GHz only, and camps INDEFINITELY on a
+        #              lock because its partner returns to ch6 every cycle.
+        #              That unlimited camp is the whole payoff of the pair.
         # --band=auto keeps the single-adapter behavior (may sweep or lock).
         if band == "2g":
-            log.info(f"Hopper mode: ch{ScanPlanHopper.SOCIAL_2G} locked, 100% (band={band})")
-            self.hopper = LockedChannelHopper(iface, ScanPlanHopper.SOCIAL_2G)
+            log.info(f"Hopper mode: scan plan C — ch{ScanPlanHopper.SOCIAL_2G} "
+                     f"plus a 2.4 sweep (band={band})")
+            self.hopper = ScanPlanHopper(iface, plan="c")
         elif band == "5g":
             log.info(f"Hopper mode: scan plan B — sweeps all non-ch6 (band={band})")
             self.hopper = ScanPlanHopper(iface, plan="b")
