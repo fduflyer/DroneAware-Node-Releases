@@ -3160,13 +3160,16 @@ class WiFiFeeder:
         #   dwell  = shared adapter, visits the band fractionally
         #   absent = no capable adapter present
         # A single dual-band card is genuinely shared between bands, so it
-        # reports dwell; sweep applies only to the dedicated per-band units.
+        # reports dwell. A SINGLE-BAND card is not shared — it owns its one
+        # band — so it reports lock or sweep on the same basis as a dedicated
+        # per-band adapter. Before v1.5.1 it was always lock because a 2.4-only
+        # radio sat on ch6 and never moved; it now sweeps 1/5/9/11 as well.
         if can_24 and can_5:
             mode_24, mode_5 = "dwell", "dwell"
         elif can_24:
-            mode_24, mode_5 = "lock", "absent"
+            mode_24, mode_5 = self._band_scan_mode(), "absent"
         elif can_5:
-            mode_24, mode_5 = "absent", "lock"
+            mode_24, mode_5 = "absent", self._band_scan_mode()
         else:
             mode_24, mode_5 = "absent", "absent"
 
