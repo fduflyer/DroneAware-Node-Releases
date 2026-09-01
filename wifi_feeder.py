@@ -3062,6 +3062,25 @@ class WiFiFeeder:
     #           counts absent as "present" for freshness/online detection)
     #   flag=false: single legacy heartbeat with feeder omitted (server
     #     infers wifi from wifi_ok/ble_ok null-ness, as pre-v1.5.0 nodes do).
+    def _band_scan_mode(self) -> str:
+        """"lock" if this radio holds one channel, "sweep" if it rotates.
+
+        Only meaningful on a dedicated per-band adapter. v1.5.0 pinned those
+        to a single channel, so "lock" described them exactly. v1.5.1 gave
+        them a plan that covers the whole band, which is neither "lock" (it
+        is not one channel) nor "dwell" (that means an adapter SHARED between
+        bands, and this one is not shared) — hence "sweep".
+
+        Derived from the plan the hopper actually built rather than from which
+        unit is running, so FIXED_CHANNEL and WIFI_EXPLORE_*=none both still
+        report "lock", which is what they genuinely do.
+        """
+        try:
+            chans = {c for c in (self.hopper.target_channels or []) if c}
+        except Exception:
+            return "lock"
+        return "sweep" if len(chans) > 1 else "lock"
+
     def _emit_wifi_heartbeats(self, common_payload: dict, wifi_ok: bool,
                               wifi_adp: str | None, wifi_fault: str | None,
                               scanning: bool):
@@ -3092,23 +3111,25 @@ class WiFiFeeder:
             mac = _get_iface_mac(self.iface) if self.iface else None
             p24 = dict(base)
             p24["feeder"] = "wifi_2g"
-            p24["scan_mode"] = "lock"  # dedicated adapter, this band only
+            mode = self._band_scan_mode()  # dedicated adapter, this band only
+            p24["scan_mode"] = mode
             p24["wifi_adapter_mac"] = mac
             p24["wifi_adapter_id"]  = None  # TODO: could look up via classifier
-            log.info(f"[heartbeat v1.5.0] emitting: wifi_2g(lock, iface={self.iface})")
+            log.info(f"[heartbeat v1.5.0] emitting: wifi_2g({mode}, iface={self.iface})")
             self._post_heartbeat_body(p24)
-            self._write_local_wifi_state("wifi_2g", "lock", mac, None, wifi_ok, wifi_fault)
+            self._write_local_wifi_state("wifi_2g", mode, mac, None, wifi_ok, wifi_fault)
             return
         if self.band == "5g":
             mac = _get_iface_mac(self.iface) if self.iface else None
             p5 = dict(base)
             p5["feeder"] = "wifi_5g"
-            p5["scan_mode"] = "lock"
+            mode = self._band_scan_mode()
+            p5["scan_mode"] = mode
             p5["wifi_adapter_mac"] = mac
             p5["wifi_adapter_id"]  = None
-            log.info(f"[heartbeat v1.5.0] emitting: wifi_5g(lock, iface={self.iface})")
+            log.info(f"[heartbeat v1.5.0] emitting: wifi_5g({mode}, iface={self.iface})")
             self._post_heartbeat_body(p5)
-            self._write_local_wifi_state("wifi_5g", "lock", mac, None, wifi_ok, wifi_fault)
+            self._write_local_wifi_state("wifi_5g", mode, mac, None, wifi_ok, wifi_fault)
             return
 
         # v1.5.0 split — figure out this adapter's band capability, then
@@ -3133,10 +3154,13 @@ class WiFiFeeder:
         except Exception as e:
             log.warning(f"[heartbeat v1.5.0] adapter capability probe failed: {e}")
 
-        # Derive scan_mode per server-claude's vocabulary:
-        #   lock  = dedicated adapter continuously on one band
-        #   dwell = shared adapter visits the band fractionally
+        # Derive scan_mode per the agreed vocabulary:
+        #   lock   = dedicated adapter, continuously on one channel
+        #   sweep  = dedicated adapter, covers the band by rotating within it
+        #   dwell  = shared adapter, visits the band fractionally
         #   absent = no capable adapter present
+        # A single dual-band card is genuinely shared between bands, so it
+        # reports dwell; sweep applies only to the dedicated per-band units.
         if can_24 and can_5:
             mode_24, mode_5 = "dwell", "dwell"
         elif can_24:
