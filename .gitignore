@@ -45,3 +45,11 @@ config.env
 # feeder classes against a fake clock to check scan behavior without a radio.
 # The repo root is what the build packages, so they stay untracked.
 *-sim.py
+
+# Temporary scan-model measurement harness — remove from nodes after testing
+test-scan.py
+preflight-check.py
+sweep-test-setup-and-hypothesis.md
+analyze-sweep-test.py
+scan-test-*.jsonl
+scan-trace-*.jsonl

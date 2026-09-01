@@ -67,19 +67,17 @@ something, against a single chance on channel 6.
 Covering the rest of the band is therefore far cheaper than it appears,
 and the sweep only has to find an aircraft — stopping on it is what
 actually collects the broadcasts. A node with one dual-band adapter now
-spends four seconds on channel 6, two on channel 149, and one second on
-one other channel, rotating through 153, 157, 161 and 165 on 5 GHz and 1,
-5, 9 and 11 on 2.4 GHz. Channel 6 keeps the majority of the time, which is
-where nearly everything ever detected has been; the second spent exploring
-comes out of channel 149's share, not channel 6's.
+spends four seconds on channel 6, one on channel 149, and one second on
+one other channel, rotating through the rest of both bands. Channel 6
+keeps the majority of the time, which is where nearly everything ever
+detected has been; the second spent exploring comes out of channel 149's
+share, not channel 6's.
 
-A node with two adapters now splits the work rather than giving each
-adapter a band. One holds channel 6 outright, permanently, and never
-retunes for any reason. The other sweeps everything else, and because its
-partner never stops covering channel 6, it can stop on an aircraft and
-stay there indefinitely. The adapter holding channel 6 also re-asserts it
-periodically, so a driver reset cannot silently park the node's primary
-radio somewhere useless for the rest of the session.
+A node with two adapters now splits the work by band rather than giving
+one adapter a single channel. One works 2.4 GHz — channel 6 for nine
+seconds in ten, then a second on one of the others. The other sweeps
+5 GHz, and because its partner returns to channel 6 every cycle, it can
+stop on an aircraft and stay there indefinitely.
 
 Stopping on a detection now requires two broadcasts on the same channel
 within two seconds, so a single stray decode cannot pin the radio to an
@@ -94,10 +92,7 @@ concealing every other drone.
 Which channels exist is read from the adapter at startup rather than
 assumed, so nodes in regions where channel 13 is permitted pick it up
 automatically, and adapters that cannot tune part of the plan simply skip
-it. Channels requiring radar detection are deliberately excluded:
-manufacturers avoid them because an aircraft must run a lengthy
-availability check before use and abandon the channel mid-flight if radar
-appears.
+it.
 
 ### The same detections were uploaded over and over
 
@@ -216,6 +211,98 @@ been deliberately changed is carried across to the new setting on update;
 the old entries are left in place, commented, so it is clear what happened
 to them. The opt-in that added glances at channels 1 and 11 is retired,
 since those channels are now always scanned.
+
+### Channels requiring radar detection are now scanned
+
+These were excluded on the reasoning that manufacturers avoid them: an
+aircraft must run a lengthy availability check before using one, and
+abandon it mid-flight if radar appears. That reasoning was plausible and
+wrong. Aircraft have now been recorded on two of these channels at
+separate sites, one of them carrying a broadcast on five flights out of
+seven.
+
+The restriction binds transmitters, not receivers. A node listening in
+monitor mode does not transmit, so there was never a regulatory reason not
+to listen there. All sixteen are now part of the sweep on any adapter that
+reports being able to tune them.
+
+The list is deliberately not narrowed to the two channels where aircraft
+have actually been found. A node can only ever record a drone on a channel
+it was already scanning, so choosing channels by past detections confirms
+whatever it already assumed — which is exactly how these came to be
+excluded in the first place.
+
+This does lengthen the sweep on a single adapter: covering the whole band
+now takes about two and a half minutes, where the shorter list took under
+one. A node that would rather sweep quickly than broadly can set
+`WIFI_EXPLORE_5G` back to `153,157,161,165`.
+
+### Channel 149 no longer gets a long visit
+
+Channel 149 was given a long visit for the same reason as channel 6 — a
+compliant aircraft broadcasting there does so once a second, and a short
+visit can land between two broadcasts.
+
+Several releases of watching that channel closely have turned up exactly
+one aircraft type actually doing this, and it has been out of production
+for some time. Everything else recorded there transmits three times a
+second or faster, which a one-second visit catches several times over.
+
+The visit is now one second rather than two. Channel 149 keeps its place
+in every cycle, so it is still looked at far more often than any other
+5 GHz channel — it simply no longer gets a visit sized for a rate almost
+nothing uses.
+
+### A drone that changed channel mid-flight was followed too slowly
+
+Aircraft have been observed changing the channel they broadcast on partway
+through a flight, twice at one site on separate days. When that happens
+the node is stopped on a channel that has gone quiet, and it waits out a
+fixed period of silence before it starts looking again.
+
+That period was six seconds everywhere, which is right for channels 6 and
+149: they carry one broadcast a second, so six seconds is six missed
+broadcasts, and anything shorter would let ordinary interference break a
+perfectly good hold.
+
+Everywhere else an aircraft must transmit at least five times a second to
+be there at all, and the slowest ever recorded is three. Three seconds is
+therefore nine or more missed broadcasts — enough to be certain, and half
+as long spent listening to a channel the aircraft has already left.
+
+### The second adapter sat idle on a single channel
+
+On a two-adapter node one adapter held channel 6 and did nothing else,
+permanently. Channel 6 carries one broadcast a second, so most of that
+time was spent waiting rather than hearing anything — while the other
+adapter was crossing between bands to cover channels 1, 5, 9 and 11, time
+taken directly out of its 5 GHz sweep.
+
+The channel 6 adapter now covers its own band: nine seconds on channel 6,
+then one second on another 2.4 GHz channel. The other adapter sweeps
+5 GHz only. That removes four legs and eight band changes from every
+5 GHz rotation, shortening it by about a sixth.
+
+The tenth of channel 6 time given up is not conditional on the sky being
+empty — the adapter takes its second even while stopped on an aircraft.
+Suppressing it would recover that tenth, but it would halt 2.4 GHz
+exploration exactly when a drone is overhead, which is when a second one
+is most likely to be up. A broadcast missed one time in ten leaves a small
+gap in a track; a node blind to four channels whenever anything is flying
+is the behavior this release set out to remove. Setting `WIFI_EXPLORE_2G`
+to `none` restores the old arrangement and pins that adapter to channel 6.
+
+### Turning off a designated channel removed it from the plan entirely
+
+Setting a band's designated channel to 0 was documented as demoting it —
+it would lose its dedicated visit and be swept like any other channel.
+Because it was not in the sweep list, it stopped being scanned at all, so
+a node configured this way was silently blind to the channel it was most
+likely to hear something on.
+
+The designated channels are now part of the sweep list, and are taken out
+of the rotation only while they hold a dedicated visit. Setting one to 0
+now does what it always claimed to.
 
 ## [1.5.0.9] — Unreleased
 

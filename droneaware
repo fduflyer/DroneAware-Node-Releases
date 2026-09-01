@@ -188,7 +188,7 @@ EOF
         old_2g="$(_cfg_get "$cfg" WIFI_DWELL_2G_SEC)"
         old_5g="$(_cfg_get "$cfg" WIFI_DWELL_5G_SEC)"
         new_2g=4.0
-        new_5g=2.0
+        new_5g=1.0
 
         # 3 and 2 were the v1.4.6 stock values — those are the old defaults,
         # not a preference, so they get replaced. Anything else was a
@@ -206,20 +206,26 @@ EOF
 # The node now sweeps both bands. Dwell is deliberately INVERSE to how fast
 # a transmitter beacons:
 #
-#   social channels (ch6, ch149)   1 Hz    long visits — one beacon a
+#   ch6                            1 Hz    a long visit — one beacon a
 #                                          second, so a short visit misses
-#   everything else               >=5 Hz   short visits — a 1s visit gives
-#                                          five to eight chances to decode
+#   everything else               >=3 Hz   short visits — a 1s visit gives
+#                                          three to eight chances to decode
 #
-# That is not arbitrary. A compliant aircraft beacons on the social channel
+# That is not arbitrary. A compliant aircraft beacons on a primary channel
 # no matter which channel its video and control link are using, and the
 # standard only lets it broadcast somewhere else if it raises its rate to
 # at least 5 Hz. So the rest of the band is cheap to cover, and the sweep
 # only has to FIND an aircraft — camping is what captures it.
 #
+# ch149 is a primary channel but gets an ordinary-length visit, not a long
+# one. Only a single aircraft type has ever been heard beaconing there once
+# a second, and it is long out of production; everything else seen on ch149
+# runs at three or more, which a one-second visit catches several times.
+# ch149 still gets looked at far more OFTEN than any other 5 GHz channel.
+#
 # Single dual-band adapter:  ${new_2g}s ch6 -> ${new_5g}s ch149 -> 1s one other
-# channel, rotating through 153/157/161/165 and 1/5/9/11.
-# Two adapters: one holds ch6 outright, the other sweeps everything else.
+# channel, rotating through 5 GHz 153/157/161/165 plus 52-144, and 1/5/9/11.
+# Two adapters: one works ch6 and the rest of 2.4, the other sweeps 5 GHz.
 #
 # Raising WIFI_DWELL_SOCIAL_2G_SEC weights the node toward 2.4 GHz (most
 # DJI), raising WIFI_DWELL_SOCIAL_5G_SEC weights it toward 5 GHz (Skydio,
@@ -233,9 +239,16 @@ WIFI_DWELL_EXPLORE_SEC=1.0
 #   TRIGGER_FRAMES / TRIGGER_WINDOW_SEC  frames needed to engage. Two
 #       within two seconds — one stray decode must not be able to pin the
 #       radio to an empty channel.
-#   SILENCE_SEC   let go after this long with nothing heard. The timer is
-#       per-channel and any frame resets it, so a second aircraft arriving
-#       keeps the node camped after the first one lands.
+#   SILENCE_SEC   let go after this long with nothing heard on a SOCIAL
+#       channel. The timer is per-channel and any frame resets it, so a
+#       second aircraft arriving keeps the node camped after the first one
+#       lands. Social channels carry 1 Hz, so 6 s is six missed beacons —
+#       shorten it and ordinary fading starts dropping live camps.
+#   SILENCE_OFFSOCIAL_SEC   the same, for every other channel. Anything
+#       transmitting off social is doing at least 5 Hz, so 3 s is nine or
+#       more missed beacons. This is the one that matters when an aircraft
+#       changes channel mid-flight: the camped channel just goes quiet, and
+#       every second of this timer is dead air before the sweep hunts again.
 #   RELEASE_INTERVAL_SEC  single-adapter only: how often to break off and
 #       check the other band. A lone radio camped on ch6 hears nothing at
 #       all from 5 GHz in between, so this is what stops one drone from
@@ -245,6 +258,7 @@ WIFI_DWELL_EXPLORE_SEC=1.0
 WIFI_CAMP_TRIGGER_FRAMES=2
 WIFI_CAMP_TRIGGER_WINDOW_SEC=2.0
 WIFI_CAMP_SILENCE_SEC=6.0
+WIFI_CAMP_SILENCE_OFFSOCIAL_SEC=3.0
 WIFI_CAMP_RELEASE_INTERVAL_SEC=9.5
 EOF
         # WIFI_OFF_CHANNEL_SWEEP is gone as well. It was an opt-in that added
@@ -262,6 +276,95 @@ EOF
         else
             info "Added v1.5.1 scan model options to config.env"
         fi
+    fi
+
+    # v1.5.1 — which channels the plan covers. Separate block from the dwell
+    # keys above because a node that already took those (an early v1.5.1
+    # build) would never re-enter that guard, and these would stay invisible
+    # on exactly the nodes most likely to want them.
+    if ! grep -q '^WIFI_SOCIAL_5G_CHANNEL=' "$cfg"; then
+        [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+        cat >> "$cfg" <<'EOF'
+
+# ─── Which channels to scan (added by droneaware update for v1.5.1+) ───
+# The dwell settings above say how LONG to listen. These say WHERE.
+#
+# Each band has one primary channel, given a long dedicated visit because
+# that is where a compliant aircraft broadcasts regardless of which channel
+# its video and control link are using. Set a primary to 0 and it stops
+# being privileged — it is then swept like any other channel. Useful for a
+# node aimed at aircraft that do not use the primary at all.
+WIFI_SOCIAL_2G_CHANNEL=6
+WIFI_SOCIAL_5G_CHANNEL=149
+
+# The sweep list for each band. Leave empty for the default:
+#   2.4 GHz   1, 5, 9, 11 (and 13 where permitted)
+#   5 GHz     153, 157, 161, 165 plus the radar-detection channels 52-144
+# Set a comma-separated list to replace a band's sweep outright. To go back
+# to the shorter pre-v1.5.1 list, which sweeps far more often but cannot see
+# an aircraft using a radar-detection channel:
+#   WIFI_EXPLORE_5G=153,157,161,165
+# Set to "none" to scan nothing in a band. Clearing one has to be said
+# explicitly so it cannot happen by leaving a line blank.
+#
+# Anything listed is still checked against what your adapter can actually
+# tune to, so an entry it cannot reach is dropped rather than wasting time.
+# Adding channels lengthens the rotation: the node visits each one less
+# often, which lowers the chance of catching a brief overflight. The
+# feeder log reports the real cycle at startup — check it after editing.
+WIFI_EXPLORE_2G=
+WIFI_EXPLORE_5G=
+EOF
+        info "Added v1.5.1 channel plan options to config.env"
+    fi
+
+    # v1.5.1 — the off-social camp timer. Its own block for the same reason
+    # as the channel plan above: a node that already took the camp keys from
+    # an earlier v1.5.1 build never re-enters that guard, and this key would
+    # stay invisible on precisely the nodes already running the scan model.
+    if ! grep -q '^WIFI_CAMP_SILENCE_OFFSOCIAL_SEC=' "$cfg"; then
+        [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+        cat >> "$cfg" <<'EOF'
+
+# ─── Off-social camp timer (added by droneaware update for v1.5.1+) ───
+# WIFI_CAMP_SILENCE_SEC above applies to the primary channels, which carry
+# one beacon per second and so need a patient timer. Every other channel
+# carries at least five per second, so silence there means something quite
+# different and can be acted on much sooner.
+#
+# This is what limits the damage when an aircraft changes channel in
+# mid-flight — confirmed in the field, twice. The camped channel simply goes
+# quiet, and until this timer expires the node is holding a channel nothing
+# is transmitting on instead of hunting for where the aircraft went.
+WIFI_CAMP_SILENCE_OFFSOCIAL_SEC=3.0
+EOF
+        info "Added v1.5.1 off-social camp timer to config.env"
+    fi
+
+    # v1.5.1 — the paired ch6 dwell. Own block again: this key only appears on
+    # two-adapter nodes and was added after the ones above.
+    if ! grep -q '^WIFI_DWELL_SOCIAL_2G_PAIRED_SEC=' "$cfg"; then
+        [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+        cat >> "$cfg" <<'EOF'
+
+# ─── Paired ch6 dwell (added by droneaware update for v1.5.1+) ───
+# TWO-ADAPTER NODES ONLY. Ignored if you run a single adapter.
+#
+# The ch6 adapter used to sit on that one channel permanently. ch6 carries
+# one beacon per second, so most of that time was spent waiting rather than
+# hearing anything, while the OTHER adapter was crossing bands to cover
+# 1/5/9/11 — time taken directly from its 5 GHz sweep.
+#
+# The ch6 adapter now works its own band: this many seconds on ch6, then one
+# second on another 2.4 channel, repeating. At the default that is one second
+# in ten, and it shortens the 5 GHz sweep by about a sixth.
+#
+# Raise it toward 30 to give ch6 more of the radio and sweep 2.4 more slowly.
+# Setting WIFI_EXPLORE_2G=none pins this adapter to ch6 the way older
+# releases did.
+WIFI_DWELL_SOCIAL_2G_PAIRED_SEC=9.0
+EOF
+        info "Added v1.5.1 paired ch6 dwell to config.env"
     fi
 
     # ─── WIFI_ADAPTER_MAC (added by droneaware update for v1.5.0+) ───
