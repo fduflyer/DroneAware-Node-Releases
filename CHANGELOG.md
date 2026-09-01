@@ -305,7 +305,7 @@ Neither of the other existing values fitted either. The one meaning "shares
 its time between bands" is wrong for an adapter dedicated to a single band,
 and would have understated the coverage rather than overstating it.
 
-There is now a third state for an adapter that owns a band outright and
+There is now a further state for an adapter that owns a band outright and
 covers it by rotating through its channels. Which state a node reports is
 worked out from the plan it actually built, so an adapter genuinely pinned
 to one channel — by `FIXED_CHANNEL`, or by clearing a band's sweep list —
