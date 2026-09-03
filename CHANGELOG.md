@@ -10,6 +10,180 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.5.2] — Unreleased
+
+Diagnostics: making the node able to tell you what it is actually doing.
+
+### There was no way to see which adapter was on which channel
+
+`droneaware status` listed the services and the firmware version but said
+nothing about the radios themselves. Answering "which adapter is doing what,
+and where is it listening?" meant knowing about `iw` — which is not on the
+command path for an ordinary shell, so the obvious attempt returns nothing at
+all rather than an error.
+
+Status now lists each radio with its driver, mode, current channel, and the
+job it has been assigned:
+
+```
+  Radios:
+    wlan0   brcmfmac      managed  ch40    network uplink
+    wlan1   rt2800usb     monitor  ch6     2.4 GHz feeder
+    wlan2   mt76x2u       monitor  ch124   5 GHz feeder
+```
+
+Running it twice a few seconds apart shows the 5 GHz radio moving, which is
+the sweep working. An adapter that is plugged in but has not been assigned a
+job is named as unused, with a pointer to the command that adopts it — that
+case previously wasted hardware silently.
+
+### A warning that fired on every healthy node
+
+Every US node logged this at every start:
+
+```
+PHY does not advertise channels [13] — hopper will retune but the radio
+may not actually be there.
+```
+
+Nothing was wrong. The check ran before the channel plan was built, so it
+tested the raw candidate list rather than the plan — and channel 13, which is
+not permitted in the US, was correctly dropped from the plan one line later.
+The node then reported that it would tune somewhere it had already decided not
+to go.
+
+The check is removed rather than reordered, because the plan-building step
+already performs it after filtering and logs the accurate version, and the
+startup line lists the channels actually in use.
+
+A warning that fires on every healthy node teaches operators to ignore
+warnings, which is expensive on the day one of them is real.
+
+### Three smaller corrections
+
+**The GPS device was picked non-deterministically.** When more than one USB
+serial device is attached, the feeder chose from an unsorted list, so it could
+read a different device after a reboot — and report no GPS while the receiver
+sat there working. Now sorted, so the choice is repeatable.
+
+**The adapter-resolution line named the wrong setting.** It always reported
+`WIFI_ADAPTER_MAC`, even on a two-adapter node where the value had come from
+`WIFI_ADAPTER_2G_MAC` or `WIFI_ADAPTER_5G_MAC`. Anyone tracing an adapter
+mix-up was reading a line pointing at a setting they had never touched.
+
+**A node with no primary channel logged a stray separator** — `started:  +
+all 25 explore` — when the 2.4 or 5 GHz primary had been switched off.
+
+### A Pi that is not getting enough power now says so
+
+The installer has checked for under-voltage since v1.5.0.6, but only once, at
+install time. A node that was healthy then and developed a power problem later
+said nothing at all — and an under-volted Pi degrades in ways that look like
+almost anything except a power fault.
+
+That gap matters more now that a second WiFi adapter is recommended, since
+adding one is exactly the change that pushes a marginal supply over the edge.
+Recommending the hardware without surfacing the consequence would have been a
+poor trade.
+
+`sudo droneaware status` now reports it:
+
+```
+  Power    : OK
+```
+
+or, when the supply is struggling, what is happening and what usually fixes it
+— the official supply, a short and thick USB cable, and a powered hub when
+several adapters are attached. Throttling with no under-voltage is reported
+separately, since that is usually heat rather than power.
+
+It is reported even when healthy. Saying nothing cannot distinguish "checked
+and fine" from "never checked", which is the same ambiguity that made the
+stale-GPS message misleading.
+
+One caveat worth knowing: these flags are latched since boot, so a clean
+reading on a Pi that has just started and has not yet drawn much current is
+weaker evidence than it appears.
+
+### Choosing which adapter sweeps 5 GHz
+
+On a two-adapter node the software decides which radio works 2.4 GHz and which
+sweeps 5 GHz. That decision is consistent — adapters are ordered by MAC
+address — but arbitrary from an operator's point of view, because a MAC says
+nothing about which radio is the better sweeper. It matters more than it
+sounds: the sweeping adapter changes channel around twenty-one times a cycle,
+and the time that takes varies by a factor of forty-five across adapters
+people actually own.
+
+Operators who edited the setting by hand found it reverted. Re-detecting
+hardware rewrites both role assignments every time it runs, and updates
+re-detect, so a deliberate change survived only until the next upgrade.
+
+```
+sudo droneaware swap            # exchange the two roles
+sudo droneaware swap --auto     # hand the choice back to the node
+```
+
+A swap is remembered across reboots, updates and re-installs. It refuses to
+move a 2.4 GHz-only adapter onto the 5 GHz role, since that node would run
+normally while never seeing a drone above 2.4 GHz.
+
+It is deliberately not permanent. If either adapter is unplugged or replaced,
+the next hardware re-detection notices the pinned radio is gone, says so, and
+returns to choosing automatically — so a new adapter is adopted normally
+rather than being ignored because of a preference set months earlier. The same
+release happens if the node drops to a single adapter.
+
+### `droneaware test` refused to run on a node with a working GPS
+
+On a mobile node, `sudo droneaware test` failed with "No location configured.
+Set NODE_LAT/NODE_LON in config.env first" — on a node whose GPS had a fix
+from 19 satellites, which `sudo droneaware status` printed correctly seconds
+earlier, and whose position was already showing on the website.
+
+`NODE_LAT`/`NODE_LON` are deliberately empty on a mobile node, because the
+position comes from the receiver. There was a GPS fallback for exactly this
+case, but it read the serial port itself rather than the position the feeder
+already publishes, and it failed four separate ways:
+
+- it required `GPS_DEVICE` to be set in the config file, but the feeder finds
+  the receiver automatically, so that setting is normally empty — which
+  skipped the entire fallback
+- it assumed 4800 baud
+- it looked only for `$GPRMC` sentences, never the `$GNRMC` that
+  multi-constellation receivers send
+- it competed for the serial port with the feeder, which holds it open
+
+The fallback now reads the position the feeder publishes, which is the same
+source `status` uses — so the two commands can no longer disagree about
+whether the node knows where it is. A fix older than ten minutes is ignored,
+since on a mobile node that is no longer where it is.
+
+### A GPS with no fix was reported as a stopped feeder
+
+`droneaware status` showed `GPS : state stale (135375s old — wifi_feeder may
+have stopped)` on a node whose feeders were both running, and which the same
+output listed as running two lines earlier.
+
+The GPS state file is written once when the serial port opens, and after that
+only when a valid position fix arrives. A receiver that is powered, connected
+and streaming NMEA — but has never achieved a fix, which is the normal state
+indoors or with a poor sky view — therefore never updated the file again. The
+status command treats anything older than two minutes as evidence the feeder
+died.
+
+So the one situation where an operator most needs a useful diagnostic produced
+a message that was wrong about the cause and pointed at the wrong component.
+
+The reader now refreshes that file every 20 seconds while the port is open,
+carrying the satellite count and fix quality it already parses. Status has
+always been able to report "NMEA, 6 satellites, no fix yet" — that line was
+simply unreachable, because the staleness check ran first.
+
+This is the same defect that was fixed for the `not_configured` state back in
+v1.3.0.2. `reading` had the identical write-once property and did not get the
+same treatment.
+
 ## [1.5.1] — Unreleased
 
 How the node chooses what to listen to. Until now it scanned two channels

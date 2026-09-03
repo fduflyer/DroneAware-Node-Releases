@@ -929,9 +929,16 @@ def resolve_monitor_iface(fallback_iface: str | None, band: str = "auto") -> str
                         # would pick peer band's adapter and cause contention.
                         return ""
                     break  # single-adapter mode — safe to fall through
+                # Name the key the value actually came from. This said
+                # WIFI_ADAPTER_MAC unconditionally, so on a two-adapter node it
+                # reported a key the operator had not set while the real one --
+                # WIFI_ADAPTER_2G_MAC or _5G_MAC -- went unmentioned. Anyone
+                # debugging an adapter mix-up was reading a line that pointed
+                # at the wrong setting.
                 log.info(
-                    f"[iface v1.5.0] resolved WIFI_ADAPTER_MAC={configured_mac} "
-                    f"→ {iface}"
+                    f"[iface v1.5.0] resolved "
+                    f"{band_key if band_specific_configured else 'WIFI_ADAPTER_MAC'}"
+                    f"={configured_mac} → {iface}"
                 )
                 return iface
         else:
@@ -1810,8 +1817,12 @@ class ScanPlanHopper(threading.Thread):
             legs_per_cycle = n_social + len(self._explore)
             explore_desc = f"all {len(self._explore)} explore @ {self.dwell_explore_s}s"
         true_cycle = cycle + legs_per_cycle * r
+        # Join only the parts that exist. A plan whose primary channel has
+        # been switched off has no social leg, which rendered as a stray
+        # leading " + ".
+        plan_desc = " + ".join(p for p in (social, explore_desc) if p)
         log.info(
-            f"Scan plan {self.plan.upper()} started: {social} + {explore_desc} "
+            f"Scan plan {self.plan.upper()} started: {plan_desc} "
             f"({true_cycle:.1f}s cycle incl. {1000*r:.0f}ms retune x{legs_per_cycle}); "
             f"camp after {self.camp_trigger_frames} frames/"
             f"{self.camp_trigger_window_s}s, release on {self.camp_silence_s}s silence "
@@ -2331,7 +2342,10 @@ def _write_gps_state(*, device: str | None = None, baud: int | None = None,
                         DroneAware can't parse; protocol field carries which
       detecting_baud  — probing baud rates against the device
       no_nmea         — device opened but no valid NMEA sentences received
-      reading         — serial port open, NMEA flowing, awaiting first fix
+      reading         — serial port open, NMEA flowing, awaiting first fix.
+                        REFRESHED every 20 s by the reader loop. It must be,
+                        or a receiver that never fixes looks identical to a
+                        stopped feeder to the staleness check in the CLI.
       fix             — most recent $GPRMC was "A" (active/valid); lat/lon populated
 
     Extended fields (v1.4.12+):
@@ -2440,7 +2454,11 @@ def find_gps_device() -> str | None:
         return env_device
 
     # USB paths — probed for every node.
-    usb_candidates = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
+    # Sorted, because glob returns filesystem order. On a node with more than
+    # one USB serial device the pick was nondeterministic across boots, so the
+    # feeder could read a different device than last time and report no GPS
+    # while the receiver sat there working.
+    usb_candidates = sorted(glob.glob('/dev/ttyUSB*')) + sorted(glob.glob('/dev/ttyACM*'))
     usb_candidates = [c for c in usb_candidates if os.path.exists(c)]
     if usb_candidates:
         return usb_candidates[0]
@@ -2557,10 +2575,40 @@ def gps_reader_thread(device: str):
 
             with serial.Serial(device, baudrate=baud, timeout=2) as ser:
                 log.info(f"[GPS] Reading from {device} at {baud} baud")
+                last_nmea  = time.time()
+                last_write = last_nmea
                 _write_gps_state(device=device, baud=baud, status="reading",
-                                 last_nmea_at=time.time(), protocol="nmea")
+                                 last_nmea_at=last_nmea, protocol="nmea")
                 while True:
                     line = ser.readline().decode('ascii', errors='ignore').strip()
+                    if line:
+                        last_nmea = time.time()
+
+                    # Heartbeat the state file even with no fix. It used to be
+                    # written once above and then ONLY on a valid RMC fix, so a
+                    # receiver streaming NMEA that never achieves a fix left the
+                    # file untouched forever — and `droneaware status` reports
+                    # anything older than 120 s as "wifi_feeder may have
+                    # stopped", which is both wrong and blames a component the
+                    # same output shows as running two lines earlier.
+                    #
+                    # This is the defect already fixed once for the
+                    # not_configured state; "reading" has the identical
+                    # write-once property and never got the same treatment.
+                    # The status command's "reading" branch already prints the
+                    # satellite count — it was simply unreachable, because the
+                    # staleness check short-circuited before it.
+                    now = time.time()
+                    if now - last_write >= 20.0:
+                        with _gps_lock:
+                            cur_lat, cur_lon = _gps_lat, _gps_lon
+                        _write_gps_state(
+                            device=device, baud=baud,
+                            status="fix" if cur_lat is not None else "reading",
+                            last_nmea_at=last_nmea, protocol="nmea",
+                            lat=cur_lat, lon=cur_lon,
+                            fix_quality=fix_quality, sats_in_use=sats_in_use)
+                        last_write = now
 
                     # GGA — fix quality + sats-in-use. Field layout:
                     #   $GxGGA,time,lat,N,lon,W,fix_quality,sats,hdop,...
@@ -2590,6 +2638,7 @@ def gps_reader_thread(device: str):
                                          last_nmea_at=time.time(), lat=lat, lon=lon,
                                          protocol="nmea", fix_quality=fix_quality,
                                          sats_in_use=sats_in_use)
+                        last_write = time.time()
                     except (ValueError, IndexError):
                         continue
         except serial.SerialException as e:
@@ -2976,18 +3025,17 @@ class WiFiFeeder:
     def _run_once(self) -> bool:
         log.info(f"DroneAware WiFi Feeder - Node: {self.node_id}")
         _check_cli_freshness()
-        target = self.hopper.target_channels
-        log.info(f"Interface: {self.iface or '<not configured>'}  |  Hopper channels: {target}")
-
-        if self.iface and os.path.exists(f"/sys/class/net/{self.iface}"):
-            supported = _supported_channels(self.iface)
-            if supported:
-                missing = [c for c in target if c not in supported]
-                if missing:
-                    log.warning(
-                        f"PHY does not advertise channels {missing} — "
-                        "hopper will retune but the radio may not actually be there."
-                    )
+        # Deliberately does NOT pre-check the channel list against the PHY.
+        # This ran before hopper.run() called _build_plan(), so it saw the raw
+        # candidates and warned that the radio "may not actually be there" for
+        # channels the plan then dropped one line later — on every US node, at
+        # every start, for ch13. _build_plan does the same check after
+        # filtering and logs the accurate version, and the "Scan plan started"
+        # line reports the channels actually in use.
+        #
+        # A warning that fires on every healthy node teaches operators to
+        # ignore warnings, which is expensive the day one is real.
+        log.info(f"Interface: {self.iface or '<not configured>'}")
 
         # FAULT mode — missing or invalid WiFi adapter
         if not self.iface or not os.path.exists(f"/sys/class/net/{self.iface}"):
