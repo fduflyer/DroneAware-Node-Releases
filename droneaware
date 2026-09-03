@@ -1721,33 +1721,42 @@ cmd_test() {
         exit 1
     fi
 
-    # Fall back to GPS fix if available and static coords are missing
+    # Fall back to the live GPS fix when static coords are missing, which is
+    # the NORMAL state on a mobile node -- NODE_LAT/NODE_LON are deliberately
+    # empty there because position comes from the receiver.
+    #
+    # Read the state file the feeder maintains, NOT the serial port. The
+    # previous version re-read /dev/tty* itself and failed four separate ways:
+    # it required GPS_DEVICE to be set in config (the feeder auto-discovers,
+    # so it is normally empty and the whole branch was skipped), hardcoded
+    # 4800 baud, matched only $GPRMC and never the $GNRMC that multi-
+    # constellation receivers emit, and contended with the feeder, which holds
+    # the port open with exclusive locking. Net effect: `droneaware status`
+    # printed a valid fix while `droneaware test` insisted no location was
+    # configured -- same node, seconds apart.
     if [[ -z "$lat" || "$lat" == "0" || -z "$lon" || "$lon" == "0" ]]; then
-        local gps_dev
-        gps_dev=$(_cfg_get "$cfg" GPS_DEVICE)
-        if [[ -n "$gps_dev" && -e "$gps_dev" ]]; then
-            local nmea
-            nmea=$(stty -F "$gps_dev" 4800 2>/dev/null; timeout 8 cat "$gps_dev" 2>/dev/null \
-                | grep -m1 '^\$GPRMC.*,A,')
-            if [[ -n "$nmea" ]]; then
-                lat=$(echo "$nmea" | python3 -c "
-import sys, re
-parts = sys.stdin.read().strip().split(',')
-d=int(float(parts[3])/100); m=float(parts[3])-d*100
-lat=round(d+m/60,6)
-if parts[4]=='S': lat=-lat
-d=int(float(parts[5])/100); m=float(parts[5])-d*100
-lon=round(d+m/60,6)
-if parts[6].split('*')[0]=='W': lon=-lon
-print(lat, lon)" | awk '{print $1}')
-                lon=$(echo "$nmea" | python3 -c "
-import sys
-parts = sys.stdin.read().strip().split(',')
-d=int(float(parts[5])/100); m=float(parts[5])-d*100
-lon=round(d+m/60,6)
-if parts[6].split('*')[0]=='W': lon=-lon
-print(lon)")
-            fi
+        local gps_fix
+        gps_fix=$(python3 - <<'GPSPY' 2>/dev/null
+import json, time
+try:
+    with open("/run/droneaware/gps_state.json") as f:
+        s = json.load(f)
+except Exception:
+    raise SystemExit
+lat, lon = s.get("lat"), s.get("lon")
+if lat is None or lon is None:
+    raise SystemExit
+# A stale fix is not where the node is now, which matters most on exactly
+# the mobile nodes this fallback exists for.
+if time.time() - (s.get("updated_at") or 0) > 600:
+    raise SystemExit
+print(lat, lon)
+GPSPY
+)
+        if [[ -n "$gps_fix" ]]; then
+            lat=${gps_fix%% *}
+            lon=${gps_fix##* }
+            echo "  Using live GPS fix (lat=${lat}, lon=${lon})"
         fi
     fi
 

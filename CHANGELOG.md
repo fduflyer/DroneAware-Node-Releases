@@ -37,6 +37,31 @@ the sweep working. An adapter that is plugged in but has not been assigned a
 job is named as unused, with a pointer to the command that adopts it — that
 case previously wasted hardware silently.
 
+### `droneaware test` refused to run on a node with a working GPS
+
+On a mobile node, `sudo droneaware test` failed with "No location configured.
+Set NODE_LAT/NODE_LON in config.env first" — on a node whose GPS had a fix
+from 19 satellites, which `sudo droneaware status` printed correctly seconds
+earlier, and whose position was already showing on the website.
+
+`NODE_LAT`/`NODE_LON` are deliberately empty on a mobile node, because the
+position comes from the receiver. There was a GPS fallback for exactly this
+case, but it read the serial port itself rather than the position the feeder
+already publishes, and it failed four separate ways:
+
+- it required `GPS_DEVICE` to be set in the config file, but the feeder finds
+  the receiver automatically, so that setting is normally empty — which
+  skipped the entire fallback
+- it assumed 4800 baud
+- it looked only for `$GPRMC` sentences, never the `$GNRMC` that
+  multi-constellation receivers send
+- it competed for the serial port with the feeder, which holds it open
+
+The fallback now reads the position the feeder publishes, which is the same
+source `status` uses — so the two commands can no longer disagree about
+whether the node knows where it is. A fix older than ten minutes is ignored,
+since on a mobile node that is no longer where it is.
+
 ### A GPS with no fix was reported as a stopped feeder
 
 `droneaware status` showed `GPS : state stale (135375s old — wifi_feeder may
