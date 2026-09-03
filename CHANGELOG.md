@@ -10,6 +10,32 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.5.2.1] — Unreleased
+
+### `droneaware swap` printed an error after succeeding
+
+Swapping adapter roles on a two-adapter node ended with:
+
+```
+/usr/local/bin/droneaware: line 1285: ok: command not found
+```
+
+The swap itself worked — the roles were exchanged, saved and applied. The
+failing line was the confirmation message afterwards, which called a helper
+that does not exist. So the command did its job and then reported an error for
+having done it, which is alarming to read and gives no clue that nothing is
+wrong.
+
+Both the swap confirmation and the `--auto` release message were affected.
+
+The reason it shipped is worth recording: neither message can be reached
+unless the swap actually goes ahead, and every node available before release
+stopped earlier than that — one with a single adapter, one with none, and one
+whose second radio is 2.4 GHz-only and is correctly refused. Those refusals
+were treated as evidence the command worked, when they are precisely the paths
+that return before the message. It now has a test that drives the paths which
+only run when nothing is wrong.
+
 ## [1.5.2] — Unreleased
 
 Diagnostics: making the node able to tell you what it is actually doing.
