@@ -802,6 +802,15 @@ elif len(monitor) >= 2:
 print(f"MONITOR_COUNT={len(monitor)}")
 print(f"ROLE_2G_MAC={role_24g['mac'] if role_24g else ''}")
 print(f"ROLE_5G_MAC={role_5g['mac'] if role_5g else ''}")
+# Per-adapter detail so `droneaware swap` can name what it is moving and
+# refuse to put a 2.4-only radio on the 5 GHz role. Ordering is by MAC and
+# therefore stable, which is what makes the roles reproducible across
+# reboots -- it is just unrelated to which adapter the operator wants where.
+for _i, _a in enumerate(monitor):
+    print(f"MON{_i}_MAC={_a['mac']}")
+    print(f"MON{_i}_IFACE={_a.get('iface','')}")
+    print(f"MON{_i}_DRIVER={_a.get('driver','')}")
+    print(f"MON{_i}_BANDS={','.join(_a['bands'])}")
 PY
 }
 
@@ -851,6 +860,27 @@ _orchestrate_wifi_mode() {
     info "v1.5.0 mode-detect: ${MONITOR_COUNT} monitor-capable USB adapter(s) present"
 
     if [[ "$MONITOR_COUNT" -ge 2 && -n "$ROLE_2G_MAC" && -n "$ROLE_5G_MAC" ]]; then
+        # An operator pin (from `droneaware swap`) beats the classifier -- but
+        # ONLY while both pinned adapters are still attached. A pin that
+        # outlives its hardware would leave the node permanently faulted, which
+        # is precisely the class of failure refresh exists to repair, so it
+        # self-clears rather than being honored forever.
+        local _pinned _p2g _p5g
+        _pinned=$(_cfg_get "$cfg" WIFI_ADAPTER_ROLES_PINNED)
+        if [[ "$(echo "$_pinned" | tr '[:upper:]' '[:lower:]')" == "true" ]]; then
+            _p2g=$(_cfg_get "$cfg" WIFI_ADAPTER_2G_MAC)
+            _p5g=$(_cfg_get "$cfg" WIFI_ADAPTER_5G_MAC)
+            if [[ -n "$_p2g" && -n "$_p5g" ]] \
+               && grep -qixF "$_p2g" /sys/class/net/*/address 2>/dev/null \
+               && grep -qixF "$_p5g" /sys/class/net/*/address 2>/dev/null; then
+                info "v1.5.0 mode-detect: keeping operator-pinned adapter roles (droneaware swap)"
+                ROLE_2G_MAC="$_p2g"
+                ROLE_5G_MAC="$_p5g"
+            else
+                warn "Pinned adapter roles name hardware that is no longer attached — reverting to automatic assignment"
+                _set_cfg_key "$cfg" WIFI_ADAPTER_ROLES_PINNED "false"
+            fi
+        fi
         _switch_to_dual_adapter_mode "$cfg" "$ROLE_2G_MAC" "$ROLE_5G_MAC"
     elif [[ "$MONITOR_COUNT" -ge 1 ]]; then
         local single_mac="${ROLE_2G_MAC:-$ROLE_5G_MAC}"
@@ -1031,6 +1061,10 @@ _switch_to_single_adapter_mode() {
         info "v1.5.0.6: clearing stale dual-adapter band keys (node resolved to single-adapter)"
         _set_cfg_key "$cfg" WIFI_ADAPTER_2G_MAC ""
         _set_cfg_key "$cfg" WIFI_ADAPTER_5G_MAC ""
+        # A role pin cannot outlive the pair it describes. Leaving it set would
+        # make config.env claim an operator choice over two MACs that were just
+        # blanked, which is the dishonest record this block exists to prevent.
+        _set_cfg_key "$cfg" WIFI_ADAPTER_ROLES_PINNED "false"
     fi
 
     # v1.5.0.6: enforce the enable-state for single mode, symmetric with
@@ -1123,6 +1157,136 @@ _start_wifi_services_for_current_mode() {
         systemctl stop droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
         systemctl start droneaware-wifi 2>/dev/null || true
     fi
+}
+
+# v1.5.2 — operator-chosen adapter roles.
+#
+# With two adapters the node decides which one works 2.4 GHz and which sweeps
+# 5 GHz. That choice is stable (adapters are ordered by MAC) but arbitrary from
+# the operator's point of view -- lowest MAC wins, which has nothing to do with
+# which radio is the better sweeper. It matters: the sweeping adapter retunes
+# ~21 times a cycle, so putting the faster radio there is worth real detection
+# performance, and the spread between adapters is 45x.
+#
+# Editing config.env by hand did not survive, because refresh recomputes and
+# rewrites both role keys on every run. An operator reported exactly that: the
+# swap held until the next update, then silently reverted. This command pins
+# the choice so refresh respects it.
+cmd_swap() {
+    require_root "swap"
+    local cfg="${INSTALL_DIR}/config.env"
+    local mode="${2:-}"
+    local MONITOR_COUNT="" ROLE_2G_MAC="" ROLE_5G_MAC=""
+    local MON0_MAC="" MON0_IFACE="" MON0_DRIVER="" MON0_BANDS=""
+    local MON1_MAC="" MON1_IFACE="" MON1_DRIVER="" MON1_BANDS=""
+    eval "$(_classify_wifi_adapters 2>/dev/null)"
+
+    _swap_describe() {
+        local mac="$1"
+        [[ -z "$mac" ]] && { echo "(none)"; return; }
+        if   [[ "$mac" == "$MON0_MAC" ]]; then echo "${MON0_IFACE} (${MON0_DRIVER})"
+        elif [[ "$mac" == "$MON1_MAC" ]]; then echo "${MON1_IFACE} (${MON1_DRIVER})"
+        else echo "$mac"; fi
+    }
+    _swap_bands() {
+        local mac="$1"
+        if   [[ "$mac" == "$MON0_MAC" ]]; then echo "$MON0_BANDS"
+        elif [[ "$mac" == "$MON1_MAC" ]]; then echo "$MON1_BANDS"
+        else echo ""; fi
+    }
+
+    # --auto hands the choice back. Symmetric with the verb that took it:
+    # an operator who set the roles with a command should not have to learn
+    # a config key name to undo it.
+    if [[ "$mode" == "--auto" ]]; then
+        echo ""
+        echo -e "${BOLD}DroneAware Adapter Roles — automatic${NC}"
+        echo ""
+        local was
+        was=$(_cfg_get "$cfg" WIFI_ADAPTER_ROLES_PINNED)
+        if [[ "$(echo "$was" | tr '[:upper:]' '[:lower:]')" != "true" ]]; then
+            echo "  Roles are already chosen automatically — nothing to release."
+            echo ""
+            exit 0
+        fi
+        _set_cfg_key "$cfg" WIFI_ADAPTER_ROLES_PINNED "false"
+        # Re-derive immediately rather than waiting for the next refresh, so
+        # the command visibly does something when it is run.
+        _orchestrate_wifi_mode "$cfg"
+        systemctl restart droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
+        echo ""
+        printf "    2.4 GHz : %s\n" "$(_swap_describe "$(_cfg_get "$cfg" WIFI_ADAPTER_2G_MAC)")"
+        printf "    5 GHz   : %s\n" "$(_swap_describe "$(_cfg_get "$cfg" WIFI_ADAPTER_5G_MAC)")"
+        echo ""
+        ok "Roles released — the node chooses them from now on."
+        echo ""
+        exit 0
+    fi
+
+    echo ""
+    echo -e "${BOLD}DroneAware Adapter Swap${NC}"
+    echo ""
+
+    [[ -z "$MONITOR_COUNT" ]] && fatal "Could not read the WiFi adapters — try 'sudo droneaware status'."
+
+    if (( MONITOR_COUNT < 2 )); then
+        echo "  Found ${MONITOR_COUNT} monitor-capable USB adapter(s)."
+        echo "  Swapping needs two: one works 2.4 GHz, the other sweeps 5 GHz."
+        echo ""
+        exit 1
+    fi
+    if (( MONITOR_COUNT > 2 )); then
+        echo "  Found ${MONITOR_COUNT} monitor-capable USB adapters; swap only knows how to"
+        echo "  exchange a pair. Set the roles by hand instead:"
+        echo ""
+        echo "    WIFI_ADAPTER_2G_MAC / WIFI_ADAPTER_5G_MAC   in ${cfg}"
+        echo "    WIFI_ADAPTER_ROLES_PINNED=true              so refresh leaves them alone"
+        echo ""
+        exit 1
+    fi
+
+    # Fall back to what the classifier would pick, so swap works on a node
+    # whose roles have never been pinned.
+    local cur_2g cur_5g
+    cur_2g=$(_cfg_get "$cfg" WIFI_ADAPTER_2G_MAC); cur_2g="${cur_2g:-$ROLE_2G_MAC}"
+    cur_5g=$(_cfg_get "$cfg" WIFI_ADAPTER_5G_MAC); cur_5g="${cur_5g:-$ROLE_5G_MAC}"
+
+    local new_2g="$cur_5g" new_5g="$cur_2g"
+
+    # The 5 GHz role needs a radio that can reach 5 GHz. Refusing here is the
+    # main reason this is a command rather than a documented config edit: a
+    # 2.4-only adapter pinned to the 5 GHz role just FAULTs, leaving the
+    # operator to work out why from the feeder log.
+    if [[ ",$(_swap_bands "$new_5g")," != *",5,"* ]]; then
+        echo -e "  ${RED}Cannot swap.${NC}"
+        echo ""
+        echo "    $(_swap_describe "$new_5g") does not support 5 GHz, so it cannot take"
+        echo "    the 5 GHz role. The node would run but never see a drone above 2.4 GHz."
+        echo ""
+        echo "  Roles unchanged."
+        echo ""
+        exit 1
+    fi
+
+    echo "  Before:"
+    printf "    2.4 GHz : %s\n" "$(_swap_describe "$cur_2g")"
+    printf "    5 GHz   : %s\n" "$(_swap_describe "$cur_5g")"
+    echo ""
+    echo "  After:"
+    printf "    2.4 GHz : %s\n" "$(_swap_describe "$new_2g")"
+    printf "    5 GHz   : %s\n" "$(_swap_describe "$new_5g")"
+    echo ""
+
+    _set_cfg_key "$cfg" WIFI_ADAPTER_2G_MAC "$new_2g"
+    _set_cfg_key "$cfg" WIFI_ADAPTER_5G_MAC "$new_5g"
+    _set_cfg_key "$cfg" WIFI_ADAPTER_ROLES_PINNED "true"
+
+    systemctl restart droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
+    ok "Roles swapped and pinned — refresh and update will leave them alone."
+    echo ""
+    echo "  'sudo droneaware swap' again puts them back."
+    echo "  'sudo droneaware swap --auto' hands the choice back to the node."
+    echo ""
 }
 
 cmd_refresh() {
@@ -2361,6 +2525,7 @@ case "$1" in
     install-webui)  cmd_install_webui ;;
     gps-diagnose)   cmd_gps_diagnose ;;
     refresh)        cmd_refresh ;;
+    swap)           cmd_swap "$@" ;;
     __migrate)
         # Internal subcommand used by cmd_update for post-install config
         # migration. The double-underscore prefix is a convention signaling
@@ -2388,6 +2553,8 @@ case "$1" in
         echo "    install-webui   Install the optional local Web UI (LAN dashboard)"
         echo "    gps-diagnose    Read-only GPS health check (device, port, protocol, state)"
         echo "    refresh         Re-detect hardware (WiFi adapters, GPS) and sync services"
+        echo "    swap            Exchange which adapter works 2.4 GHz vs sweeps 5 GHz"
+        echo "    swap --auto     Hand the adapter role choice back to the node"
         echo ""
         ;;
 esac

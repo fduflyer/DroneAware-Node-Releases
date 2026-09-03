@@ -37,6 +37,35 @@ the sweep working. An adapter that is plugged in but has not been assigned a
 job is named as unused, with a pointer to the command that adopts it — that
 case previously wasted hardware silently.
 
+### Choosing which adapter sweeps 5 GHz
+
+On a two-adapter node the software decides which radio works 2.4 GHz and which
+sweeps 5 GHz. That decision is consistent — adapters are ordered by MAC
+address — but arbitrary from an operator's point of view, because a MAC says
+nothing about which radio is the better sweeper. It matters more than it
+sounds: the sweeping adapter changes channel around twenty-one times a cycle,
+and the time that takes varies by a factor of forty-five across adapters
+people actually own.
+
+Operators who edited the setting by hand found it reverted. Re-detecting
+hardware rewrites both role assignments every time it runs, and updates
+re-detect, so a deliberate change survived only until the next upgrade.
+
+```
+sudo droneaware swap            # exchange the two roles
+sudo droneaware swap --auto     # hand the choice back to the node
+```
+
+A swap is remembered across reboots, updates and re-installs. It refuses to
+move a 2.4 GHz-only adapter onto the 5 GHz role, since that node would run
+normally while never seeing a drone above 2.4 GHz.
+
+It is deliberately not permanent. If either adapter is unplugged or replaced,
+the next hardware re-detection notices the pinned radio is gone, says so, and
+returns to choosing automatically — so a new adapter is adopted normally
+rather than being ignored because of a preference set months earlier. The same
+release happens if the node drops to a single adapter.
+
 ### `droneaware test` refused to run on a node with a working GPS
 
 On a mobile node, `sudo droneaware test` failed with "No location configured.

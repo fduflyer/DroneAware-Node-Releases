@@ -249,6 +249,10 @@ sudo droneaware update
 # After changing hardware — added an adapter, swapped a USB port, new GPS
 sudo droneaware refresh
 
+# Two adapters? Exchange which one works 2.4 GHz and which sweeps 5 GHz
+sudo droneaware swap
+sudo droneaware swap --auto     # hand the choice back to the node
+
 # Transmit a sanctioned 60-second test flight and confirm your node sees it
 sudo droneaware test
 
@@ -269,6 +273,14 @@ and where it is tuned at this moment:
 Run it twice a few seconds apart and you will see the 5 GHz radio move — that
 is the sweep working. An adapter listed as `unused` is plugged in but not
 assigned to anything.
+
+`swap` exists because the node's own choice, while consistent, is arbitrary
+from your point of view — it orders adapters by MAC address, which says
+nothing about which radio is the better sweeper. The sweeping adapter changes
+channel around 21 times a cycle, so putting the faster one there is worth real
+detection performance. It refuses to move a 2.4 GHz-only adapter onto the
+5 GHz role, and the choice survives updates and reboots until you release it
+or the hardware changes.
 
 `refresh` is the one people miss. The node works out which adapter serves
 which band at install time, so if you add or move hardware afterwards, run it
