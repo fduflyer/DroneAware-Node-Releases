@@ -37,6 +37,43 @@ the sweep working. An adapter that is plugged in but has not been assigned a
 job is named as unused, with a pointer to the command that adopts it — that
 case previously wasted hardware silently.
 
+### A warning that fired on every healthy node
+
+Every US node logged this at every start:
+
+```
+PHY does not advertise channels [13] — hopper will retune but the radio
+may not actually be there.
+```
+
+Nothing was wrong. The check ran before the channel plan was built, so it
+tested the raw candidate list rather than the plan — and channel 13, which is
+not permitted in the US, was correctly dropped from the plan one line later.
+The node then reported that it would tune somewhere it had already decided not
+to go.
+
+The check is removed rather than reordered, because the plan-building step
+already performs it after filtering and logs the accurate version, and the
+startup line lists the channels actually in use.
+
+A warning that fires on every healthy node teaches operators to ignore
+warnings, which is expensive on the day one of them is real.
+
+### Three smaller corrections
+
+**The GPS device was picked non-deterministically.** When more than one USB
+serial device is attached, the feeder chose from an unsorted list, so it could
+read a different device after a reboot — and report no GPS while the receiver
+sat there working. Now sorted, so the choice is repeatable.
+
+**The adapter-resolution line named the wrong setting.** It always reported
+`WIFI_ADAPTER_MAC`, even on a two-adapter node where the value had come from
+`WIFI_ADAPTER_2G_MAC` or `WIFI_ADAPTER_5G_MAC`. Anyone tracing an adapter
+mix-up was reading a line pointing at a setting they had never touched.
+
+**A node with no primary channel logged a stray separator** — `started:  +
+all 25 explore` — when the 2.4 or 5 GHz primary had been switched off.
+
 ### A Pi that is not getting enough power now says so
 
 The installer has checked for under-voltage since v1.5.0.6, but only once, at

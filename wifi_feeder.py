@@ -929,9 +929,16 @@ def resolve_monitor_iface(fallback_iface: str | None, band: str = "auto") -> str
                         # would pick peer band's adapter and cause contention.
                         return ""
                     break  # single-adapter mode — safe to fall through
+                # Name the key the value actually came from. This said
+                # WIFI_ADAPTER_MAC unconditionally, so on a two-adapter node it
+                # reported a key the operator had not set while the real one --
+                # WIFI_ADAPTER_2G_MAC or _5G_MAC -- went unmentioned. Anyone
+                # debugging an adapter mix-up was reading a line that pointed
+                # at the wrong setting.
                 log.info(
-                    f"[iface v1.5.0] resolved WIFI_ADAPTER_MAC={configured_mac} "
-                    f"→ {iface}"
+                    f"[iface v1.5.0] resolved "
+                    f"{band_key if band_specific_configured else 'WIFI_ADAPTER_MAC'}"
+                    f"={configured_mac} → {iface}"
                 )
                 return iface
         else:
@@ -1810,8 +1817,12 @@ class ScanPlanHopper(threading.Thread):
             legs_per_cycle = n_social + len(self._explore)
             explore_desc = f"all {len(self._explore)} explore @ {self.dwell_explore_s}s"
         true_cycle = cycle + legs_per_cycle * r
+        # Join only the parts that exist. A plan whose primary channel has
+        # been switched off has no social leg, which rendered as a stray
+        # leading " + ".
+        plan_desc = " + ".join(p for p in (social, explore_desc) if p)
         log.info(
-            f"Scan plan {self.plan.upper()} started: {social} + {explore_desc} "
+            f"Scan plan {self.plan.upper()} started: {plan_desc} "
             f"({true_cycle:.1f}s cycle incl. {1000*r:.0f}ms retune x{legs_per_cycle}); "
             f"camp after {self.camp_trigger_frames} frames/"
             f"{self.camp_trigger_window_s}s, release on {self.camp_silence_s}s silence "
@@ -2443,7 +2454,11 @@ def find_gps_device() -> str | None:
         return env_device
 
     # USB paths — probed for every node.
-    usb_candidates = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
+    # Sorted, because glob returns filesystem order. On a node with more than
+    # one USB serial device the pick was nondeterministic across boots, so the
+    # feeder could read a different device than last time and report no GPS
+    # while the receiver sat there working.
+    usb_candidates = sorted(glob.glob('/dev/ttyUSB*')) + sorted(glob.glob('/dev/ttyACM*'))
     usb_candidates = [c for c in usb_candidates if os.path.exists(c)]
     if usb_candidates:
         return usb_candidates[0]
@@ -3010,18 +3025,17 @@ class WiFiFeeder:
     def _run_once(self) -> bool:
         log.info(f"DroneAware WiFi Feeder - Node: {self.node_id}")
         _check_cli_freshness()
-        target = self.hopper.target_channels
-        log.info(f"Interface: {self.iface or '<not configured>'}  |  Hopper channels: {target}")
-
-        if self.iface and os.path.exists(f"/sys/class/net/{self.iface}"):
-            supported = _supported_channels(self.iface)
-            if supported:
-                missing = [c for c in target if c not in supported]
-                if missing:
-                    log.warning(
-                        f"PHY does not advertise channels {missing} — "
-                        "hopper will retune but the radio may not actually be there."
-                    )
+        # Deliberately does NOT pre-check the channel list against the PHY.
+        # This ran before hopper.run() called _build_plan(), so it saw the raw
+        # candidates and warned that the radio "may not actually be there" for
+        # channels the plan then dropped one line later — on every US node, at
+        # every start, for ch13. _build_plan does the same check after
+        # filtering and logs the accurate version, and the "Scan plan started"
+        # line reports the channels actually in use.
+        #
+        # A warning that fires on every healthy node teaches operators to
+        # ignore warnings, which is expensive the day one is real.
+        log.info(f"Interface: {self.iface or '<not configured>'}")
 
         # FAULT mode — missing or invalid WiFi adapter
         if not self.iface or not os.path.exists(f"/sys/class/net/{self.iface}"):
