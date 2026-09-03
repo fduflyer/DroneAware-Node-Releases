@@ -1775,6 +1775,43 @@ cmd_status() {
         echo ""
     fi
 
+    # Power. The installer has checked this since v1.5.0.6, but only once, at
+    # install time — a node that was healthy then and browns out later says
+    # nothing. That gap matters more now that we recommend a SECOND WiFi
+    # adapter, which is exactly the change that pushes a marginal supply over
+    # the edge, and an under-volted Pi degrades in ways that look like
+    # anything but a power problem.
+    #
+    # Reported even when healthy: silence cannot distinguish "checked and
+    # fine" from "never checked", which is the same ambiguity that made the
+    # stale-GPS message misleading.
+    #
+    # Flags are latched since boot, so 0x0 on a freshly booted Pi that has not
+    # yet drawn much current is weaker evidence than it looks.
+    if command -v vcgencmd >/dev/null 2>&1; then
+        local _thr _bits
+        _thr=$(vcgencmd get_throttled 2>/dev/null)
+        _bits="${_thr#throttled=}"
+        if [[ "$_bits" =~ ^0x[0-9a-fA-F]+$ ]]; then
+            if (( _bits == 0 )); then
+                echo "  Power    : OK"
+            elif (( (_bits & 0x1) != 0 )); then
+                echo -e "  Power    : ${RED}UNDER-VOLTAGE NOW${NC} — the Pi is not getting enough power"
+                echo "             Detection degrades in ways that do not look like a power fault."
+                echo "             Use the official PSU and a short, thick USB cable; a powered hub"
+                echo "             if you have several adapters attached."
+            elif (( (_bits & 0x10000) != 0 )); then
+                echo -e "  Power    : ${YELLOW}under-voltage has occurred${NC} since boot (${_bits})"
+                echo "             Not happening right now, but the supply is marginal under load."
+            elif (( (_bits & 0x4) != 0 || (_bits & 0x40000) != 0 )); then
+                echo "  Power    : throttled (${_bits}) with no under-voltage — most likely thermal"
+            else
+                echo "  Power    : ${_bits}"
+            fi
+            echo ""
+        fi
+    fi
+
     # GPS state — read tmpfs state file written by wifi_feeder. Soft-fails
     # if file missing (feeder not yet started, or pre-v1.3.0 binary).
     python3 - <<'PYEOF'

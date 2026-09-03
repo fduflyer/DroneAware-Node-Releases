@@ -37,6 +37,37 @@ the sweep working. An adapter that is plugged in but has not been assigned a
 job is named as unused, with a pointer to the command that adopts it — that
 case previously wasted hardware silently.
 
+### A Pi that is not getting enough power now says so
+
+The installer has checked for under-voltage since v1.5.0.6, but only once, at
+install time. A node that was healthy then and developed a power problem later
+said nothing at all — and an under-volted Pi degrades in ways that look like
+almost anything except a power fault.
+
+That gap matters more now that a second WiFi adapter is recommended, since
+adding one is exactly the change that pushes a marginal supply over the edge.
+Recommending the hardware without surfacing the consequence would have been a
+poor trade.
+
+`sudo droneaware status` now reports it:
+
+```
+  Power    : OK
+```
+
+or, when the supply is struggling, what is happening and what usually fixes it
+— the official supply, a short and thick USB cable, and a powered hub when
+several adapters are attached. Throttling with no under-voltage is reported
+separately, since that is usually heat rather than power.
+
+It is reported even when healthy. Saying nothing cannot distinguish "checked
+and fine" from "never checked", which is the same ambiguity that made the
+stale-GPS message misleading.
+
+One caveat worth knowing: these flags are latched since boot, so a clean
+reading on a Pi that has just started and has not yet drawn much current is
+weaker evidence than it appears.
+
 ### Choosing which adapter sweeps 5 GHz
 
 On a two-adapter node the software decides which radio works 2.4 GHz and which
