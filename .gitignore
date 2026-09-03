@@ -53,3 +53,7 @@ sweep-test-setup-and-hypothesis.md
 analyze-sweep-test.py
 scan-test-*.jsonl
 scan-trace-*.jsonl
+
+# CLI test harness — drives cmd_swap success paths without two dual-band
+# adapters. Not product; keep out of the packaged repo.
+cli-swap-test.sh

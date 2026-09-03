@@ -1218,7 +1218,7 @@ cmd_swap() {
         printf "    2.4 GHz : %s\n" "$(_swap_describe "$(_cfg_get "$cfg" WIFI_ADAPTER_2G_MAC)")"
         printf "    5 GHz   : %s\n" "$(_swap_describe "$(_cfg_get "$cfg" WIFI_ADAPTER_5G_MAC)")"
         echo ""
-        ok "Roles released — the node chooses them from now on."
+        info "Roles released — the node chooses them from now on."
         echo ""
         exit 0
     fi
@@ -1282,7 +1282,7 @@ cmd_swap() {
     _set_cfg_key "$cfg" WIFI_ADAPTER_ROLES_PINNED "true"
 
     systemctl restart droneaware-wifi-2g droneaware-wifi-5g 2>/dev/null || true
-    ok "Roles swapped and pinned — refresh and update will leave them alone."
+    info "Roles swapped and pinned — refresh and update will leave them alone."
     echo ""
     echo "  'sudo droneaware swap' again puts them back."
     echo "  'sudo droneaware swap --auto' hands the choice back to the node."
