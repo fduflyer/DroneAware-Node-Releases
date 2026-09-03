@@ -2331,7 +2331,10 @@ def _write_gps_state(*, device: str | None = None, baud: int | None = None,
                         DroneAware can't parse; protocol field carries which
       detecting_baud  — probing baud rates against the device
       no_nmea         — device opened but no valid NMEA sentences received
-      reading         — serial port open, NMEA flowing, awaiting first fix
+      reading         — serial port open, NMEA flowing, awaiting first fix.
+                        REFRESHED every 20 s by the reader loop. It must be,
+                        or a receiver that never fixes looks identical to a
+                        stopped feeder to the staleness check in the CLI.
       fix             — most recent $GPRMC was "A" (active/valid); lat/lon populated
 
     Extended fields (v1.4.12+):
@@ -2557,10 +2560,40 @@ def gps_reader_thread(device: str):
 
             with serial.Serial(device, baudrate=baud, timeout=2) as ser:
                 log.info(f"[GPS] Reading from {device} at {baud} baud")
+                last_nmea  = time.time()
+                last_write = last_nmea
                 _write_gps_state(device=device, baud=baud, status="reading",
-                                 last_nmea_at=time.time(), protocol="nmea")
+                                 last_nmea_at=last_nmea, protocol="nmea")
                 while True:
                     line = ser.readline().decode('ascii', errors='ignore').strip()
+                    if line:
+                        last_nmea = time.time()
+
+                    # Heartbeat the state file even with no fix. It used to be
+                    # written once above and then ONLY on a valid RMC fix, so a
+                    # receiver streaming NMEA that never achieves a fix left the
+                    # file untouched forever — and `droneaware status` reports
+                    # anything older than 120 s as "wifi_feeder may have
+                    # stopped", which is both wrong and blames a component the
+                    # same output shows as running two lines earlier.
+                    #
+                    # This is the defect already fixed once for the
+                    # not_configured state; "reading" has the identical
+                    # write-once property and never got the same treatment.
+                    # The status command's "reading" branch already prints the
+                    # satellite count — it was simply unreachable, because the
+                    # staleness check short-circuited before it.
+                    now = time.time()
+                    if now - last_write >= 20.0:
+                        with _gps_lock:
+                            cur_lat, cur_lon = _gps_lat, _gps_lon
+                        _write_gps_state(
+                            device=device, baud=baud,
+                            status="fix" if cur_lat is not None else "reading",
+                            last_nmea_at=last_nmea, protocol="nmea",
+                            lat=cur_lat, lon=cur_lon,
+                            fix_quality=fix_quality, sats_in_use=sats_in_use)
+                        last_write = now
 
                     # GGA — fix quality + sats-in-use. Field layout:
                     #   $GxGGA,time,lat,N,lon,W,fix_quality,sats,hdop,...
@@ -2590,6 +2623,7 @@ def gps_reader_thread(device: str):
                                          last_nmea_at=time.time(), lat=lat, lon=lon,
                                          protocol="nmea", fix_quality=fix_quality,
                                          sats_in_use=sats_in_use)
+                        last_write = time.time()
                     except (ValueError, IndexError):
                         continue
         except serial.SerialException as e:

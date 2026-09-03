@@ -235,7 +235,8 @@ knows how your node is put together, so the same command works whether you
 have one WiFi adapter or two.
 
 ```bash
-# How is my node doing? Services, adapters, firmware version
+# How is my node doing? Services, firmware, and which radio is on
+# which channel right now
 sudo droneaware status
 
 # Watch detections as they arrive (add "ble" for the Bluetooth feeder)
@@ -254,6 +255,20 @@ sudo droneaware test
 # Read-only GPS health check
 sudo droneaware gps-diagnose
 ```
+
+`status` answers the question people ask most — which adapter is doing what,
+and where it is tuned at this moment:
+
+```
+  Radios:
+    wlan0   brcmfmac      managed  ch40    network uplink
+    wlan1   rt2800usb     monitor  ch6     2.4 GHz feeder
+    wlan2   mt76x2u       monitor  ch124   5 GHz feeder
+```
+
+Run it twice a few seconds apart and you will see the 5 GHz radio move — that
+is the sweep working. An adapter listed as `unused` is plugged in but not
+assigned to anything.
 
 `refresh` is the one people miss. The node works out which adapter serves
 which band at install time, so if you add or move hardware afterwards, run it

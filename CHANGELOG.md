@@ -10,6 +10,58 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.5.2] — Unreleased
+
+Diagnostics: making the node able to tell you what it is actually doing.
+
+### There was no way to see which adapter was on which channel
+
+`droneaware status` listed the services and the firmware version but said
+nothing about the radios themselves. Answering "which adapter is doing what,
+and where is it listening?" meant knowing about `iw` — which is not on the
+command path for an ordinary shell, so the obvious attempt returns nothing at
+all rather than an error.
+
+Status now lists each radio with its driver, mode, current channel, and the
+job it has been assigned:
+
+```
+  Radios:
+    wlan0   brcmfmac      managed  ch40    network uplink
+    wlan1   rt2800usb     monitor  ch6     2.4 GHz feeder
+    wlan2   mt76x2u       monitor  ch124   5 GHz feeder
+```
+
+Running it twice a few seconds apart shows the 5 GHz radio moving, which is
+the sweep working. An adapter that is plugged in but has not been assigned a
+job is named as unused, with a pointer to the command that adopts it — that
+case previously wasted hardware silently.
+
+### A GPS with no fix was reported as a stopped feeder
+
+`droneaware status` showed `GPS : state stale (135375s old — wifi_feeder may
+have stopped)` on a node whose feeders were both running, and which the same
+output listed as running two lines earlier.
+
+The GPS state file is written once when the serial port opens, and after that
+only when a valid position fix arrives. A receiver that is powered, connected
+and streaming NMEA — but has never achieved a fix, which is the normal state
+indoors or with a poor sky view — therefore never updated the file again. The
+status command treats anything older than two minutes as evidence the feeder
+died.
+
+So the one situation where an operator most needs a useful diagnostic produced
+a message that was wrong about the cause and pointed at the wrong component.
+
+The reader now refreshes that file every 20 seconds while the port is open,
+carrying the satellite count and fix quality it already parses. Status has
+always been able to report "NMEA, 6 satellites, no fix yet" — that line was
+simply unreachable, because the staleness check ran first.
+
+This is the same defect that was fixed for the `not_configured` state back in
+v1.3.0.2. `reading` had the identical write-once property and did not get the
+same treatment.
+
 ## [1.5.1] — Unreleased
 
 How the node chooses what to listen to. Until now it scanned two channels

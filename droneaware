@@ -1559,6 +1559,46 @@ cmd_status() {
 
     echo ""
 
+    # Which radio is doing what, and where it is right now. "Which adapter is
+    # on which channel" is the question operators actually ask, and answering
+    # it previously meant knowing about `iw` — which is not even on a
+    # non-login shell's PATH, so the obvious attempt returns nothing.
+    #
+    # The role column is the useful half: it maps a physical adapter to the
+    # job it was assigned, and names an adapter that is plugged in but not
+    # configured, which is the case that silently wastes hardware.
+    local _iw
+    _iw=$(command -v iw 2>/dev/null || echo /usr/sbin/iw)
+    if [[ -x "$_iw" ]] && compgen -G "/sys/class/net/wl*" >/dev/null; then
+        local m2g m5g m1
+        m2g=$(_cfg_get "$cfg" WIFI_ADAPTER_2G_MAC)
+        m5g=$(_cfg_get "$cfg" WIFI_ADAPTER_5G_MAC)
+        m1=$(_cfg_get "$cfg" WIFI_ADAPTER_MAC)
+        echo "  Radios:"
+        local dev
+        for dev in /sys/class/net/wl*; do
+            [[ -e "$dev" ]] || continue
+            local ifn drv mac info mode chan role
+            ifn=${dev##*/}
+            drv=$(basename "$(readlink "$dev/device/driver" 2>/dev/null)" 2>/dev/null)
+            mac=$(cat "$dev/address" 2>/dev/null)
+            info=$("$_iw" dev "$ifn" info 2>/dev/null)
+            mode=$(grep -oE 'type [a-z]+' <<<"$info" | cut -d' ' -f2)
+            chan=$(grep -oE 'channel [0-9]+' <<<"$info" | cut -d' ' -f2)
+            if   [[ -n "$mac" && "$mac" == "$m2g" ]]; then role="2.4 GHz feeder"
+            elif [[ -n "$mac" && "$mac" == "$m5g" ]]; then role="5 GHz feeder"
+            elif [[ -n "$mac" && "$mac" == "$m1"  ]]; then role="detection"
+            elif [[ "$drv" == brcmfmac* ]];          then role="network uplink"
+            elif [[ "$mode" == "monitor" ]];         then role="unused — run 'sudo droneaware refresh'"
+            else                                          role="not used for detection"
+            fi
+            printf "    %-7s %-13s %-8s %-7s %s\n" \
+                "$ifn" "${drv:-?}" "${mode:-?}" \
+                "$( [[ -n "$chan" ]] && echo "ch${chan}" || echo "—" )" "$role"
+        done
+        echo ""
+    fi
+
     # Web UI URL — shown when service is active and bound, so operators
     # know how to reach it from another device on the LAN.
     if systemctl is-active --quiet droneaware-web 2>/dev/null; then
