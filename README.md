@@ -38,7 +38,8 @@ Once connected, you'll also get real-time email alerts anytime your node(s) dete
 | Raspberry Pi 4 (1 GB or more) | 2 GB+ recommended if running other software |
 | MicroSD card (16 GB+, Class 10) | Samsung Endurance or SanDisk High Endurance preferred |
 | USB Bluetooth adapter | **Sena UD100** (newer variants with Bluetooth 4.0+ only) or any CSR/Cambridge Silicon Radio USB dongle. **Older UD100 variants (G01, G02, G03 and similar) are Bluetooth Classic (BT 2.0/2.1) only and will not work.** If unsure which version you have, the Pi's built-in Bluetooth works out of the box at shorter range. |
-| WiFi adapter (required) | **Alfa AWUS036N** (Ralink RT3070 chipset, 2.4 GHz) |
+| WiFi adapter (required) | **Alfa AWUS036ACS** (RTL8821AU) or **Panda AC600** (MT7610U). Both are dual-band — see the table below, and note that 2.4 GHz-only adapters cannot see a large share of drones. |
+| Second WiFi adapter (recommended) | A second dual-band adapter lets the node sweep 5 GHz about seven times faster. See **Two adapters** below. |
 | 5V/3A USB-C power supply | Official Raspberry Pi PSU recommended |
 | Ethernet cable or WiFi credentials | For initial setup |
 
@@ -47,10 +48,47 @@ Once connected, you'll also get real-time email alerts anytime your node(s) dete
 > dongle with an external antenna has significantly better range. The Sena UD100
 > / CSR chipset is confirmed working and widely available for under $20.
 
-> **Why the Alfa WiFi adapter?**
-> The Alfa AWUS036N supports monitor mode, which is required to capture Wi-Fi
-> Remote ID beacon frames (the 802.11 transport used by many newer drones). The
-> Pi's built-in WiFi cannot be put into monitor mode reliably.
+> **Why a USB WiFi adapter?**
+> It has to support monitor mode, which is required to capture Wi-Fi Remote ID
+> beacon frames. The Pi's built-in WiFi cannot be put into monitor mode
+> reliably, and is used for your network connection instead.
+
+### Which WiFi adapter
+
+Two things matter: whether it does 5 GHz at all, and how fast it changes
+channel. The node sweeps a lot of channels, so a slow adapter spends much of
+its time deaf while retuning. These figures are measured on our own bench,
+same test and same code path:
+
+| Adapter | Chipset | Channel change | Notes |
+|---|---|---|---|
+| **Alfa AWUS036ACS** | RTL8821AU | **22 ms** | Fastest we've measured. The best choice for the 5 GHz sweep. |
+| **Panda AC600** | MT7610U | 111 ms | Inexpensive and works well. |
+| Alfa AWUS036ACM | MT7612U | **1007 ms** | Dual-band, but 45x slower to change channel than the ACS. Usable, noticeably worse. |
+| Alfa AWUS036N | RT3070 | — | **2.4 GHz only.** Cannot see any drone broadcasting on 5 GHz. |
+
+The spread between adapters is larger than anything you can fix in software.
+In a side-by-side test, identical code on the ACM captured 51% of a drone's
+broadcasts where the MT7610U captured 72%. Nothing in the marketing or the
+chipset name tells you this.
+
+If you already own an AWUS036N it still works, and it will still see most DJI
+aircraft. It simply cannot see the 5 GHz ones.
+
+### Two adapters
+
+The node supports a pair, and it is a substantial upgrade. One adapter works
+2.4 GHz while the other sweeps 5 GHz, so neither has to cover for the other:
+
+| Setup | Time to sweep the whole 5 GHz band |
+|---|---|
+| Two adapters | **~21 seconds** |
+| One adapter | ~2.5 minutes |
+
+A short overflight can easily finish inside 2.5 minutes, so a single-adapter
+node will miss aircraft that a pair catches. Both are supported and the
+installer configures whichever it finds — plug in a second dual-band adapter
+and run `sudo droneaware refresh`.
 
 ---
 
@@ -66,10 +104,23 @@ ODID message is decoded locally (drone ID, position, speed, operator location)
 and forwarded to the DroneAware server in batches.
 
 **WiFi Feeder (`droneaware-wifi`)**
-Places the Alfa adapter into monitor mode and hops across 2.4 GHz channels
-(1–11) looking for 802.11 beacon frames carrying vendor-specific Remote ID
-payloads (OUI FA:0B:BC, ASTM F3411) and Wi-Fi NAN action frames (OUI 50:6F:9A).
-Detected payloads are forwarded to the server alongside MAC address and RSSI.
+Places the USB adapter into monitor mode and sweeps both bands looking for
+802.11 beacon frames carrying vendor-specific Remote ID payloads (OUI
+FA:0B:BC, ASTM F3411) and Wi-Fi NAN action frames (OUI 50:6F:9A). Detected
+payloads are forwarded to the server alongside the channel, MAC address and
+RSSI.
+
+A compliant aircraft broadcasts on channel 6 or 149 regardless of which
+channel its video link uses, so those get the longest visits. It is only
+allowed to broadcast elsewhere if it raises its rate to at least five times a
+second — which means the rest of the band is cheap to cover, because a brief
+visit to a fast channel still yields several chances to hear something. The
+sweep covers 2.4 GHz plus 21 channels across 5 GHz, including the
+radar-detection channels between 52 and 144 where non-DJI aircraft turn out to
+spend much of their time.
+
+When the node hears a drone it stops sweeping and holds that channel for as
+long as the aircraft keeps transmitting.
 
 **Data Flow**
 ```
@@ -179,25 +230,64 @@ see your node on the live map and access:
 
 ## Useful Commands
 
+Use the `droneaware` command rather than driving the services directly — it
+knows how your node is put together, so the same command works whether you
+have one WiFi adapter or two.
+
 ```bash
-# Check service status
+# How is my node doing? Services, adapters, firmware version
+sudo droneaware status
+
+# Watch detections as they arrive (add "ble" for the Bluetooth feeder)
+sudo droneaware logs
+sudo droneaware logs ble
+
+# Upgrade to the latest release
+sudo droneaware update
+
+# After changing hardware — added an adapter, swapped a USB port, new GPS
+sudo droneaware refresh
+
+# Transmit a sanctioned 60-second test flight and confirm your node sees it
+sudo droneaware test
+
+# Read-only GPS health check
+sudo droneaware gps-diagnose
+```
+
+`refresh` is the one people miss. The node works out which adapter serves
+which band at install time, so if you add or move hardware afterwards, run it
+to bring the configuration back in line — otherwise a newly added adapter sits
+unused.
+
+**Changing settings** — location, server URL, scan tuning:
+
+```bash
+sudo nano /opt/droneaware/config.env
+sudo droneaware refresh
+```
+
+<details>
+<summary>Driving the services directly</summary>
+
+Rarely needed, but the unit names depend on how many WiFi adapters you have:
+
+```bash
+# Bluetooth feeder — same on every node
 sudo systemctl status droneaware-ble
+
+# WiFi, one adapter
 sudo systemctl status droneaware-wifi
 
-# Watch live detection logs
-sudo journalctl -u droneaware-ble -f
-sudo journalctl -u droneaware-wifi -f
-
-# Edit node config (location, server URL, etc.)
-sudo nano /opt/droneaware/config.env
-sudo systemctl restart droneaware-ble droneaware-wifi
-
-# Start feeders manually (they start automatically on next reboot)
-sudo systemctl start droneaware-ble droneaware-wifi
-
-# To upgrade an existing node
-sudo droneaware update
+# WiFi, two adapters — the single-adapter unit is not used
+sudo systemctl status droneaware-wifi-2g
+sudo systemctl status droneaware-wifi-5g
 ```
+
+`sudo droneaware status` reports the right ones without you having to know
+which mode the node is in.
+
+</details>
 
 ---
 
@@ -404,9 +494,9 @@ or anyone else's dashboard.
 ## Troubleshooting
 
 **"USB WiFi adapter required" — installer exits immediately**
-The installer requires a USB WiFi adapter to be present. Connect your Alfa
-AWUS036N (or compatible monitor-mode adapter) before running the installer, then
-run it again.
+The installer requires a USB WiFi adapter to be present. Connect a
+monitor-mode capable adapter before running the installer, then run it again.
+See **Which WiFi adapter** above.
 
 **The BLE feeder starts but shows 0 detections**
 This is normal — there may simply be no drones broadcasting Remote ID nearby.
@@ -416,11 +506,11 @@ drone activity.
 
 **WiFi feeder fails to start or keeps restarting**
 ```bash
-sudo journalctl -u droneaware-wifi -n 50
+sudo droneaware logs
 ```
 Common causes:
 - USB WiFi adapter not plugged in or not detected (`ip link show`)
-- Adapter does not support monitor mode (must be Ralink RT3070 or compatible)
+- Adapter does not support monitor mode (see **Which WiFi adapter** above)
 - Another process (NetworkManager) has taken control of the interface —
   the installer configures NM to ignore the adapter, but a reinstall of NM
   may revert this
@@ -468,7 +558,8 @@ your node, and update its location there. Node location is managed server-side.
 | `/opt/droneaware/config.env` | Node configuration (ID, location, adapters) |
 | `/etc/droneaware/token` | Node credential (written at enrollment) |
 | `/etc/systemd/system/droneaware-ble.service` | BLE feeder systemd unit |
-| `/etc/systemd/system/droneaware-wifi.service` | WiFi feeder systemd unit |
+| `/etc/systemd/system/droneaware-wifi.service` | WiFi feeder unit (single-adapter nodes) |
+| `/etc/systemd/system/droneaware-wifi-2g.service`<br>`…-5g.service` | WiFi feeder units (two-adapter nodes) |
 | `/etc/systemd/system/droneaware-bt-select.service` | BT selector systemd unit |
 
 ---
