@@ -57,6 +57,7 @@ import collections
 import datetime
 import json
 import logging
+import math
 import os
 import socket
 import sqlite3
@@ -140,6 +141,42 @@ SSE_CLIENT_QUEUE_MAX = 100
 # stays on CartoDB — graceful degradation either way.
 WORLD_TILES_FILENAME = "world-tiles.mbtiles"
 WORLD_TILES_MAX_ZOOM = 6
+
+# ── Offline map region packs (v1.6.0) ────────────────────────────────────────
+# The bundled world bundle is zoom 0-6: a global overview, far too coarse to
+# follow a local track. An operator can download a pack for their own area
+# instead, and these bound what they are allowed to ask for.
+#
+# The zoom ceiling is the number that surprises people. Tile count grows 4x per
+# level, so at a 20 km radius: z16 is ~200 MB, z17 ~780 MB, z18 ~3 GB and z19
+# ~12 GB — larger than the free space on most nodes' SD cards. The UI must
+# therefore price every zoom and let the disk decide, rather than offering a
+# depth that will always fail.
+OFFLINE_MAP_MAX_RADIUS_KM = 20.0
+OFFLINE_MAP_MIN_RADIUS_KM = 1.0
+OFFLINE_MAP_ZOOM_CEILING  = 19      # hard stop for the estimate loop, NOT a
+                                    # recommendation — affordability decides.
+# Raster PNG basemap tiles vary roughly 15-35 KB between empty coastline and
+# dense city. 25 KB keeps the estimate honest in both directions; the API
+# labels the figure as approximate for the same reason.
+OFFLINE_MAP_BYTES_PER_TILE = 25 * 1024
+# Headroom that must survive the download. A node that stops recording
+# detections because the card filled with map tiles is strictly worse than a
+# node with no offline map at all. Covers the 40 MB feeder log cap, the 50 MB
+# forwarder buffer, and room for OS updates.
+OFFLINE_MAP_RESERVE_BYTES = 500 * 1024 * 1024
+# A hard ceiling on pack size, independent of free space. "It fits" is
+# necessary but not sufficient: a node with a 64 GB card would happily accept a
+# 15 GB / 635,000-tile download at 20 km z19, which means hours of transfer and
+# a great deal of SD-card write wear for a basemap. Disk space and good sense
+# are different limits, and the API reports which one a request failed.
+OFFLINE_MAP_MAX_PACK_BYTES = 1536 * 1024 * 1024
+# What we SUGGEST, as distinct from what we allow. The deepest zoom that fits
+# is often ~1 GB, which is a long download on a domestic line for a basemap.
+# The default should be quick and genuinely useful; going deeper stays
+# available, but as a deliberate choice rather than the path of least
+# resistance.
+OFFLINE_MAP_COMFORTABLE_BYTES = 400 * 1024 * 1024
 
 START_TIME = time.time()
 
@@ -788,6 +825,120 @@ def api_status():
         "feeders":     _read_feeder_states(),
     })
     return jsonify(s)
+
+
+def _tiles_for_region(lat: float, lon: float, radius_km: float, maxzoom: int) -> int:
+    """Cumulative tile count covering a square region, zoom 0 through maxzoom.
+
+    Exact arithmetic, not a guess — only the bytes-per-tile figure is an
+    estimate. Uses the same Web Mercator maths the tile server does, so the
+    count matches what a download would actually fetch.
+
+    A degree of latitude is ~111.32 km everywhere; a degree of longitude
+    shrinks by cos(lat), which is why the same radius costs more tiles near
+    the equator than near the poles.
+    """
+    dlat = radius_km / 111.32
+    dlon = radius_km / (111.32 * max(math.cos(math.radians(lat)), 1e-6))
+    north = min(lat + dlat, 85.05112878)
+    south = max(lat - dlat, -85.05112878)
+    total = 0
+    for z in range(maxzoom + 1):
+        n = 2 ** z
+        def xtile(lng):
+            return int((lng + 180.0) / 360.0 * n)
+        def ytile(la):
+            r = math.radians(la)
+            return int((1.0 - math.log(math.tan(r) + 1 / math.cos(r)) / math.pi) / 2.0 * n)
+        x0, x1 = xtile(lon - dlon), xtile(lon + dlon)
+        y0, y1 = ytile(north), ytile(south)
+        total += (abs(x1 - x0) + 1) * (abs(y1 - y0) + 1)
+    return total
+
+
+@app.route("/api/offline-map/estimate")
+def api_offline_map_estimate():
+    """Price every zoom depth for a region and say which ones fit on disk.
+
+    Returns the whole table rather than a single recommendation, so the UI can
+    show the operator what each depth costs and grey out the ones that do not
+    fit. A red X that explains itself is worth more than a disabled button.
+    """
+    # Region selection needs a different default from map centering, and
+    # get_home_location() answers the other question. On a mobile node it
+    # deliberately returns nothing without a live GPS fix, because showing a
+    # stale position as "here" would be wrong. But "roughly where should I
+    # download tiles for" is answered perfectly well by the configured
+    # coordinates — a mobile node with no fix yet still has a home region.
+    home = get_home_location() or {}
+    if home.get("lat") is None:
+        try:
+            home = {"lat": float(_read_config_env("NODE_LAT")),
+                    "lon": float(_read_config_env("NODE_LON"))}
+        except (TypeError, ValueError):
+            home = {}
+    try:
+        lat = float(request.args.get("lat", home.get("lat")))
+        lon = float(request.args.get("lon", home.get("lon")))
+    except (TypeError, ValueError):
+        return jsonify({
+            "error": "no_location",
+            "detail": "No latitude/longitude given, and the node does not know "
+                      "where it is. Set NODE_LAT/NODE_LON, or wait for a GPS fix.",
+        }), 400
+    try:
+        radius = float(request.args.get("radius_km", 10.0))
+    except ValueError:
+        radius = 10.0
+    radius = max(OFFLINE_MAP_MIN_RADIUS_KM, min(radius, OFFLINE_MAP_MAX_RADIUS_KM))
+
+    try:
+        st = os.statvfs(_static_root())
+        free = st.f_bavail * st.f_frsize
+    except OSError:
+        free = 0
+    usable = max(free - OFFLINE_MAP_RESERVE_BYTES, 0)
+
+    zooms, recommended, deepest = [], None, None
+    for z in range(WORLD_TILES_MAX_ZOOM + 1, OFFLINE_MAP_ZOOM_CEILING + 1):
+        tiles = _tiles_for_region(lat, lon, radius, z)
+        size = tiles * OFFLINE_MAP_BYTES_PER_TILE
+        too_big = size > OFFLINE_MAP_MAX_PACK_BYTES
+        no_room = size > usable
+        fits = not (too_big or no_room)
+        zooms.append({
+            "maxzoom": z, "tiles": tiles, "bytes": size, "fits": fits,
+            # Distinguish the two failures. "Too large" is answered by
+            # choosing a smaller radius or depth; "not enough space" is
+            # answered by freeing disk. Telling an operator the wrong one
+            # sends them off fixing something that is not the problem.
+            "reason": None if fits else ("too_large" if too_big else "not_enough_space"),
+        })
+        if fits:
+            deepest = z
+            if size <= OFFLINE_MAP_COMFORTABLE_BYTES:
+                recommended = z
+
+    return jsonify({
+        "center": {"lat": lat, "lon": lon},
+        "radius_km": radius,
+        "limits": {
+            "radius_km_min": OFFLINE_MAP_MIN_RADIUS_KM,
+            "radius_km_max": OFFLINE_MAP_MAX_RADIUS_KM,
+        },
+        "disk": {
+            "free_bytes": free,
+            "reserve_bytes": OFFLINE_MAP_RESERVE_BYTES,
+            "usable_bytes": usable,
+        },
+        "bytes_per_tile": OFFLINE_MAP_BYTES_PER_TILE,
+        "max_pack_bytes": OFFLINE_MAP_MAX_PACK_BYTES,
+        "estimate_is_approximate": True,
+        "zooms": zooms,
+        "recommended_maxzoom": recommended,   # quick and useful — the default
+        "deepest_allowed_maxzoom": deepest,   # available, but a deliberate choice
+        "comfortable_bytes": OFFLINE_MAP_COMFORTABLE_BYTES,
+    })
 
 
 @app.route("/tiles/<int:z>/<int:x>/<int:y>.png")
