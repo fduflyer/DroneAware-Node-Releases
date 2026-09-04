@@ -38,7 +38,7 @@ Once connected, you'll also get real-time email alerts anytime your node(s) dete
 | Raspberry Pi 4 (1 GB or more) | 2 GB+ recommended if running other software |
 | MicroSD card (16 GB+, Class 10) | Samsung Endurance or SanDisk High Endurance preferred |
 | USB Bluetooth adapter | **Sena UD100** (newer variants with Bluetooth 4.0+ only) or any CSR/Cambridge Silicon Radio USB dongle. **Older UD100 variants (G01, G02, G03 and similar) are Bluetooth Classic (BT 2.0/2.1) only and will not work.** If unsure which version you have, the Pi's built-in Bluetooth works out of the box at shorter range. |
-| WiFi adapter (required) | **Alfa AWUS036ACS** (RTL8821AU) or **Panda AC600** (MT7610U). Both are dual-band — see the table below, and note that 2.4 GHz-only adapters cannot see a large share of drones. |
+| WiFi adapter (required) | **Alfa AWUS036ACS** (RTL8811AU) or **Panda AC600** (MT7610U). Both are dual-band — see the table below, and note that 2.4 GHz-only adapters cannot see a large share of drones. |
 | Second WiFi adapter (recommended) | A second dual-band adapter lets the node sweep 5 GHz about seven times faster. See **Two adapters** below. |
 | 5V/3A USB-C power supply | Official Raspberry Pi PSU recommended |
 | Ethernet cable or WiFi credentials | For initial setup |
@@ -62,10 +62,15 @@ same test and same code path:
 
 | Adapter | Chipset | Channel change | Notes |
 |---|---|---|---|
-| **Alfa AWUS036ACS** | RTL8821AU | **22 ms** | Fastest we've measured. The best choice for the 5 GHz sweep. |
+| **Alfa AWUS036ACS** | RTL8811AU | **22 ms** | Fastest we've measured. The best choice for the 5 GHz sweep. |
 | **Panda AC600** | MT7610U | 111 ms | Inexpensive and works well. |
 | Alfa AWUS036ACM | MT7612U | **1007 ms** | Dual-band, but 45x slower to change channel than the ACS. Usable, noticeably worse. |
 | Alfa AWUS036N | RT3070 | — | **2.4 GHz only.** Cannot see any drone broadcasting on 5 GHz. |
+
+The ACS reports as `Realtek 8812AU/8821AU` in `lsusb` and loads the
+`rtw88_8821au` driver. That is not a different adapter — the USB ID and the
+driver are shared across Realtek's 88xx family. Alfa have confirmed the silicon
+is the RTL8811AU.
 
 The spread between adapters is larger than anything you can fix in software.
 In a side-by-side test, identical code on the ACM captured 51% of a drone's
