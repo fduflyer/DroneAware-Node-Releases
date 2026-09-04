@@ -146,6 +146,87 @@
       align-items: center;
       gap: 8px;
     }
+
+    /* ── Settings panel (v1.6.0) ─────────────────────────────────────────
+       Values taken from the share modal on droneaware.io/live.html so the
+       node UI and the public site feel like one product: 14px radius, 28px
+       padding, blurred backdrop, absolute top-right close, accent callout at
+       6%/20%. Expressed as classes rather than the inline styles the public
+       page uses, matching this file's convention.
+
+       Deliberate divergence: no Font Awesome. The public site pulls it from a
+       CDN; a node showing this UI may have no internet at all, which is the
+       entire reason the offline map exists. Text glyphs instead. */
+    .settings-backdrop {
+      display: none; position: fixed; inset: 0; z-index: 99998;
+      background: rgba(0,0,0,0.7); backdrop-filter: blur(4px);
+      align-items: center; justify-content: center; padding: 20px;
+    }
+    .settings-backdrop.open { display: flex; }
+    .settings-panel {
+      background: var(--bg-surface); border: 1px solid var(--border);
+      border-radius: 14px; padding: 28px 28px 24px;
+      max-width: 520px; width: 100%; max-height: 88vh; overflow-y: auto;
+      box-shadow: 0 12px 50px rgba(0,0,0,0.6);
+      color: var(--text-primary); position: relative;
+    }
+    .settings-close {
+      position: absolute; top: 12px; right: 12px;
+      background: none; border: none; color: var(--text-dim);
+      font-size: 24px; cursor: pointer; width: 32px; height: 32px;
+      border-radius: 6px; line-height: 1;
+    }
+    .settings-panel h2 {
+      margin: 0 0 14px; font-size: 18px; font-weight: 700;
+      color: var(--text-primary);
+    }
+    .settings-panel .lede {
+      font-size: 13px; color: var(--text-dim); line-height: 1.4; margin: 0 0 18px;
+    }
+    .field { margin-bottom: 16px; }
+    .field label {
+      display: flex; justify-content: space-between; align-items: baseline;
+      font-size: 13px; color: var(--text-dim); margin-bottom: 7px;
+    }
+    .field label b { color: var(--text-primary); font-weight: 700; }
+    .field input[type="range"] { width: 100%; accent-color: var(--accent); }
+    .coord-row { display: flex; gap: 8px; }
+    .coord-row input {
+      flex: 1; min-width: 0; background: var(--bg-primary);
+      color: var(--text-primary); border: 1px solid var(--border);
+      border-radius: 8px; padding: 9px 11px; font-size: 13px;
+      font-family: inherit; outline: none;
+    }
+    .coord-row input:focus { border-color: var(--accent); }
+    /* Accent callout — same treatment as the share modal's URL box. */
+    .estimate-box {
+      background: rgba(0,229,255,0.06); border: 1px solid rgba(0,229,255,0.2);
+      border-radius: 8px; padding: 12px 14px; margin-bottom: 18px;
+    }
+    .estimate-row {
+      display: flex; justify-content: space-between; gap: 12px;
+      font-size: 13px; color: var(--text-dim); padding: 3px 0;
+    }
+    .estimate-row b { color: var(--text-primary); font-weight: 700; }
+    .verdict {
+      display: flex; gap: 9px; align-items: flex-start;
+      margin-top: 11px; padding-top: 11px;
+      border-top: 1px solid rgba(0,229,255,0.15);
+      font-size: 12px; line-height: 1.45; color: var(--text-dim);
+    }
+    .verdict .mark { font-size: 15px; line-height: 1.3; flex: none; font-weight: 700; }
+    .verdict.ok  .mark { color: var(--status-ok); }
+    .verdict.bad .mark { color: var(--status-error); }
+    .btn-download {
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      width: 100%; background: var(--accent); border: none; color: #070F1E;
+      padding: 11px 14px; border-radius: 8px; font-size: 14px; font-weight: 700;
+      cursor: pointer; font-family: inherit; transition: filter 0.15s;
+    }
+    .btn-download:disabled {
+      background: #0B1C3E; border: 1px solid var(--border);
+      color: var(--text-muted); cursor: not-allowed;
+    }
     .icon-btn {
       width: 30px; height: 30px;
       border: 1px solid var(--border);
@@ -735,6 +816,7 @@
     <div class="header-right">
       <button class="icon-btn" id="btn-units" title="Toggle units (imperial / metric)" aria-label="Toggle units" style="font-size: 12px; font-weight: 700; letter-spacing: 0.5px;">ft</button>
       <button class="icon-btn" id="btn-theme" title="Toggle theme" aria-label="Toggle theme">◐</button>
+      <button class="icon-btn" id="btn-settings" title="Settings" aria-label="Settings">⚙</button>
     </div>
   </div>
 
@@ -841,6 +923,49 @@
   <div class="toast-container" id="toast-container"></div>
 
   <!-- Bundled Leaflet -->
+  <!-- Settings panel (v1.6.0). Click-outside-to-close matches the public
+       site's share modal. -->
+  <div class="settings-backdrop" id="settings-backdrop">
+    <div class="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <button class="settings-close" id="settings-close" aria-label="Close">&times;</button>
+      <h2 id="settings-title">Offline map</h2>
+      <p class="lede">
+        This node ships a world overview that is deliberately coarse. Download
+        detail for your own area so the map still works with no internet.
+      </p>
+
+      <div class="field">
+        <label for="om-radius">Area around the node <b><span id="om-radius-val">10</span> km</b></label>
+        <input type="range" id="om-radius" min="1" max="20" step="1" value="10">
+      </div>
+
+      <div class="field">
+        <label for="om-zoom">Detail <b><span id="om-zoom-val">—</span></b></label>
+        <input type="range" id="om-zoom" min="7" max="19" step="1" value="16">
+      </div>
+
+      <div class="field">
+        <label>Centre <b id="om-center-src">node location</b></label>
+        <div class="coord-row">
+          <input type="text" id="om-lat" inputmode="decimal" placeholder="latitude">
+          <input type="text" id="om-lon" inputmode="decimal" placeholder="longitude">
+        </div>
+      </div>
+
+      <div class="estimate-box">
+        <div class="estimate-row"><span>Map tiles</span><b id="om-tiles">—</b></div>
+        <div class="estimate-row"><span>Download size</span><b id="om-size">—</b></div>
+        <div class="estimate-row"><span>Free space</span><b id="om-free">—</b></div>
+        <div class="verdict" id="om-verdict">
+          <span class="mark" id="om-mark"></span>
+          <span id="om-verdict-text">Checking…</span>
+        </div>
+      </div>
+
+      <button class="btn-download" id="om-download" disabled>Download offline map</button>
+    </div>
+  </div>
+
   <script src="/static/leaflet.js"></script>
 
   <script>
@@ -1970,6 +2095,122 @@ ${multiSerialHTML}
         }
       });
     });
+
+    // ── Offline map settings (v1.6.0) ────────────────────────────────────
+    // Every change re-prices the region against the node's real disk. The
+    // Download button is a readout of that, never an invitation to try
+    // something that will fail.
+    const om = {
+      est: null,
+      fmtBytes(b) {
+        if (b >= 1024 ** 3) return (b / 1024 ** 3).toFixed(1) + " GB";
+        return Math.round(b / 1024 ** 2) + " MB";
+      },
+      open() {
+        document.getElementById("settings-backdrop").classList.add("open");
+        om.refresh();
+      },
+      close() {
+        document.getElementById("settings-backdrop").classList.remove("open");
+      },
+      async refresh() {
+        const radius = document.getElementById("om-radius").value;
+        document.getElementById("om-radius-val").textContent = radius;
+        const lat = document.getElementById("om-lat").value.trim();
+        const lon = document.getElementById("om-lon").value.trim();
+        let url = `/api/offline-map/estimate?radius_km=${encodeURIComponent(radius)}`;
+        if (lat && lon) url += `&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}`;
+        let d;
+        try {
+          const r = await fetch(url);
+          d = await r.json();
+        } catch (e) {
+          return om.fail("Could not reach the node to check available space.");
+        }
+        if (d.error) return om.fail(d.detail || "This node does not know where it is.");
+        om.est = d;
+
+        // Populate the centre boxes from whatever the node resolved, so the
+        // operator sees the default rather than an empty field they have to
+        // guess at.
+        if (!lat) document.getElementById("om-lat").value = d.center.lat.toFixed(5);
+        if (!lon) document.getElementById("om-lon").value = d.center.lon.toFixed(5);
+
+        // Bound the detail slider to what this region can actually offer, and
+        // land on the suggested depth the first time through.
+        const zEl = document.getElementById("om-zoom");
+        const zooms = d.zooms.map(z => z.maxzoom);
+        zEl.min = Math.min(...zooms);
+        zEl.max = Math.max(...zooms);
+        if (om.est_first !== d.radius_km) {
+          zEl.value = d.recommended_maxzoom || d.deepest_allowed_maxzoom || zEl.min;
+          om.est_first = d.radius_km;
+        }
+        om.render();
+      },
+      render() {
+        const d = om.est; if (!d) return;
+        const z = parseInt(document.getElementById("om-zoom").value, 10);
+        const row = d.zooms.find(x => x.maxzoom === z);
+        if (!row) return;
+
+        // "Detail" rather than a zoom number: z17 means nothing to most
+        // operators, but "streets" and "buildings" do.
+        const label = z <= 10 ? "region" : z <= 13 ? "towns"
+                    : z <= 15 ? "main roads" : z <= 17 ? "streets" : "buildings";
+        document.getElementById("om-zoom-val").textContent = label;
+        document.getElementById("om-tiles").textContent = row.tiles.toLocaleString();
+        document.getElementById("om-size").textContent = om.fmtBytes(row.bytes);
+        document.getElementById("om-free").textContent = om.fmtBytes(d.disk.free_bytes);
+
+        const v = document.getElementById("om-verdict");
+        const mark = document.getElementById("om-mark");
+        const text = document.getElementById("om-verdict-text");
+        const btn = document.getElementById("om-download");
+
+        if (row.fits) {
+          v.className = "verdict ok"; mark.textContent = "\u2713";
+          text.textContent = `About ${om.fmtBytes(row.bytes)}, leaving `
+            + `${om.fmtBytes(d.disk.free_bytes - row.bytes)} free. `
+            + `Sizes are approximate — dense cities run larger than open country.`;
+          btn.disabled = false;
+        } else {
+          v.className = "verdict bad"; mark.textContent = "\u2717";
+          // The two failures have different answers, so they get different
+          // sentences. Telling someone to free disk space when the real
+          // problem is that they asked for 15 GB sends them off fixing the
+          // wrong thing.
+          text.textContent = row.reason === "not_enough_space"
+            ? `Needs ${om.fmtBytes(row.bytes)} but only `
+              + `${om.fmtBytes(d.disk.usable_bytes)} is available once space is `
+              + `reserved for detection logs. Reduce the area or the detail.`
+            : `${om.fmtBytes(row.bytes)} is more than this node will download in `
+              + `one go. That is hours of transfer and heavy wear on the SD card `
+              + `for a map. Reduce the area or the detail.`;
+          btn.disabled = true;
+        }
+      },
+      fail(msg) {
+        document.getElementById("om-verdict").className = "verdict bad";
+        document.getElementById("om-mark").textContent = "\u2717";
+        document.getElementById("om-verdict-text").textContent = msg;
+        document.getElementById("om-download").disabled = true;
+      },
+    };
+
+    document.getElementById("btn-settings").addEventListener("click", om.open);
+    document.getElementById("settings-close").addEventListener("click", om.close);
+    document.getElementById("settings-backdrop").addEventListener("click", (e) => {
+      if (e.target.id === "settings-backdrop") om.close();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") om.close();
+    });
+    document.getElementById("om-radius").addEventListener("input", om.refresh);
+    document.getElementById("om-zoom").addEventListener("input", om.render);
+    ["om-lat", "om-lon"].forEach(id =>
+      document.getElementById(id).addEventListener("change", om.refresh));
+
   </script>
 </body>
 </html>
