@@ -1788,6 +1788,14 @@ except Exception:
     sys.exit()
 adv, age, scanning = s.get("adv_total"), s.get("adv_age_s"), s.get("scanning")
 adapter = s.get("adapter") or "?"
+# hci0 alone cannot tell a USB dongle from the Pi's built-in radio -- both
+# present the same name. Say which one this is, since "my Bluetooth is not
+# working" has very different answers for each.
+bus, usb_id = s.get("adapter_bus"), s.get("adapter_usb_id")
+if bus == "usb":
+    adapter = f"{adapter} (USB {usb_id})" if usb_id else f"{adapter} (USB)"
+elif bus == "onboard":
+    adapter = f"{adapter} (onboard)"
 if adv is None:
     sys.exit()                      # pre-v1.5.2.2 feeder, nothing to show
 if scanning:

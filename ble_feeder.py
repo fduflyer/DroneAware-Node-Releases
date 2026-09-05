@@ -368,6 +368,56 @@ def get_ble_health(adapter: str = "hci0") -> tuple[bool, str]:
         return False, adapter
 
 
+def _adapter_hardware(adapter: str) -> dict:
+    """Identify what hci<N> physically is: onboard radio or USB dongle.
+
+    `hci0` alone is useless for telling a Sena UD100 from the Pi's built-in
+    Bluetooth -- both present as hci0, and the fleet could not be asked which
+    hardware was failing because nothing reported it.
+
+    Walks sysfs from the hci device toward the root looking for a USB parent.
+    Finding one means a dongle, and its idVendor:idProduct identifies the
+    chipset family. Finding none means the onboard radio, which hangs off a
+    serial/UART node instead.
+
+    NOTE for whoever reads the VID:PID: 0a12:0001 is Cambridge Silicon Radio's
+    generic identifier and the most widely cloned in Bluetooth. It establishes
+    "USB CSR dongle", never "genuine Sena" -- counterfeits report it too.
+
+    Hardware identity, not personal data: a chipset model, no address and
+    nothing about the devices around the node.
+    """
+    info = {"bus": "unknown", "usb_id": None, "usb_desc": None}
+    try:
+        dev = os.path.realpath(f"/sys/class/bluetooth/{adapter}/device")
+        while dev and dev != "/":
+            vid_path = os.path.join(dev, "idVendor")
+            if os.path.isfile(vid_path):
+                with open(vid_path) as f:
+                    vid = f.read().strip()
+                with open(os.path.join(dev, "idProduct")) as f:
+                    pid = f.read().strip()
+                info["bus"] = "usb"
+                info["usb_id"] = f"{vid}:{pid}"
+                parts = []
+                for name in ("manufacturer", "product"):
+                    try:
+                        with open(os.path.join(dev, name)) as f:
+                            v = f.read().strip()
+                        if v:
+                            parts.append(v)
+                    except OSError:
+                        pass
+                info["usb_desc"] = " ".join(parts) or None
+                return info
+            dev = os.path.dirname(dev)
+        # No USB parent anywhere up the chain -- the built-in radio.
+        info["bus"] = "onboard"
+    except Exception:
+        pass
+    return info
+
+
 def _scanning_alive(feeder) -> bool:
     """True when the radio has actually heard something recently.
 
@@ -1161,6 +1211,13 @@ class BLEFeeder:
                         "ble_ok":       False,
                         "ble_adapter":  self.adapter,
                         "ble_fault":    reason,
+                        # Carried in FAULT too. A broken node is exactly when
+                        # knowing whether it is a USB dongle or the onboard
+                        # radio matters most, and the healthy path reporting it
+                        # while the faulted path stays silent would leave the
+                        # failures -- the rows worth querying -- blank.
+                        "ble_bus":      _adapter_hardware(self.adapter or "hci0")["bus"],
+                        "ble_usb_id":   _adapter_hardware(self.adapter or "hci0")["usb_id"],
                         # v1.4.8: restart count meaningful even in FAULT
                         # (a crash-looping FAULT feeder should be visible).
                         "restarts_since_boot": self.restart_count,
@@ -1325,6 +1382,8 @@ class BLEFeeder:
                                if getattr(self, "last_adv_mono", None) is not None
                                else None),
                 "scanning":   _scanning_alive(self),
+                **{f"adapter_{k}": v
+                   for k, v in _adapter_hardware(adapter or "hci0").items()},
                 "sent_total": getattr(getattr(self, "forwarder", None),
                                       "sent_total", 0),
                 "updated_at": time.time(),
@@ -1408,6 +1467,13 @@ class BLEFeeder:
                                 # signal for the node's location, and nothing
                                 # needs it.
                                 "ble_scanning":               _scanning_alive(self),
+                                # Which radio this actually is. hci0 alone
+                                # cannot distinguish a USB dongle from the
+                                # Pi's built-in Bluetooth, so no fleet-wide
+                                # question about adapter hardware could be
+                                # answered. Chipset identity only.
+                                "ble_bus":                    _adapter_hardware(ble_adp or "hci0")["bus"],
+                                "ble_usb_id":                 _adapter_hardware(ble_adp or "hci0")["usb_id"],
                                 # v1.4.8 telemetry additions:
                                 "buffered":                   self.forwarder.held_events,
                                 "buffered_bytes":             self.forwarder.held_bytes,
