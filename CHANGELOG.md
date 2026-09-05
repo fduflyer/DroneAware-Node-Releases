@@ -10,6 +10,24 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.5.2.3] — Unreleased
+
+### Nodes now report which Bluetooth radio they are using
+
+A USB adapter and the Pi's built-in Bluetooth both appear as `hci0`, so nothing
+recorded which one a node actually had — two nodes with different hardware
+looked identical in every record. It is now reported in the node's heartbeat
+and shown locally:
+
+```
+Bluetooth: hci0 (USB 0a12:0001) — hearing traffic ...
+Bluetooth: hci0 (onboard) — hearing traffic ...
+```
+
+Reported by faulted nodes as well as healthy ones, since a broken node is when
+it matters most. Only the chipset model — the same identifier any USB device
+gives the computer it is plugged into.
+
 ## [1.5.2.2] — Unreleased
 
 ### Bluetooth could stop working silently, and the node would not notice
