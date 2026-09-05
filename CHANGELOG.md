@@ -10,6 +10,53 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.5.2.2] — Unreleased
+
+### Bluetooth could stop working silently, and the node would not notice
+
+Several nodes stopped detecting anything over Bluetooth while reporting
+themselves perfectly healthy. Wi-Fi carried on normally on the same nodes —
+one logged over 231,000 Wi-Fi detections and exactly zero Bluetooth in the
+same month. One operator went roughly a month before noticing, and only
+because he lives beside a delivery hub and knew what he ought to be seeing.
+
+The node had no way to tell the difference between a broken radio and a quiet
+sky, and neither did we. Its health check asked whether the adapter was
+present and switched on — which it always was. That answers a different
+question from whether scanning still works.
+
+The trigger appears to be the Bluetooth service restarting underneath the
+feeder, which happens during ordinary system updates. The connection the
+feeder scans through is dropped, no error is raised, and it listens to a dead
+channel indefinitely. That matches what was seen: failures on different dates
+per node with no common software version, since it depends on when each
+operator last updated their system.
+
+Nodes now notice. If the radio hears nothing at all for fifteen minutes it
+rebuilds the scan and recovers without anyone being involved. `sudo droneaware
+status` gained a Bluetooth line reporting whether traffic is arriving, and the
+node tells the server whether its radio is alive rather than merely present.
+
+If your Bluetooth has been quiet, `sudo systemctl restart droneaware-ble`
+fixes it immediately on any version.
+
+### How this works, and what it does not collect
+
+To find Remote ID broadcasts, a Bluetooth radio has to listen to every
+advertisement near it — that is how Bluetooth scanning works, and it is what a
+phone does constantly. The node has always worked this way; there is no way to
+ask the adapter for only drone traffic.
+
+What is new is that it now **counts** them. Nothing else. Anything that is not
+Remote ID is discarded the moment it arrives: no address, no device name and
+no content is read, stored, written to a log, or sent anywhere. The count
+exists purely so the node can tell "working, nothing flying" apart from
+"stopped working".
+
+That count stays on your node. `sudo droneaware status` shows it to you; the
+server is told only whether the radio is alive, because a count would hint at
+how many devices are near your home and nothing needs that.
+
 ## [1.5.2.1] — Unreleased
 
 ### `droneaware swap` printed an error after succeeding
