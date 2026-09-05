@@ -40,6 +40,22 @@ node tells the server whether its radio is alive rather than merely present.
 If your Bluetooth has been quiet, `sudo systemctl restart droneaware-ble`
 fixes it immediately on any version.
 
+### Nodes now report which Bluetooth radio they are using
+
+A USB adapter and the Pi's built-in Bluetooth both appear as `hci0`, so nothing
+recorded which one a node actually had — two nodes with different hardware
+looked identical in every record. It is now reported in the node's heartbeat
+and shown locally:
+
+```
+Bluetooth: hci0 (USB 0a12:0001) — hearing traffic ...
+Bluetooth: hci0 (onboard) — hearing traffic ...
+```
+
+Reported by faulted nodes as well as healthy ones, since a broken node is when
+it matters most. Only the chipset model — the same identifier any USB device
+gives the computer it is plugged into.
+
 ### How this works, and what it does not collect
 
 To find Remote ID broadcasts, a Bluetooth radio has to listen to every
