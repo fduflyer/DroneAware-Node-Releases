@@ -1775,6 +1775,35 @@ cmd_status() {
         echo ""
     fi
 
+    # Bluetooth liveness. The count is read from the feeder's own state file
+    # and shown ONLY here, on the operator's own node -- it is never sent to
+    # the server, which receives a boolean. An operator checking their own
+    # antenna is a different decision from telemetry leaving the device.
+    if [[ -r /run/droneaware/ble_state.json ]]; then
+        python3 - <<'BLEPY'
+import json, sys
+try:
+    s = json.load(open("/run/droneaware/ble_state.json"))
+except Exception:
+    sys.exit()
+adv, age, scanning = s.get("adv_total"), s.get("adv_age_s"), s.get("scanning")
+adapter = s.get("adapter") or "?"
+if adv is None:
+    sys.exit()                      # pre-v1.5.2.2 feeder, nothing to show
+if scanning:
+    print(f"  Bluetooth: {adapter} — hearing traffic "
+          f"({adv:,} advertisements seen, last {age}s ago)")
+elif adv == 0:
+    print(f"  Bluetooth: {adapter} — NO advertisements heard at all.")
+    print(f"             The adapter reports up, but nothing is arriving. In any")
+    print(f"             populated area this means the scan is dead, not quiet.")
+else:
+    print(f"  Bluetooth: {adapter} — silent for {int(age)}s "
+          f"({adv:,} heard earlier). Rebuilding the scan.")
+print("")
+BLEPY
+    fi
+
     # Power. The installer has checked this since v1.5.0.6, but only once, at
     # install time — a node that was healthy then and browns out later says
     # nothing. That gap matters more now that we recommend a SECOND WiFi

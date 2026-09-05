@@ -260,6 +260,13 @@ UA_TYPE = {
 
 # -- Adapter Resolution --------------------------------------------------------
 
+# How long a radio may hear NOTHING AT ALL before we treat the scan as dead
+# and rebuild it. Generous on purpose: this counts every advertisement from
+# every device, so anywhere with people nearby ticks constantly, and only a
+# genuinely broken subscription goes quiet this long.
+BLE_SILENCE_RESTART_SEC = 15 * 60
+
+
 def find_adapter_by_mac(target_mac: str) -> str | None:
     """
     Resolve a Bluetooth adapter MAC address to its HCI device name (e.g. 'hci0').
@@ -359,6 +366,21 @@ def get_ble_health(adapter: str = "hci0") -> tuple[bool, str]:
         return "UP RUNNING" in result.stdout, adapter
     except Exception:
         return False, adapter
+
+
+def _scanning_alive(feeder) -> bool:
+    """True when the radio has actually heard something recently.
+
+    Distinct from ble_ok, which is `hciconfig` reporting UP RUNNING and
+    therefore answers "does the interface exist" rather than "does scanning
+    work". This is the boolean the server needs to tell a broken radio from a
+    quiet one -- and it is the ONLY thing derived from the advertisement count
+    that leaves the node. The count itself stays local.
+    """
+    last = getattr(feeder, "last_adv_mono", None)
+    if last is None:
+        return False
+    return (time.monotonic() - last) <= BLE_SILENCE_RESTART_SEC
 
 
 async def _attempt_ble_recovery(adapter: str) -> bool:
@@ -976,8 +998,39 @@ class BLEFeeder:
         self.restart_count           = _get_restart_count()
         self.max_lag_ms_this_interval = 0
 
+        # v1.5.2.2 — liveness. ble_ok is `hciconfig` reporting UP RUNNING,
+        # which says the interface exists, not that scanning works. A node
+        # whose BlueZ subscription is orphaned (bluetooth.service restarting
+        # under `apt upgrade`, say) keeps reporting UP RUNNING and hears
+        # nothing, forever, with no fault raised. Seven nodes sat like that.
+        #
+        # Counting only Remote ID cannot detect it: a healthy radio in a quiet
+        # area also sees zero. Counting EVERY advertisement can — anywhere with
+        # people in it is saturated with phones, earbuds and TVs.
+        #
+        # PRIVACY: this is a counter and nothing else. The callback already
+        # receives every advertisement in range (there is no UUID pre-filter —
+        # the CSR adapter cannot do one reliably), and already discards
+        # non-Remote-ID ones untouched. Incrementing an integer adds no new
+        # reception and retains nothing: no address, no name, no payload. The
+        # count stays on the node; only a boolean reaches the server.
+        self.adv_total      = 0          # every advertisement, local only
+        self.adv_ever_seen  = False      # gate for self-heal, see below
+        self.last_adv_mono  = None
+
     def on_advertisement(self, device: BLEDevice, adv: AdvertisementData):
-        """Callback for every BLE advertisement containing UUID 0xFFFA service data."""
+        """Callback for every BLE advertisement the adapter receives.
+
+        Docstring corrected: there is no UUID pre-filter on the scanner, so
+        this fires for every device in range, not only 0xFFFA ones.
+        """
+        # Liveness only. Counted before anything is examined, and nothing
+        # about the advertisement is read, kept or logged unless it turns out
+        # to be Remote ID below.
+        self.adv_total += 1
+        self.adv_ever_seen = True
+        self.last_adv_mono = time.monotonic()
+
         # Locate the FFFA service data entry
         svc_data  = None
         svc_uuid  = None
@@ -992,8 +1045,10 @@ class BLEFeeder:
 
         rid_payload_hex, strategy = extract_rid_payload(svc_data)
         if rid_payload_hex is None:
+            # Address deliberately omitted: the payload is what is
+            # diagnostically useful, and a MAC written to disk is not.
             log.warning(
-                f"Unrecognised service data from {device.address} "
+                f"Unrecognised 0xFFFA service data "
                 f"({len(svc_data)} bytes: {svc_data.hex()}) — skipped"
             )
             return
@@ -1187,6 +1242,28 @@ class BLEFeeder:
                         self.max_lag_ms_this_interval = lag_ms
                     last_tick_time = now
 
+                    # Liveness. If the radio has heard nothing whatsoever for
+                    # BLE_SILENCE_RESTART_SEC, the scan is dead even though
+                    # hciconfig still says UP RUNNING — rebuild it. Returning
+                    # False hands control back to run()'s retry wrapper, the
+                    # same path adapter recovery already uses.
+                    #
+                    # Gated on having seen at least one advertisement since
+                    # start. A node genuinely alone in a field would otherwise
+                    # rebuild its scanner every 15 minutes forever, achieving
+                    # nothing; it reports scanning=False instead, which is
+                    # visible and does not thrash. The failure this fixes —
+                    # working, then orphaned — always has traffic before the
+                    # silence.
+                    if (self.adv_ever_seen and self.last_adv_mono is not None
+                            and now - self.last_adv_mono > BLE_SILENCE_RESTART_SEC):
+                        log.warning(
+                            f"[Liveness] No BLE advertisements of any kind for "
+                            f"{int(now - self.last_adv_mono)}s while the adapter "
+                            f"reports UP RUNNING — the scan is dead. Rebuilding."
+                        )
+                        return False
+
                     # Flush via a worker thread — sync requests.post inside
                     # Forwarder._flush no longer blocks the async loop.
                     if self.forwarder.should_flush():
@@ -1240,6 +1317,14 @@ class BLEFeeder:
                 "ble_ok":     ble_ok,
                 "ble_fault":  fault,
                 "seen_total": getattr(self, "count", 0),
+                # Local only -- read by `droneaware status` so an operator can
+                # confirm their own radio is hearing traffic. Never sent to the
+                # server; the heartbeat carries a boolean derived from it.
+                "adv_total":  getattr(self, "adv_total", 0),
+                "adv_age_s":  (round(time.monotonic() - self.last_adv_mono, 1)
+                               if getattr(self, "last_adv_mono", None) is not None
+                               else None),
+                "scanning":   _scanning_alive(self),
                 "sent_total": getattr(getattr(self, "forwarder", None),
                                       "sent_total", 0),
                 "updated_at": time.time(),
@@ -1313,6 +1398,16 @@ class BLEFeeder:
                                 "load_15m":                   load_15m,
                                 "ble_ok":                     ble_ok,
                                 "ble_adapter":                ble_adp,
+                                # v1.5.2.2. ble_ok means the interface is UP
+                                # RUNNING; this means advertisements are
+                                # actually arriving. A node reporting
+                                # ble_ok=true with ble_scanning=false is the
+                                # silent failure that left seven nodes dark.
+                                # Deliberately a boolean and not the count:
+                                # the count would leak a rough device-density
+                                # signal for the node's location, and nothing
+                                # needs it.
+                                "ble_scanning":               _scanning_alive(self),
                                 # v1.4.8 telemetry additions:
                                 "buffered":                   self.forwarder.held_events,
                                 "buffered_bytes":             self.forwarder.held_bytes,
