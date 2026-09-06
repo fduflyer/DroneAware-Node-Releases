@@ -145,7 +145,17 @@ automatically. Nothing is written to the SD card.
 
 **What data is collected?**
 Only data broadcast publicly by the drones themselves via FAA-mandated Remote ID
-transmissions. Remote ID is an open broadcast equivalent to a drone's tail
+transmissions.
+
+The Bluetooth radio has to listen to every nearby advertisement in order to find
+the Remote ID ones — that is how Bluetooth scanning works, and it is what your
+phone does constantly. Anything that is not Remote ID is discarded immediately:
+no address, no device name, and no content is read, stored, logged or
+transmitted. The node keeps a running **count** of advertisements, and nothing
+else about them, purely so it can tell "my Bluetooth radio is working and the
+sky is quiet" apart from "my Bluetooth radio has stopped working". That count
+never leaves your node — `sudo droneaware status` shows it to you, and the
+server is told only whether the radio is alive. Remote ID is an open broadcast equivalent to a drone's tail
 number visible on a radar screen. No private communications, networks, or
 personal devices are accessed. Your node's GPS coordinates are stored on the
 DroneAware server to correctly place detections on the map.
