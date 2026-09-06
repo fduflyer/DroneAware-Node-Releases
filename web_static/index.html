@@ -11,7 +11,7 @@
 
   <!-- Brand mark favicon (paper airplane, green #10b981) — inlined as data URI
        so the browser tab icon works without an additional asset request. -->
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' fill='transparent'/%3E%3Cpath d='M22 2L11 13' stroke='%2310b981' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M22 2L15 22L11 13L2 9L22 2Z' stroke='%2310b981' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='65 200 250 245'><g fill='none' stroke='%2310b981' stroke-width='15' stroke-linecap='round' stroke-linejoin='round' transform='translate%28-35 2.5%29'><path d='M283.2 351.8 L250 420 L216 330 L120 300 L192.8 266.6 L247.4 241.6 L302 216.5 L268 274 L333 249.5 L308.1 300.7 Z'/><path d='M216 330 L268 274'/></g></svg>">
 
   <style>
     /* =========================================================================
@@ -20,6 +20,10 @@
        (#00E5FF) is the accent for links / focus / selected state / .io.
        ========================================================================= */
     :root {
+      /* Sized so a full 44px touch target fits with breathing room.
+         Operators have built mobile touchscreen node displays; 44px is
+         the minimum comfortable tap target. */
+      --header-h: 60px;
       --bg-primary:    #0A1228;
       --bg-surface:    #0F1B3A;
       --bg-elevated:   #142450;
@@ -80,9 +84,9 @@
                    Consolas, "Courier New", monospace;
     }
 
-    /* ========== Header (44px fixed top) ========== */
+    /* ========== Header (fixed top, --header-h) ========== */
     .header {
-      height: 44px;
+      height: var(--header-h);
       background: var(--bg-surface);
       border-bottom: 1px solid var(--border);
       display: flex;
@@ -104,7 +108,7 @@
       flex-shrink: 0;
     }
     .brand-wordmark .brand-tld { color: var(--brand); }  /* green — matches the paper-airplane brand mark */
-    .brand-wordmark svg { width: 22px; height: 22px; flex-shrink: 0; }
+    .brand-wordmark svg { width: 24px; height: 24px; flex-shrink: 0; color: var(--brand); }
 
     .header-center {
       flex: 1;
@@ -183,6 +187,140 @@
     .settings-panel .lede {
       font-size: 13px; color: var(--text-dim); line-height: 1.4; margin: 0 0 18px;
     }
+    /* Paginated settings. Map is the first page; Node follows. Underline
+       rides on the container's own border, hence the -1px pull. */
+    .settings-tabs {
+      display: flex; gap: 2px; margin: 0 0 18px;
+      border-bottom: 1px solid var(--border);
+    }
+    .settings-tab {
+      appearance: none; background: transparent; border: 0;
+      border-bottom: 2px solid transparent; margin-bottom: -1px;
+      font: inherit; font-size: 13px; font-weight: 600;
+      color: var(--text-dim); padding: 8px 14px; cursor: pointer;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    .settings-tab:hover { color: var(--text-primary); }
+    .settings-tab.is-active {
+      color: var(--accent); border-bottom-color: var(--accent);
+    }
+    /* .settings-page has no display rule of its own, but be explicit —
+       a later display: block would otherwise defeat the hidden attribute. */
+    .settings-page[hidden] { display: none; }
+    .cfg-group {
+      font-size: 11px; font-weight: 700; letter-spacing: 0.08em;
+      text-transform: uppercase; color: var(--text-dim);
+      margin: 22px 0 10px; padding-bottom: 6px;
+      border-bottom: 1px solid var(--border);
+    }
+    .cfg-group:first-child { margin-top: 0; }
+    .cfg-input {
+      width: 100%; box-sizing: border-box; background: var(--bg-primary);
+      color: var(--text-primary); border: 1px solid var(--border);
+      border-radius: 8px; padding: 0 11px; min-height: 44px;
+      font-size: 13px; font-family: inherit; outline: none;
+    }
+    .cfg-input:focus { border-color: var(--accent); }
+    .cfg-help {
+      font-size: 11px; color: var(--text-muted); line-height: 1.4;
+      margin: 6px 0 0;
+    }
+    .cfg-info-btn {
+      appearance: none; margin-left: 7px; width: 16px; height: 16px;
+      border-radius: 50%; border: 1px solid var(--border);
+      background: transparent; color: var(--text-dim);
+      font: 700 10px/1 inherit; cursor: pointer; vertical-align: middle;
+      padding: 0;
+    }
+    .cfg-info-btn:hover, .cfg-info-btn.is-open {
+      color: var(--accent); border-color: var(--accent);
+    }
+    .cfg-info {
+      font-size: 12px; line-height: 1.5; color: var(--text-dim);
+      margin: 0 0 8px; padding: 9px 11px;
+      background: rgba(0,229,255,0.06);
+      border-left: 2px solid rgba(0,229,255,0.4); border-radius: 0 6px 6px 0;
+    }
+    .adapter-row {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; padding: 8px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+    }
+    .adapter-row:last-child { border-bottom: 0; }
+    .adapter-name { font-size: 13px; color: var(--text-primary); font-weight: 600; }
+    .adapter-meta { font-size: 11px; color: var(--text-muted); margin-top: 3px; }
+    .adapter-role {
+      font-size: 11px; font-weight: 700; white-space: nowrap;
+      color: var(--accent); text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    .adapter-role.is-onboard { color: var(--text-muted); }
+    .action-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
+    .density-table {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+      margin-bottom: 12px; padding-bottom: 12px;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+    }
+    .density-col { text-align: center; }
+    .density-head {
+      display: block; font-size: 10px; font-weight: 700;
+      letter-spacing: 0.07em; text-transform: uppercase;
+      color: var(--text-dim); margin-bottom: 5px;
+    }
+    .density-col b { font-size: 16px; color: var(--text-primary); }
+    .node-ident {
+      display: flex; align-items: baseline; gap: 10px;
+      margin: 0 0 20px; padding-bottom: 14px;
+      border-bottom: 1px solid var(--border);
+    }
+    .node-ident-label {
+      font-size: 11px; font-weight: 700; letter-spacing: 0.08em;
+      text-transform: uppercase; color: var(--text-dim);
+    }
+    .node-ident-id { font-size: 17px; font-weight: 700; color: var(--text-primary); }
+    /* Errors get their own color. Accent cyan reads as "information" next to
+       every other box in this panel, so a failure in it goes unnoticed. */
+    .estimate-box.is-error {
+      background: rgba(245,158,11,0.10);
+      border-color: rgba(245,158,11,0.45);
+    }
+    .estimate-box.is-error .verdict,
+    .estimate-box.is-error .mark { color: #F59E0B; }
+    .estimate-box.is-error .mark {
+      font-weight: 800; display: inline-flex; align-items: center;
+      justify-content: center; width: 16px; height: 16px; flex: 0 0 16px;
+      border: 1.5px solid #F59E0B; border-radius: 50%; font-size: 11px;
+    }
+    /* CLI output is preformatted and can run long — wrap rather than
+       overflow the panel. */
+    .cfg-status-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+    /* Location picking. The backdrop stops intercepting clicks so the map
+       underneath stays usable, and the panel drops to a bar at the bottom. */
+    .pick-bar { display: none; }
+    .settings-backdrop.picking {
+      background: transparent; pointer-events: none; align-items: flex-end;
+    }
+    .settings-backdrop.picking .settings-panel {
+      pointer-events: auto; max-width: 560px; width: calc(100% - 32px);
+      margin-bottom: 20px; padding: 14px 16px; max-height: none;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.45);
+    }
+    .settings-backdrop.picking .settings-panel > h2,
+    .settings-backdrop.picking .settings-tabs,
+    .settings-backdrop.picking .settings-page,
+    .settings-backdrop.picking .settings-close { display: none; }
+    .settings-backdrop.picking .pick-bar {
+      display: flex; align-items: center; gap: 12px;
+    }
+    .pick-text { flex: 1; min-width: 0; }
+    .pick-title { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+    .pick-coords { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+    .btn-inline.btn-primary {
+      color: var(--bg-primary); background: var(--accent);
+      border-color: var(--accent);
+    }
+    .btn-inline.btn-primary:hover { filter: brightness(1.1); background: var(--accent); }
+    .btn-inline:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn-inline.btn-primary:disabled { background: var(--accent); }
     .field { margin-bottom: 16px; }
     .field label {
       display: flex; justify-content: space-between; align-items: baseline;
@@ -198,6 +336,20 @@
       font-family: inherit; outline: none;
     }
     .coord-row input:focus { border-color: var(--accent); }
+    .coord-readout {
+      flex: 1; min-width: 0; background: var(--bg-primary);
+      color: var(--text-primary); border: 1px solid var(--border);
+      border-radius: 8px; padding: 9px 11px; font-size: 13px;
+      display: flex; align-items: center;
+    }
+    .btn-inline {
+      background: transparent; color: var(--accent);
+      border: 1px solid var(--border); border-radius: 8px;
+      padding: 0 14px; min-height: 44px; font: inherit; font-size: 13px;
+      font-weight: 600; cursor: pointer; white-space: nowrap;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .btn-inline:hover { border-color: var(--accent); background: var(--bg-elevated); }
     /* Accent callout — same treatment as the share modal's URL box. */
     .estimate-box {
       background: rgba(0,229,255,0.06); border: 1px solid rgba(0,229,255,0.2);
@@ -228,7 +380,10 @@
       color: var(--text-muted); cursor: not-allowed;
     }
     .icon-btn {
-      width: 30px; height: 30px;
+      /* 44px is the touch-target minimum. Operators have built mobile
+         touchscreen builds of the local UI and have to be able to hit
+         these; --header-h is sized to fit them. */
+      width: 44px; height: 44px;
       border: 1px solid var(--border);
       background: transparent;
       color: var(--text-dim);
@@ -250,7 +405,7 @@
     /* ========== Main layout (sidebar + map) ========== */
     .main {
       display: flex;
-      height: calc(100% - 44px - 28px);  /* minus header, minus status bar */
+      height: calc(100% - var(--header-h) - 28px);  /* minus header, minus status bar */
     }
     .sidebar {
       width: 340px;
@@ -278,21 +433,29 @@
       gap: 4px;
       font-size: 12px;
     }
+    /* Matches nodes.html .health-row (156-162) so the offline panel and the
+       online node card are visually the same component. */
     .feeder-row {
-      display: grid;
-      grid-template-columns: 20px 60px 1fr;
-      gap: 8px;
-      align-items: center;
-      color: var(--text-dim);
+      display: flex; align-items: center; gap: 6px;
+      font-size: 12px; padding: 7px 0;
+      border-bottom: 1px solid rgba(30,58,110,0.5);
     }
-    .feeder-icon { text-align: center; opacity: 0.7; }
-    .feeder-label { font-weight: 600; color: var(--text-primary); }
-    .feeder-status { font-family: var(--font-mono, monospace); font-size: 11px; }
-    .feeder-status.ok      { color: var(--fresh-live); }
-    .feeder-status.warn    { color: var(--fresh-recent); }
-    .feeder-status.fault   { color: var(--fresh-older); }
-    .feeder-status.absent  { color: var(--text-muted); font-style: italic; }
-    .feeder-status.stale   { color: var(--text-muted); }
+    .feeder-row:last-child { border-bottom: none; }
+    .feeder-icon, .health-icon {
+      width: 16px; height: 14px; flex: 0 0 16px;
+    }
+    .ic-ble  { color: #3b82f6; }
+    .ic-wifi { color: #6366f1; }
+    .ic-loc  { color: #64748b; }
+    .ic-gps  { color: #10b981; }
+    .feeder-label { width: 64px; flex: 0 0 64px; color: var(--text-dim); }
+    .feeder-status {
+      font-weight: 600; min-width: 0;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .health-meta {
+      color: #64748b; font-size: 10px; font-family: monospace; font-weight: 400;
+    }
     .chip {
       display: inline-flex;
       align-items: center;
@@ -461,6 +624,7 @@
       width: 96px;
       height: 96px;
       opacity: 0.7;
+      color: var(--brand);
     }
     .empty .title { font-size: 14px; font-weight: 700; color: var(--text-dim); }
     .empty .sub { font-size: 12px; }
@@ -795,13 +959,54 @@
 </head>
 <body>
   <!-- Header -->
+  <!-- Brand artwork, defined ONCE. Both visible instances below are <use>
+       references, so a future revision is a single edit rather than the
+       three near-identical copies this replaced. Stroke is currentColor so
+       the color comes from --brand via CSS, not a hardcoded hex. -->
+  <svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" aria-hidden="true"
+       style="position:absolute">
+    <symbol id="brand-plane" viewBox="65 200 250 245">
+      <g fill="none" stroke="currentColor" stroke-width="15"
+         stroke-linecap="round" stroke-linejoin="round"
+         transform="translate(-35 2.5)">
+        <path d="M283.2 351.8 L250 420 L216 330 L120 300 L192.8 266.6 L247.4 241.6 L302 216.5 L268 274 L333 249.5 L308.1 300.7 Z"/>
+        <path d="M216 330 L268 274"/>
+      </g>
+    </symbol>
+    <symbol id="ic-bluetooth" viewBox="0 0 24 24">
+      <path d="M6.5 6.5 17.5 17.5 12 23 12 1 17.5 6.5 6.5 17.5" fill="none"
+            stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+    <symbol id="ic-wifi" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round">
+        <path d="M1.42 9a16 16 0 0 1 21.16 0"/>
+        <path d="M5 12.55a11 11 0 0 1 14.08 0"/>
+        <path d="M8.53 16.11a6 6 0 0 1 6.95 0"/>
+        <path d="M12 20h.01"/>
+      </g>
+    </symbol>
+    <symbol id="ic-pin" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
+        <circle cx="12" cy="10" r="3"/>
+      </g>
+    </symbol>
+    <symbol id="ic-gps" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="7"/>
+        <path d="M12 1v3M12 20v3M1 12h3M20 12h3"/>
+        <circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"/>
+      </g>
+    </symbol>
+  </svg>
+
   <div class="header">
     <a href="/" class="brand-wordmark" title="DroneAware Local Viewer">
-      <!-- Brand mark SVG: paper airplane, green #10b981 (fixed) -->
-      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-        <path d="M22 2L11 13" stroke="#10b981" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-        <path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="#10b981" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-      </svg>
+      <svg role="img" aria-label="DroneAware"><use href="#brand-plane"/></svg>
       <span><span class="brand-name">DroneAware</span><span class="brand-tld">.io</span></span>
     </a>
     <div class="header-center">
@@ -816,7 +1021,7 @@
     <div class="header-right">
       <button class="icon-btn" id="btn-units" title="Toggle units (imperial / metric)" aria-label="Toggle units" style="font-size: 12px; font-weight: 700; letter-spacing: 0.5px;">ft</button>
       <button class="icon-btn" id="btn-theme" title="Toggle theme" aria-label="Toggle theme">◐</button>
-      <button class="icon-btn" id="btn-settings" title="Settings" aria-label="Settings">⚙</button>
+      <button class="icon-btn" id="btn-settings" title="Settings" aria-label="Settings" style="font-size: 17px;">☰</button>
     </div>
   </div>
 
@@ -829,19 +1034,24 @@
            check for BLE). -->
       <div class="feeders-panel" id="feeders-panel">
         <div class="feeder-row" data-feeder="ble">
-          <span class="feeder-icon">📶</span>
+          <svg class="feeder-icon ic-ble"><use href="#ic-bluetooth"/></svg>
           <span class="feeder-label">BLE</span>
           <span class="feeder-status" data-role="ble-status">—</span>
         </div>
         <div class="feeder-row" data-feeder="wifi_2g">
-          <span class="feeder-icon">📡</span>
+          <svg class="feeder-icon ic-wifi"><use href="#ic-wifi"/></svg>
           <span class="feeder-label">2.4 GHz</span>
           <span class="feeder-status" data-role="wifi_2g-status">—</span>
         </div>
         <div class="feeder-row" data-feeder="wifi_5g">
-          <span class="feeder-icon">📡</span>
+          <svg class="feeder-icon ic-wifi"><use href="#ic-wifi"/></svg>
           <span class="feeder-label">5 GHz</span>
           <span class="feeder-status" data-role="wifi_5g-status">—</span>
+        </div>
+        <div class="feeder-row" data-feeder="location" id="row-location" hidden>
+          <svg class="health-icon ic-loc" id="loc-icon"><use href="#ic-pin"/></svg>
+          <span class="feeder-label" id="loc-label">Location</span>
+          <span class="feeder-status mono" id="loc-value">—</span>
         </div>
       </div>
       <div class="sidebar-filters">
@@ -860,10 +1070,7 @@
       </div>
       <div class="sidebar-list" id="sidebar-list">
         <div class="empty" id="empty-state">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-            <path d="M22 2L11 13" stroke="#10b981" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="#10b981" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-          </svg>
+          <svg aria-hidden="true"><use href="#brand-plane"/></svg>
           <div class="title">No drones detected</div>
           <div class="sub">Your node is scanning.</div>
         </div>
@@ -928,33 +1135,58 @@
   <div class="settings-backdrop" id="settings-backdrop">
     <div class="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title">
       <button class="settings-close" id="settings-close" aria-label="Close">&times;</button>
-      <h2 id="settings-title">Offline map</h2>
+      <h2 id="settings-title">Settings</h2>
+
+      <div class="settings-tabs" role="tablist">
+        <button class="settings-tab is-active" id="tab-map" data-page="map"
+                role="tab" aria-selected="true" aria-controls="page-map">Map</button>
+        <button class="settings-tab" id="tab-node" data-page="node"
+                role="tab" aria-selected="false" aria-controls="page-node">Node</button>
+      </div>
+
+      <section class="settings-page" id="page-map" role="tabpanel" aria-labelledby="tab-map">
       <p class="lede">
         This node ships a world overview that is deliberately coarse. Download
         detail for your own area so the map still works with no internet.
       </p>
 
       <div class="field">
-        <label for="om-radius">Area around the node <b><span id="om-radius-val">10</span> km</b></label>
-        <input type="range" id="om-radius" min="1" max="20" step="1" value="10">
+        <!-- Default covers the outermost distance ring. Below that the
+             basemap stops exactly where the rings are still drawn, which
+             reads as a broken map rather than a small download. -->
+        <label for="om-radius">Area around the node <b><span id="om-radius-val">20</span> km</b></label>
+        <input type="range" id="om-radius" min="1" max="30" step="1" value="20">
       </div>
 
       <div class="field">
-        <label for="om-zoom">Detail <b><span id="om-zoom-val">—</span></b></label>
-        <input type="range" id="om-zoom" min="7" max="19" step="1" value="16">
-      </div>
-
-      <div class="field">
-        <label>Centre <b id="om-center-src">node location</b></label>
+        <label>Center <b id="om-center-src">node location</b></label>
+        <!-- Read-only here on purpose. The node's position is node
+             configuration, not a map setting, so it is edited in one
+             place — the Node tab — rather than in two that can disagree. -->
         <div class="coord-row">
-          <input type="text" id="om-lat" inputmode="decimal" placeholder="latitude">
-          <input type="text" id="om-lon" inputmode="decimal" placeholder="longitude">
+          <span class="coord-readout mono" id="om-center">—</span>
+          <button class="btn-inline" id="om-edit-center" type="button">Edit</button>
         </div>
       </div>
 
       <div class="estimate-box">
-        <div class="estimate-row"><span>Map tiles</span><b id="om-tiles">—</b></div>
-        <div class="estimate-row"><span>Download size</span><b id="om-size">—</b></div>
+        <!-- Three densities, not one number. Measured spread at the same
+             radius is ~47x between open country and a dense city, so a
+             single figure would be wrong nearly everywhere. -->
+        <div class="density-table">
+          <div class="density-col">
+            <span class="density-head">Rural</span>
+            <b id="om-rural">—</b>
+          </div>
+          <div class="density-col">
+            <span class="density-head">Suburban</span>
+            <b id="om-suburban">—</b>
+          </div>
+          <div class="density-col">
+            <span class="density-head">City</span>
+            <b id="om-city">—</b>
+          </div>
+        </div>
         <div class="estimate-row"><span>Free space</span><b id="om-free">—</b></div>
         <div class="verdict" id="om-verdict">
           <span class="mark" id="om-mark"></span>
@@ -963,10 +1195,37 @@
       </div>
 
       <button class="btn-download" id="om-download" disabled>Download offline map</button>
+      </section>
+
+      <section class="settings-page" id="page-node" role="tabpanel"
+               aria-labelledby="tab-node" hidden>
+        <div class="node-ident">
+          <span class="node-ident-label">Editing node</span>
+          <span class="node-ident-id mono" id="cfg-node-id">—</span>
+        </div>
+
+        <div id="cfg-form"></div>
+
+        <button class="btn-download" id="cfg-save">Save changes</button>
+      </section>
+
+      <!-- Shown INSTEAD of the pages while picking a location on the map.
+           The panel shrinks to this bar so the map underneath is tappable. -->
+      <div class="pick-bar" id="pick-bar">
+        <div class="pick-text">
+          <div class="pick-title">Tap the map to place this node</div>
+          <div class="pick-coords mono" id="pick-coords">nothing selected yet</div>
+        </div>
+        <button class="btn-inline" id="pick-cancel" type="button">Cancel</button>
+        <button class="btn-inline btn-primary" id="pick-update" type="button" disabled>Update</button>
+      </div>
     </div>
   </div>
 
   <script src="/static/leaflet.js"></script>
+  <!-- Vector renderer for Protomaps region packs. Vendored, not CDN — this
+       UI has to work with no internet, which is the whole point of it. -->
+  <script src="/static/protomaps-leaflet.js"></script>
 
   <script>
     "use strict";
@@ -1010,6 +1269,10 @@
       // bundle that doesn't exist on this node.
       tileSource: (typeof navigator !== "undefined" && navigator.onLine === false) ? "local" : "cartocdn",
       tilesLocalAvailable: false,
+      // A Protomaps region pack, if one has been downloaded. Outranks both
+      // other sources when present: street-level detail at any zoom, both
+      // themes from one file, and no network at all.
+      mapPackAvailable: false,
       // Display units: "imperial" (ft AGL / mph / mi rings) or "metric"
       // (m AGL / km/h / km rings). Persisted per-browser in localStorage.
       // Default imperial — matches US operator majority; international
@@ -1075,6 +1338,21 @@
       const url = TILE_URLS[source][theme];
 
       if (state.tileLayer) state.map.removeLayer(state.tileLayer);
+
+      // A downloaded region pack wins over both other sources. It is vector,
+      // so one archive covers every zoom and both themes — the flavor is a
+      // render option, not a second download. protomaps-leaflet supplies its
+      // own "Protomaps © OpenStreetMap" attribution, which is what ODbL
+      // requires; do not hand-roll it here.
+      if (state.mapPackAvailable) {
+        state.tileLayer = protomapsL.leafletLayer({
+          url: "/map.pmtiles",
+          flavor: theme === "day" ? "light" : "dark",
+          lang: "en",
+        }).addTo(state.map);
+        if (state.home) drawHomeView(state.home);
+        return;
+      }
 
       const opts = {
         attribution: source === "cartocdn"
@@ -1174,6 +1452,11 @@
     const MILE_METERS = 1609.344;
     const KM_METERS = 1000;
     const RING_COUNT = 10;
+    // Which distance ring the map frames on first load. Ten rings zoomed to
+    // fit puts the node in a county-wide view where nothing is legible;
+    // three is close enough to read streets while still showing more area
+    // than a drone is likely to be detected in.
+    const DEFAULT_RING_FIT = 3;
 
     // Distance-ring stroke for the active theme. The map uses
     // preferCanvas:true, so ring strokes are painted to a <canvas> and CSS
@@ -1201,15 +1484,26 @@
       state.homeLayer.clearLayers();
       const center = [home.lat, home.lon];
 
+      const stepMeters = state.units === "metric" ? KM_METERS : MILE_METERS;
+      const unitLabel  = state.units === "metric" ? "km" : "mi";
+
       // Recenter + zoom the map on the FIRST home draw only. On mobile
       // nodes the GPS fix updates every ~2s and re-calling setView here
       // would wipe out any manual pan/zoom the operator has done. The
       // rings/marker below still redraw at the new position, so the map
       // stays accurate — the user's chosen view just isn't blown away.
-      if (isFirstDraw) state.map.setView(center, 11);
-
-      const stepMeters = state.units === "metric" ? KM_METERS : MILE_METERS;
-      const unitLabel  = state.units === "metric" ? "km" : "mi";
+      //
+      // Frame the DEFAULT_RING_FIT ring rather than hardcoding a zoom
+      // number: the right zoom depends on the viewport, and a phone and a
+      // desktop do not agree on it. toBounds() takes the full width of the
+      // box, so it is the ring's diameter, not its radius.
+      if (isFirstDraw) {
+        // toBounds() takes the full width of the box, so it is the ring's
+        // diameter, not its radius. Viewport-relative rather than a
+        // hardcoded zoom number, so it lands sensibly on a phone too.
+        const fit = L.latLng(center).toBounds(2 * DEFAULT_RING_FIT * stepMeters);
+        state.map.setView(center, state.map.getBoundsZoom(fit, true));
+      }
       const ring       = ringStyle();
 
       // Concentric distance rings, dashed. Colour comes from the active
@@ -1659,39 +1953,124 @@
        from /api/status.feeders. Mirrors My Nodes' visual layout so the
        operator sees consistent status whether they're on the online
        dashboard or the offline node UI. */
+    /* Mirrors nodes.html's node-card health block field for field, so an
+       operator reads the SAME sentence about their hardware on droneaware.io
+       and on the node itself. Colors, dots, wording and the strict === tests
+       are all taken from there deliberately — the two surfaces disagreeing is
+       precisely what confuses people when something is wrong.
+
+       Server source: nodes.html _bandRow() ~1001-1062, BLE block ~928-945. */
+    const HEALTH = {
+      ok:      "#10b981",
+      fault:   "#f87171",
+      unknown: "#475569",
+      stale:   "#fb923c",
+      meta:    "#64748b",
+    };
+    const MODE_DOT   = { lock: "\u25CF", dwell: "\u25D0", sweep: "\u25D1" };
+    const MODE_LABEL = {
+      dwell: " \u00B7 dwelling",
+      sweep: " \u00B7 sweeping",
+    };
+
+    function _statusEl(el, color, dot, text, meta) {
+      el.replaceChildren();
+      el.style.color = color;
+      if (dot) el.appendChild(document.createTextNode(dot + " "));
+      el.appendChild(document.createTextNode(text));
+      if (meta) {
+        const m = document.createElement("span");
+        m.className = "health-meta";
+        m.textContent = ` (${meta})`;
+        el.appendChild(m);
+      }
+    }
+
     function renderFeeders(feeders) {
       if (!feeders) return;
-      const bands = [
-        { key: "ble",     label: "BLE" },
-        { key: "wifi_2g", label: "2.4 GHz" },
-        { key: "wifi_5g", label: "5 GHz" },
-      ];
-      for (const {key} of bands) {
+
+      // ---- BLE -------------------------------------------------------------
+      const bleEl = document.querySelector('[data-role="ble-status"]');
+      const b = feeders.ble;
+      if (bleEl) {
+        if (!b) {
+          _statusEl(bleEl, HEALTH.unknown, "", "\u2014");
+        } else {
+          // === false throughout: a feeder older than v1.5.2.2 omits
+          // `scanning` entirely, and a falsy test would make every legacy
+          // node claim a broken radio.
+          const ok   = b.ble_ok;
+          const deaf = ok === true && b.scanning === false;
+          const where = b.adapter_bus === "onboard" ? " onboard"
+                      : b.adapter_bus === "usb"
+                          ? (b.adapter_usb_id ? " adapter " + b.adapter_usb_id : " adapter")
+                          : "";
+          const meta = b.adapter ? `${b.adapter}${where}` : "";
+          if (deaf)             _statusEl(bleEl, HEALTH.fault,   "", "Not scanning", meta);
+          else if (ok === true) _statusEl(bleEl, HEALTH.ok, "",
+                                  b.scanning === true ? "OK \u2014 scanning" : "OK", meta);
+          else if (ok === false) _statusEl(bleEl, HEALTH.fault, "",
+                                  b.ble_fault ? `Fault: ${b.ble_fault}` : "Fault", meta);
+          else                   _statusEl(bleEl, HEALTH.unknown, "", "\u2014", meta);
+        }
+      }
+
+      // ---- WiFi bands ------------------------------------------------------
+      for (const [key, band] of [["wifi_2g", "2g"], ["wifi_5g", "5g"]]) {
         const el = document.querySelector(`[data-role="${key}-status"]`);
         if (!el) continue;
         const f = feeders[key];
-        if (!f) { el.textContent = "unknown"; el.className = "feeder-status stale"; continue; }
+        if (!f) { _statusEl(el, HEALTH.unknown, "\u2022", "\u2014"); continue; }
+
+        // Locally this is the state file going stale; on the server it is the
+        // per-band freshness flag. Same failure either way: the feeder for
+        // this band has stopped reporting and its last value would otherwise
+        // sit there looking green.
         if (f.stale) {
-          el.textContent = `stale (${f.age_sec}s)`;
-          el.className = "feeder-status stale";
+          _statusEl(el, HEALTH.stale, "\u26A0",
+                    "Not reporting \u2014 feeder down", f.iface);
           continue;
         }
-        const mode = f.scan_mode || "?";
-        const iface = f.iface ? ` (${f.iface})` : "";
+        const mode = f.scan_mode;
         if (mode === "absent") {
-          el.textContent = `Absent — no capable adapter`;
-          el.className = "feeder-status absent";
-        } else if (f.wifi_fault) {
-          el.textContent = `Fault: ${f.wifi_fault}${iface}`;
-          el.className = "feeder-status fault";
+          // Never tag an absent row with an adapter.
+          _statusEl(el, HEALTH.unknown, "\u25CB", "Absent \u2014 no capable adapter");
+        } else if (f.wifi_ok === true) {
+          const lockLabel = band === "5g"
+            ? " \u00B7 continuous (149 lock)" : " \u00B7 continuous (ch 6 lock)";
+          const label = mode === "lock" ? lockLabel
+                      : MODE_LABEL[mode] !== undefined ? MODE_LABEL[mode]
+                      : (mode ? " \u00B7 " + mode : "");
+          _statusEl(el, HEALTH.ok, MODE_DOT[mode] || "\u2022", "OK" + label, f.iface);
         } else if (f.wifi_ok === false) {
-          el.textContent = `not scanning${iface}`;
-          el.className = "feeder-status warn";
+          _statusEl(el, HEALTH.fault, "\u25CF",
+                    f.wifi_fault ? `Fault: ${f.wifi_fault}` : "Fault", f.iface);
         } else {
-          el.textContent = `OK · ${mode}${iface}`;
-          el.className = "feeder-status ok";
+          _statusEl(el, HEALTH.unknown, "\u2022", "\u2014", f.iface);
         }
       }
+    }
+
+    function renderLocation(status) {
+      const row = document.getElementById("row-location");
+      if (!row) return;
+      row.hidden = false;
+      const home = status.home;
+      // Label keys off hardware + config, not off whether a fix has landed,
+      // so a mobile node reads "Live GPS / Awaiting fix" rather than
+      // silently calling itself static.
+      const live = !!(status.mobile && status.has_gps);
+      document.getElementById("loc-label").textContent = live ? "Live GPS" : "Location";
+      const icon = document.getElementById("loc-icon");
+      icon.firstElementChild.setAttribute("href", live ? "#ic-gps" : "#ic-pin");
+      // setAttribute, not .className: on an SVG element className is a
+      // read-only SVGAnimatedString and assigning to it throws.
+      icon.setAttribute("class", "health-icon " + (live ? "ic-gps" : "ic-loc"));
+      document.getElementById("loc-value").textContent =
+        (home && home.lat != null && home.lon != null)
+          ? `${home.lat.toFixed(4)}, ${home.lon.toFixed(4)}`
+            + (home.elevation_agl_m != null ? ` \u00B7 ${home.elevation_agl_m}m AGL` : "")
+          : (live ? "Awaiting fix\u2026" : "Location not set");
     }
 
     async function refreshStatus() {
@@ -1700,6 +2079,7 @@
         if (!r.ok) return;
         const s = await r.json();
         renderFeeders(s.feeders);
+        renderLocation(s);
         document.getElementById("stat-buffer").textContent =
           `${s.buffer_pct}% (${(s.buffer_bytes / 1e6).toFixed(1)} MB)`;
         document.getElementById("stat-cpu").textContent =
@@ -1715,6 +2095,14 @@
         // we started in offline mode (we couldn't swap at init because
         // tilesLocalAvailable was unknown). After the first /api/status,
         // tileerror-driven fallback also becomes possible.
+        // A region pack outranks everything else, so apply it as soon as
+        // the first status confirms one exists — including when we started
+        // on CartoDB because the browser reported itself online.
+        if (s.map_pack && !state.mapPackAvailable) {
+          state.mapPackAvailable = true;
+          applyMapTheme();
+        }
+
         if (s.tiles_local && !state.tilesLocalAvailable) {
           state.tilesLocalAvailable = true;
           if (state.tileSource === "local") {
@@ -2109,17 +2497,28 @@ ${multiSerialHTML}
       open() {
         document.getElementById("settings-backdrop").classList.add("open");
         om.refresh();
+        om.fillNode();
       },
       close() {
         document.getElementById("settings-backdrop").classList.remove("open");
       },
+      showPage(name) {
+        document.querySelectorAll(".settings-tab").forEach(t => {
+          const on = t.dataset.page === name;
+          t.classList.toggle("is-active", on);
+          t.setAttribute("aria-selected", on ? "true" : "false");
+        });
+        document.querySelectorAll(".settings-page").forEach(p => {
+          p.hidden = (p.id !== `page-${name}`);
+        });
+      },
+      async fillNode() { return cfg.load(); },
       async refresh() {
         const radius = document.getElementById("om-radius").value;
         document.getElementById("om-radius-val").textContent = radius;
-        const lat = document.getElementById("om-lat").value.trim();
-        const lon = document.getElementById("om-lon").value.trim();
-        let url = `/api/offline-map/estimate?radius_km=${encodeURIComponent(radius)}`;
-        if (lat && lon) url += `&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}`;
+        // Always centered on the node. The operator changes where that is
+        // on the Node tab, not here.
+        const url = `/api/offline-map/estimate?radius_km=${encodeURIComponent(radius)}`;
         let d;
         try {
           const r = await fetch(url);
@@ -2130,63 +2529,40 @@ ${multiSerialHTML}
         if (d.error) return om.fail(d.detail || "This node does not know where it is.");
         om.est = d;
 
-        // Populate the centre boxes from whatever the node resolved, so the
-        // operator sees the default rather than an empty field they have to
-        // guess at.
-        if (!lat) document.getElementById("om-lat").value = d.center.lat.toFixed(5);
-        if (!lon) document.getElementById("om-lon").value = d.center.lon.toFixed(5);
+        document.getElementById("om-center").textContent =
+          `${d.center.lat.toFixed(5)}, ${d.center.lon.toFixed(5)}`;
 
-        // Bound the detail slider to what this region can actually offer, and
-        // land on the suggested depth the first time through.
-        const zEl = document.getElementById("om-zoom");
-        const zooms = d.zooms.map(z => z.maxzoom);
-        zEl.min = Math.min(...zooms);
-        zEl.max = Math.max(...zooms);
-        if (om.est_first !== d.radius_km) {
-          zEl.value = d.recommended_maxzoom || d.deepest_allowed_maxzoom || zEl.min;
-          om.est_first = d.radius_km;
-        }
         om.render();
       },
       render() {
         const d = om.est; if (!d) return;
-        const z = parseInt(document.getElementById("om-zoom").value, 10);
-        const row = d.zooms.find(x => x.maxzoom === z);
-        if (!row) return;
+        const e = d.estimates;
+        document.getElementById("om-rural").textContent    = om.fmtBytes(e.rural);
+        document.getElementById("om-suburban").textContent = om.fmtBytes(e.suburban);
+        document.getElementById("om-city").textContent     = om.fmtBytes(e.city);
+        document.getElementById("om-free").textContent =
+          om.fmtBytes(d.disk.free_bytes);
 
-        // "Detail" rather than a zoom number: z17 means nothing to most
-        // operators, but "streets" and "buildings" do.
-        const label = z <= 10 ? "region" : z <= 13 ? "towns"
-                    : z <= 15 ? "main roads" : z <= 17 ? "streets" : "buildings";
-        document.getElementById("om-zoom-val").textContent = label;
-        document.getElementById("om-tiles").textContent = row.tiles.toLocaleString();
-        document.getElementById("om-size").textContent = om.fmtBytes(row.bytes);
-        document.getElementById("om-free").textContent = om.fmtBytes(d.disk.free_bytes);
-
-        const v = document.getElementById("om-verdict");
+        const v    = document.getElementById("om-verdict");
         const mark = document.getElementById("om-mark");
         const text = document.getElementById("om-verdict-text");
-        const btn = document.getElementById("om-download");
+        const btn  = document.getElementById("om-download");
 
-        if (row.fits) {
+        // Judged against the CITY figure. Saying it fits and then filling
+        // someone's card is the failure that matters; overstating the
+        // requirement only costs them a smaller radius.
+        if (d.fits) {
           v.className = "verdict ok"; mark.textContent = "\u2713";
-          text.textContent = `About ${om.fmtBytes(row.bytes)}, leaving `
-            + `${om.fmtBytes(d.disk.free_bytes - row.bytes)} free. `
-            + `Sizes are approximate — dense cities run larger than open country.`;
+          text.textContent = `Pick the column that matches your area. Even a `
+            + `city-density download leaves `
+            + `${om.fmtBytes(d.disk.free_bytes - d.worst_case_bytes)} free.`;
           btn.disabled = false;
         } else {
           v.className = "verdict bad"; mark.textContent = "\u2717";
-          // The two failures have different answers, so they get different
-          // sentences. Telling someone to free disk space when the real
-          // problem is that they asked for 15 GB sends them off fixing the
-          // wrong thing.
-          text.textContent = row.reason === "not_enough_space"
-            ? `Needs ${om.fmtBytes(row.bytes)} but only `
-              + `${om.fmtBytes(d.disk.usable_bytes)} is available once space is `
-              + `reserved for detection logs. Reduce the area or the detail.`
-            : `${om.fmtBytes(row.bytes)} is more than this node will download in `
-              + `one go. That is hours of transfer and heavy wear on the SD card `
-              + `for a map. Reduce the area or the detail.`;
+          text.textContent = `A city-density area at this radius needs `
+            + `${om.fmtBytes(d.worst_case_bytes)}, but only `
+            + `${om.fmtBytes(d.disk.usable_bytes)} is free once space is kept `
+            + `for detection logs. Reduce the area.`;
           btn.disabled = true;
         }
       },
@@ -2198,18 +2574,431 @@ ${multiSerialHTML}
       },
     };
 
+    /* ----- Node configuration editor (Node tab) -----
+       Renders from the schema the API returns rather than hardcoding fields
+       here, so adding a setting is a server-side change only. Everything is
+       built with textContent / createElement — config values are echoed back
+       into the page, and innerHTML would make that an injection path. */
+    const cfg = {
+      loaded: null,
+      async load() {
+        const host = document.getElementById("cfg-form");
+        let d;
+        try {
+          d = await (await fetch("/api/config")).json();
+        } catch (e) {
+          host.textContent = "Could not read the node configuration.";
+          return;
+        }
+        if (d.error) {
+          host.textContent = d.detail || "Configuration unavailable.";
+          return;
+        }
+        cfg.loaded = d.values;
+        cfg.specs = {};
+        document.getElementById("cfg-node-id").textContent = d.node_id || "unknown";
+        host.replaceChildren();
+        for (const group of d.schema) {
+          const h = document.createElement("h3");
+          h.className = "cfg-group";
+          h.textContent = group.group;
+          host.appendChild(h);
+          for (const f of group.fields) {
+            cfg.specs[f.key] = f;
+            host.appendChild(cfg.field(f, d.values[f.key] ?? ""));
+          }
+          if (group.widget === "adapters") await cfg.adapterWidget(host);
+          if (group.widget === "defaults") {
+            const bar = document.createElement("div");
+            bar.className = "action-row";
+            const b = document.createElement("button");
+            b.type = "button";
+            b.className = "btn-inline";
+            b.textContent = "Restore defaults";
+            b.title = "Put this section back to the values the node ships with";
+            b.addEventListener("click", () => {
+              // Fills the fields only — the operator still reviews and
+              // presses Save, same as any other edit.
+              for (const f of group.fields) {
+                if (f.default == null) continue;
+                const el = document.getElementById(`cfg-${f.key}`);
+                if (el) el.value = cfg.toDisplay(f, f.default);
+              }
+              cfg.status(`${group.group} restored to defaults — press `
+                + `"Save changes" to apply.`, false, b);
+            });
+            bar.appendChild(b);
+            host.appendChild(bar);
+          }
+          if (group.widget === "pickmap") {
+            const bar = document.createElement("div");
+            bar.className = "action-row";
+            const b = document.createElement("button");
+            b.type = "button";
+            b.className = "btn-inline";
+            b.textContent = "Select on map";
+            b.title = "Pick the node's position by tapping the map";
+            b.addEventListener("click", pick.start);
+            bar.appendChild(b);
+            host.appendChild(bar);
+          }
+        }
+        cfg.updateCheck();
+      },
+      // Non-blocking: a node with no internet is the normal case, and the
+      // panel must not stall waiting for GitHub to time out.
+      async updateCheck() {
+        const host = document.getElementById("cfg-form");
+        let d;
+        try {
+          d = await (await fetch("/api/update-check")).json();
+        } catch (e) { return; }
+        const box = document.createElement("div");
+        box.className = "estimate-box";
+        const row = document.createElement("div");
+        row.className = "adapter-row";
+        const txt = document.createElement("div");
+        txt.className = "adapter-name";
+        if (!d.reachable) {
+          txt.textContent = `Firmware ${d.current} — could not reach GitHub to check for updates.`;
+        } else if (d.available) {
+          txt.textContent = `Update available: ${d.latest} (this node runs ${d.current}).`;
+        } else {
+          txt.textContent = `Firmware ${d.current} is up to date.`;
+        }
+        row.appendChild(txt);
+        if (d.available) {
+          row.appendChild(cfg.actionBtn("update", `Install ${d.latest}`,
+            "Download and install the latest release, then restart the feeders."));
+        }
+        box.appendChild(row);
+        const h = document.createElement("h3");
+        h.className = "cfg-group";
+        h.textContent = "Firmware";
+        host.appendChild(h);
+        host.appendChild(box);
+      },
+      // Bytes are stored, megabytes are shown. Nobody reasons about a
+      // buffer in bytes, and the config file has to keep the unit the
+      // feeders already parse.
+      MB: 1048576,
+      toDisplay(f, raw) {
+        if (f.type !== "megabytes" || raw === "" || raw == null) return raw ?? "";
+        const n = Number(raw);
+        return Number.isFinite(n) ? String(Math.round(n / cfg.MB)) : raw;
+      },
+      toStored(f, val) {
+        if (f.type !== "megabytes" || val === "") return val;
+        const n = Number(val);
+        return Number.isFinite(n) ? String(Math.round(n * cfg.MB)) : val;
+      },
+      field(f, value) {
+        const wrap = document.createElement("div");
+        wrap.className = "field";
+        const label = document.createElement("label");
+        label.setAttribute("for", `cfg-${f.key}`);
+
+        const name = document.createElement("span");
+        name.textContent = f.label;
+        label.appendChild(name);
+
+        // "i" toggles the explanation rather than showing it always — seven
+        // paragraphs of scanning theory open by default would bury the
+        // controls they describe.
+        if (f.info) {
+          const i = document.createElement("button");
+          i.type = "button";
+          i.className = "cfg-info-btn";
+          i.textContent = "i";
+          i.setAttribute("aria-label", `What is ${f.label}?`);
+          i.setAttribute("aria-expanded", "false");
+          name.appendChild(i);
+        }
+        if (f.unit) {
+          const b = document.createElement("b");
+          b.textContent = f.unit;
+          label.appendChild(b);
+        }
+        wrap.appendChild(label);
+
+        if (f.info) {
+          const box = document.createElement("p");
+          box.className = "cfg-info";
+          box.textContent = f.info;
+          box.hidden = true;
+          wrap.appendChild(box);
+          label.querySelector(".cfg-info-btn").addEventListener("click", (e) => {
+            e.preventDefault();
+            box.hidden = !box.hidden;
+            e.target.setAttribute("aria-expanded", box.hidden ? "false" : "true");
+            e.target.classList.toggle("is-open", !box.hidden);
+          });
+        }
+
+        let input;
+        if (f.type === "bool") {
+          input = document.createElement("select");
+          for (const v of ["true", "false"]) {
+            const o = document.createElement("option");
+            o.value = v;
+            o.textContent = v === "true" ? "On" : "Off";
+            input.appendChild(o);
+          }
+          input.value = String(value).toLowerCase() === "true" ? "true" : "false";
+        } else {
+          input = document.createElement("input");
+          input.type = (f.type === "number" || f.type === "megabytes")
+            ? "number" : "text";
+          input.value = cfg.toDisplay(f, value);
+          if (f.placeholder) input.placeholder = f.placeholder;
+        }
+        input.id = `cfg-${f.key}`;
+        input.className = "cfg-input";
+        input.dataset.key = f.key;
+        wrap.appendChild(input);
+
+        if (f.help) {
+          const p = document.createElement("p");
+          p.className = "cfg-help";
+          p.textContent = f.help;
+          wrap.appendChild(p);
+        }
+        return wrap;
+      },
+      // Live hardware instead of two MAC text boxes. The roles are owned by
+      // the node's orchestration, so the only honest controls here are the
+      // ones that ask it to redo the assignment.
+      async adapterWidget(host) {
+        const box = document.createElement("div");
+        box.className = "estimate-box";
+        host.appendChild(box);
+        let d;
+        try {
+          d = await (await fetch("/api/adapters")).json();
+        } catch (e) {
+          box.textContent = "Could not read WiFi hardware.";
+          return;
+        }
+        for (const a of d.adapters) {
+          const row = document.createElement("div");
+          row.className = "adapter-row";
+
+          const left = document.createElement("div");
+          const nm = document.createElement("div");
+          nm.className = "adapter-name";
+          nm.textContent = a.name;
+          const meta = document.createElement("div");
+          meta.className = "adapter-meta mono";
+          meta.textContent = [a.iface, a.mac, a.driver, a.usb_id]
+            .filter(Boolean).join("  ·  ");
+          left.appendChild(nm);
+          left.appendChild(meta);
+
+          const role = document.createElement("span");
+          role.className = "adapter-role" + (a.onboard ? " is-onboard" : "");
+          role.textContent = a.role;
+
+          row.appendChild(left);
+          row.appendChild(role);
+          box.appendChild(row);
+        }
+
+        const bar = document.createElement("div");
+        bar.className = "action-row";
+        bar.appendChild(cfg.actionBtn("swap", "Swap 2.4 / 5 GHz",
+          "Exchange which adapter handles which band."));
+        bar.appendChild(cfg.actionBtn("refresh", "Refresh hardware",
+          "Re-detect adapters and reassign roles."));
+        host.appendChild(bar);
+      },
+      actionBtn(action, text, title) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "btn-inline";
+        b.textContent = text;
+        b.title = title;
+        b.addEventListener("click", () => cfg.runAction(action, b));
+        return b;
+      },
+      async runAction(action, btn) {
+        const label = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = "Working…";
+        let ok = false, message = "";
+        try {
+          const r = await (await fetch("/api/action", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action }),
+          })).json();
+          if (r.error) throw new Error(r.detail || r.error);
+          // The CLI restarts feeders, so poll rather than guess a duration.
+          for (let i = 0; i < 180; i++) {
+            await new Promise(res => setTimeout(res, 1000));
+            const s = await (await fetch("/api/action")).json();
+            if (!s.running && s.last) {
+              ok = s.last.ok;
+              message = ok ? `${action} completed.` : s.last.detail;
+              break;
+            }
+          }
+          if (!message) message = `${action} is still running.`;
+        } catch (e) {
+          message = `${action} failed: ${e.message}`;
+        }
+        btn.disabled = false;
+        btn.textContent = label;
+
+        // Only re-read on success — a reload rebuilds the form and would
+        // throw away the failure text the operator has to act on. On
+        // success the button is a new node, so find it again by its label.
+        let anchor = btn;
+        if (ok) {
+          await cfg.load();
+          anchor = [...document.querySelectorAll("#cfg-form .btn-inline")]
+            .find(b => b.textContent === label) || null;
+        }
+        cfg.status(message, !ok, anchor);
+      },
+      async save() {
+        if (!cfg.loaded) return;
+        // Send only what actually changed, so a save cannot rewrite a key
+        // the operator never touched.
+        const values = {};
+        document.querySelectorAll("#cfg-form [data-key]").forEach(el => {
+          const key = el.dataset.key;
+          // Compare in STORED units, not displayed ones — a megabytes field
+          // shows 50 for 52428800 and would otherwise look changed every time.
+          const stored = cfg.toStored(cfg.specs[key] || {}, el.value);
+          if (stored !== (cfg.loaded[key] ?? "")) values[key] = stored;
+        });
+        if (!Object.keys(values).length) {
+          return cfg.status("Nothing changed.", false);
+        }
+        let d;
+        try {
+          d = await (await fetch("/api/config", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ values }),
+          })).json();
+        } catch (e) {
+          return cfg.status("Could not reach the node.", true);
+        }
+        if (d.error) {
+          return cfg.status(d.detail || `Rejected: ${d.error}`, true);
+        }
+        Object.assign(cfg.loaded, values);
+        cfg.status(
+          `Saved ${d.written.length} setting${d.written.length === 1 ? "" : "s"}. `
+          + `Run "sudo droneaware refresh" on the node to apply.`, false);
+      },
+      // `anchor` is the control that caused the message. The status box is
+      // MOVED next to it rather than living at the bottom of the panel — a
+      // swap failure printed below a long scrolling form is a failure the
+      // operator never sees.
+      status(text, bad, anchor) {
+        // Built fresh each time rather than moving one element around the
+        // DOM: the anchor lives inside #cfg-form, and cfg.load()'s
+        // replaceChildren() would delete a relocated singleton outright —
+        // after which every later status call throws on a null node.
+        document.querySelectorAll(".cfg-status").forEach(e => e.remove());
+        const box = document.createElement("div");
+        box.className = "estimate-box cfg-status" + (bad ? " is-error" : "");
+        const verdict = document.createElement("div");
+        verdict.className = "verdict";
+        const mark = document.createElement("span");
+        mark.className = "mark";
+        mark.textContent = bad ? "!" : "✓";
+        const body = document.createElement("span");
+        body.className = "cfg-status-text";
+        body.textContent = text;
+        verdict.appendChild(mark);
+        verdict.appendChild(body);
+        box.appendChild(verdict);
+
+        if (anchor && anchor.isConnected) {
+          (anchor.closest(".action-row") || anchor).after(box);
+        } else {
+          document.getElementById("cfg-save").before(box);
+        }
+        box.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      },
+    };
+
+    /* ----- Pick the node's location by tapping the map -----
+       Typing coordinates is the worst possible input method on a
+       touchscreen, and operators have built touchscreen node displays. The
+       panel collapses to a bar so the map underneath stays tappable; the
+       backdrop stops swallowing clicks while this is active. */
+    const pick = {
+      lat: null, lon: null, marker: null,
+      start() {
+        pick.lat = pick.lon = null;
+        document.getElementById("pick-coords").textContent = "nothing selected yet";
+        document.getElementById("pick-update").disabled = true;
+        document.getElementById("settings-backdrop").classList.add("picking");
+        state.map.on("click", pick.onMap);
+        state.map.getContainer().style.cursor = "crosshair";
+      },
+      onMap(e) {
+        pick.lat = e.latlng.lat;
+        pick.lon = e.latlng.lng;
+        document.getElementById("pick-coords").textContent =
+          `${pick.lat.toFixed(5)}, ${pick.lon.toFixed(5)}`;
+        document.getElementById("pick-update").disabled = false;
+        if (pick.marker) state.map.removeLayer(pick.marker);
+        pick.marker = L.circleMarker(e.latlng, {
+          radius: 8, color: ringStyle().color, weight: 2,
+          fillColor: ringStyle().color, fillOpacity: 0.35,
+        }).addTo(state.map);
+      },
+      stop() {
+        state.map.off("click", pick.onMap);
+        state.map.getContainer().style.cursor = "";
+        if (pick.marker) { state.map.removeLayer(pick.marker); pick.marker = null; }
+        document.getElementById("settings-backdrop").classList.remove("picking");
+      },
+      apply() {
+        if (pick.lat == null) return;
+        // Fills the fields but does NOT save — the operator still reviews
+        // and presses Save, same as a typed edit.
+        const la = document.getElementById("cfg-NODE_LAT");
+        const lo = document.getElementById("cfg-NODE_LON");
+        if (la) la.value = pick.lat.toFixed(6);
+        if (lo) lo.value = pick.lon.toFixed(6);
+        pick.stop();
+        om.showPage("node");
+      },
+      get active() {
+        return document.getElementById("settings-backdrop")
+                       .classList.contains("picking");
+      },
+    };
+
+    document.getElementById("pick-cancel").addEventListener("click", pick.stop);
+    document.getElementById("pick-update").addEventListener("click", pick.apply);
+    document.getElementById("cfg-save").addEventListener("click", cfg.save);
     document.getElementById("btn-settings").addEventListener("click", om.open);
     document.getElementById("settings-close").addEventListener("click", om.close);
     document.getElementById("settings-backdrop").addEventListener("click", (e) => {
       if (e.target.id === "settings-backdrop") om.close();
     });
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") om.close();
+      if (e.key !== "Escape") return;
+      // While picking, Escape backs out of the pick — not out of Settings
+      // entirely, which would discard the edits they came here to make.
+      if (pick.active) pick.stop(); else om.close();
     });
+    document.querySelectorAll(".settings-tab").forEach(t =>
+      t.addEventListener("click", () => om.showPage(t.dataset.page)));
     document.getElementById("om-radius").addEventListener("input", om.refresh);
-    document.getElementById("om-zoom").addEventListener("input", om.render);
-    ["om-lat", "om-lon"].forEach(id =>
-      document.getElementById(id).addEventListener("change", om.refresh));
+    document.getElementById("om-edit-center").addEventListener("click", () => {
+      om.showPage("node");
+      // Draw the eye to the field they came here to change.
+      const el = document.getElementById("cfg-NODE_LAT");
+      if (el) { el.focus(); el.select && el.select(); }
+    });
 
   </script>
 </body>

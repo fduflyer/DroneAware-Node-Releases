@@ -59,38 +59,62 @@ import json
 import logging
 import math
 import os
+import re
 import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
+import urllib.request
 import time
 from queue import Empty, Full, Queue
 
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, send_file
 
 
 # ---- Version stamping (CI overwrites .ver file at build time) ---------------
 
-def _read_fw_version(fallback: str) -> str:
-    """Read embedded version file (written by build.sh into web_static/
-    before the PyInstaller --add-data call). Falls back to dev value
-    when running from source without a stamped .ver. The file lives
-    inside web_static/ because that's the directory PyInstaller bundles
-    via --add-data web_static:web_static — at runtime it resolves to
-    _MEIPASS/web_static/.ver."""
+# What `droneaware update` / install.sh record as the node's firmware. Used
+# as the fallback below, and by the update check.
+INSTALLED_VERSION_PATH = "/opt/droneaware/version"
+
+
+def _read_fw_version() -> str:
+    """Version of the running binary.
+
+    CI stamps web_static/.ver at build time (build.sh writes it before the
+    PyInstaller --add-data call), so a released binary knows its own version.
+    At runtime that resolves to _MEIPASS/web_static/.ver.
+
+    Running from source there is no stamp. This used to fall back to a
+    hardcoded "1.4.0", which reported a plausible-looking version number that
+    was simply false — the footer claimed v1.4.0 while the node ran v1.5.2.1.
+    Prefer the node's installed version, and if even that is missing say
+    "dev", which cannot be mistaken for a real release.
+    """
     try:
         ver_path = os.path.join(
-            getattr(sys, "_MEIPASS", os.path.dirname(__file__)),
+            getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))),
             "web_static", ".ver",
         )
         with open(ver_path) as f:
-            return f.read().strip()
+            stamped = f.read().strip()
+        if stamped:
+            return stamped
     except Exception:
-        return fallback
+        pass
+    try:
+        with open(INSTALLED_VERSION_PATH) as f:
+            installed = f.read().strip()
+        if installed:
+            return installed
+    except Exception:
+        pass
+    return "dev"
 
 
-FW_VERSION = _read_fw_version("1.4.0")
+FW_VERSION = _read_fw_version()
 
 
 def _static_root() -> str:
@@ -142,41 +166,227 @@ SSE_CLIENT_QUEUE_MAX = 100
 WORLD_TILES_FILENAME = "world-tiles.mbtiles"
 WORLD_TILES_MAX_ZOOM = 6
 
+# A downloaded Protomaps region pack: vector tiles (MVT) in a single
+# PMTiles archive, rendered client-side by protomaps-leaflet. Replaces both
+# the CartoDB CDN dependency and the zoom-0-6 raster bundle where present.
+#
+# Measured: a 10 km radius at zoom 0-15 is ~10 MB — roughly 14x smaller than
+# the equivalent raster area, because vector tiles carry geometry rather
+# than pixels and overzoom cleanly past their maximum zoom instead of
+# blurring. One archive serves both day and night: the flavor is a
+# client-side render option, not a separate download.
+REGION_PACK_FILENAME = "region.pmtiles"
+
+# The pack is DOWNLOADED, so it must not live in _static_root(). Under
+# PyInstaller --onefile that resolves to _MEIPASS, a temp directory the
+# loader recreates on every start and deletes on exit — a pack written there
+# would silently vanish on the next restart. /opt/droneaware is persistent
+# and already droneaware-owned, same as config.env.
+REGION_PACK_PATH = os.environ.get(
+    "DRONEAWARE_MAP_PACK_PATH", "/opt/droneaware/region.pmtiles")
+
+
+def _region_pack_path() -> str | None:
+    """Absolute path to the downloaded region pack, or None if absent.
+
+    Checks the persistent location first, then the bundle — the latter only
+    so a source checkout with a pack dropped in web_static/ still works for
+    development.
+    """
+    for candidate in (REGION_PACK_PATH,
+                      os.path.join(_static_root(), REGION_PACK_FILENAME)):
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+# ── Node configuration (v1.6.0) ──────────────────────────────────────────────
+# The settings panel edits config.env so operators do not have to SSH in.
+#
+# NEVER READ, NEVER WRITTEN, NEVER SENT TO THE BROWSER. This page answers to
+# anyone on the network, so these must not leave the node:
+#   NODE_TOKEN        — authenticates this node to the server. Leaking it lets
+#                       someone impersonate the node and inject detections.
+#   ENROLLMENT_SECRET — same class as NODE_TOKEN.
+#   SERVER_URL        — rewrite it and the node's detections go elsewhere.
+# The filter is an allowlist (CONFIG_SCHEMA), not a denylist, so a key added
+# to config.env in future is invisible here until someone deliberately adds
+# it — the safe direction to fail.
+CONFIG_SECRETS = frozenset({"NODE_TOKEN", "ENROLLMENT_SECRET", "SERVER_URL"})
+
+CONFIG_SCHEMA = [
+    # NODE_ID is deliberately NOT here. It must match the node's enrollment
+    # on the server, so it is shown as identity at the top of the panel
+    # rather than offered as a field someone can break.
+    {"group": "Location", "widget": "pickmap", "fields": [
+        {"key": "NODE_MOBILE", "label": "Mobile node", "type": "bool",
+         "help": "On: position comes from GPS. Off: from the fixed "
+                 "coordinates below."},
+        {"key": "NODE_LAT", "label": "Latitude", "type": "text"},
+        {"key": "NODE_LON", "label": "Longitude", "type": "text"},
+        {"key": "NODE_ELEVATION_AGL_M", "label": "Antenna height",
+         "type": "number", "unit": "m above ground"},
+    ]},
+    {"group": "GPS", "fields": [
+        {"key": "GPS_DEVICE", "label": "Serial device", "type": "text",
+         "placeholder": "auto-detect",
+         "help": "Leave blank to search /dev/ttyUSB* and /dev/ttyACM*."},
+        {"key": "GPS_BAUD", "label": "Baud rate", "type": "text",
+         "placeholder": "auto-detect"},
+    ]},
+    # Adapter roles are NOT free-text fields. `_orchestrate_wifi_mode`
+    # reassigns them on every refresh, so a hand-typed MAC silently reverts —
+    # the exact trap `droneaware swap` was built to close. Rendered as live
+    # hardware plus a Swap button instead; see /api/adapters.
+    {"group": "Radios", "widget": "adapters", "fields": [
+        {"key": "BLE_ADAPTER", "label": "Bluetooth adapter", "type": "text"},
+    ]},
+    # "default" mirrors wifi_feeder.py ScanPlanHopper.DEFAULT_* (~line 1426-1468).
+    # Duplicated across a process boundary because the feeder is a separate
+    # binary; if those change, these must change with them.
+    {"group": "Scanning", "widget": "defaults", "fields": [
+        {"key": "ADAPTIVE_DWELL", "default": "true", "label": "Adaptive dwell", "type": "bool",
+         "info": "Lets the node lengthen or shorten its time per channel "
+                 "based on what it is hearing, instead of a fixed rotation. "
+                 "Leave on unless you are reproducing a specific test."},
+        {"key": "WIFI_DWELL_EXPLORE_SEC", "default": "1.0", "label": "Explore dwell",
+         "type": "number", "unit": "s",
+         "info": "How long the radio sits on each non-primary channel while "
+                 "sweeping. Drones off the common channels beacon at 3-5 per "
+                 "second, so even a short stop usually catches one. Raising "
+                 "this makes each channel more reliable but lengthens the "
+                 "time before the sweep returns to any given channel."},
+        {"key": "WIFI_CAMP_TRIGGER_FRAMES", "default": "2", "label": "Frames to camp",
+         "type": "number",
+         "info": "How many Remote ID frames must arrive on a channel before "
+                 "the radio stops sweeping and stays there. Lower reacts "
+                 "faster; too low and one stray frame parks the radio on a "
+                 "quiet channel while the rest go unwatched."},
+        {"key": "WIFI_CAMP_TRIGGER_WINDOW_SEC", "default": "2.0", "label": "Camp trigger window",
+         "type": "number", "unit": "s",
+         "info": "The window those frames have to arrive within. Together "
+                 "with the frame count this is the rule for 'something is "
+                 "really transmitting here' rather than a one-off."},
+        {"key": "WIFI_CAMP_SILENCE_SEC", "default": "6.0", "label": "Camp silence (common channels)",
+         "type": "number", "unit": "s",
+         "info": "How long to keep holding a common channel (2.4 GHz ch6, "
+                 "5 GHz ch149) after the traffic stops. Aircraft on these "
+                 "channels beacon only once per second, so a short gap is "
+                 "normal and leaving too early loses the aircraft."},
+        {"key": "WIFI_CAMP_SILENCE_OFFSOCIAL_SEC", "default": "3.0",
+         "label": "Camp silence (other channels)", "type": "number", "unit": "s",
+         "info": "The same timer for every other channel. Aircraft off the "
+                 "common channels beacon several times a second, so silence "
+                 "there means the aircraft has genuinely gone — this can be "
+                 "shorter, which returns the radio to sweeping sooner."},
+        {"key": "WIFI_CAMP_RELEASE_INTERVAL_SEC", "default": "9.5", "label": "Camp release",
+         "type": "number", "unit": "s",
+         "info": "While camped on a busy channel, how often to briefly leave "
+                 "and check the others. Without this a single talkative "
+                 "aircraft would hold the radio indefinitely and everything "
+                 "else in the air would go unseen."},
+    ]},
+    {"group": "Uploads", "fields": [
+        # BATCH_SIZE and FLUSH_INTERVAL are deliberately absent: they are
+        # coordinated with the server's ingest, and a node that disagrees
+        # does not fail loudly, it just uploads badly.
+        {"key": "DRONEAWARE_BUFFER_MAX_BYTES", "label": "Upload buffer",
+         "type": "megabytes", "unit": "MB",
+         "info": "How much backlog is held in memory when the node cannot "
+                 "reach the server. Once full, the oldest detections are "
+                 "dropped first. This buffer lives in RAM, so a restart "
+                 "during an outage discards it."},
+        {"key": "DRONEAWARE_BUFFER_WARN_PCT", "label": "Buffer warning",
+         "type": "number", "unit": "%",
+         "info": "How full the upload buffer gets before the node starts "
+                 "warning in its logs and heartbeat."},
+    ]},
+    {"group": "Local interfaces", "fields": [
+        {"key": "DRONEAWARE_WEB_PORT", "label": "Web UI port", "type": "number",
+         "help": "Takes effect after the web service restarts."},
+        {"key": "DRONEAWARE_LOCAL_UDP_TARGETS", "label": "UDP broadcast targets",
+         "type": "text", "placeholder": "255.255.255.255:9999",
+         "info": "Where this node re-broadcasts detections on your own "
+                 "network, for tools like a Docker consumer or a second "
+                 "display. Blank broadcasts to the whole subnet."},
+        {"key": "DRONEAWARE_LOCAL_BUFFER_MAX_BYTES", "label": "Local ring buffer",
+         "type": "megabytes", "unit": "MB",
+         "info": "How much recent detection history the node keeps for this "
+                 "page and the local feed. Larger means the map can show a "
+                 "longer history after a browser reload."},
+        {"key": "DRONEAWARE_LOG_MAX_BYTES", "label": "Log size cap",
+         "type": "megabytes", "unit": "MB",
+         "info": "Total size of each feeder's rotated log files. Roughly six "
+                 "months of history at 40 MB; the cap exists to stop a fault "
+                 "loop filling the SD card."},
+    ]},
+]
+
+CONFIG_EDITABLE = frozenset(
+    f["key"] for g in CONFIG_SCHEMA for f in g["fields"]
+) - CONFIG_SECRETS
+
 # ── Offline map region packs (v1.6.0) ────────────────────────────────────────
 # The bundled world bundle is zoom 0-6: a global overview, far too coarse to
 # follow a local track. An operator can download a pack for their own area
 # instead, and these bound what they are allowed to ask for.
-#
-# The zoom ceiling is the number that surprises people. Tile count grows 4x per
-# level, so at a 20 km radius: z16 is ~200 MB, z17 ~780 MB, z18 ~3 GB and z19
-# ~12 GB — larger than the free space on most nodes' SD cards. The UI must
-# therefore price every zoom and let the disk decide, rather than offering a
-# depth that will always fail.
-OFFLINE_MAP_MAX_RADIUS_KM = 20.0
+# Region packs are vector (Protomaps/PMTiles), not raster, so the old
+# tile-count-times-bytes-per-tile model no longer applies. The published
+# basemap builds stop at zoom 15; vector overzooms cleanly past that, so
+# there is no zoom ladder to choose from and no depth to price.
+PROTOMAPS_MAX_ZOOM = 15
 OFFLINE_MAP_MIN_RADIUS_KM = 1.0
-OFFLINE_MAP_ZOOM_CEILING  = 19      # hard stop for the estimate loop, NOT a
-                                    # recommendation — affordability decides.
-# Raster PNG basemap tiles vary roughly 15-35 KB between empty coastline and
-# dense city. 25 KB keeps the estimate honest in both directions; the API
-# labels the figure as approximate for the same reason.
-OFFLINE_MAP_BYTES_PER_TILE = 25 * 1024
+OFFLINE_MAP_MAX_RADIUS_KM = 30.0
+
+# MEASURED 2026-09-06 with `pmtiles extract --dry-run` against the planet
+# build, three places at matched radii. Archive size in MB:
+#
+#     radius   rural MT   suburban NJ   dense NYC
+#        1        0.47        1.6          2.5
+#        2        0.48        2.7          3.9
+#        5        0.55        4.0         12
+#       10        0.68       10           32
+#       20        1.3        32           84
+#       30        2.5        66          129
+#
+# A 47x spread at 10 km is why this is a table and not a constant: any
+# bytes-per-area figure would be wrong nearly everywhere. The operator knows
+# which column describes where they live; the node does not, so it shows all
+# three rather than inventing a precision it does not have.
+#
+# The ~0.47 MB floor in the rural column is the low-zoom world coverage every
+# pack carries regardless of radius.
+PACK_SIZE_SAMPLES_MB = {
+    "rural":    [(1, 0.47), (2, 0.48), (5, 0.55), (10, 0.68), (20, 1.3), (30, 2.5)],
+    "suburban": [(1, 1.6),  (2, 2.7),  (5, 4.0),  (10, 10.0), (20, 32.0), (30, 66.0)],
+    "city":     [(1, 2.5),  (2, 3.9),  (5, 12.0), (10, 32.0), (20, 84.0), (30, 129.0)],
+}
+
+
+def _pack_size_estimates(radius_km: float) -> dict:
+    """Interpolate the measured table. Returns bytes keyed by density."""
+    out = {}
+    for density, samples in PACK_SIZE_SAMPLES_MB.items():
+        if radius_km <= samples[0][0]:
+            mb = samples[0][1]
+        elif radius_km >= samples[-1][0]:
+            mb = samples[-1][1]
+        else:
+            mb = samples[-1][1]
+            for (r0, m0), (r1, m1) in zip(samples, samples[1:]):
+                if r0 <= radius_km <= r1:
+                    t = (radius_km - r0) / (r1 - r0)
+                    mb = m0 + t * (m1 - m0)
+                    break
+        out[density] = int(mb * 1024 * 1024)
+    return out
+
+
 # Headroom that must survive the download. A node that stops recording
 # detections because the card filled with map tiles is strictly worse than a
 # node with no offline map at all. Covers the 40 MB feeder log cap, the 50 MB
 # forwarder buffer, and room for OS updates.
 OFFLINE_MAP_RESERVE_BYTES = 500 * 1024 * 1024
-# A hard ceiling on pack size, independent of free space. "It fits" is
-# necessary but not sufficient: a node with a 64 GB card would happily accept a
-# 15 GB / 635,000-tile download at 20 km z19, which means hours of transfer and
-# a great deal of SD-card write wear for a basemap. Disk space and good sense
-# are different limits, and the API reports which one a request failed.
-OFFLINE_MAP_MAX_PACK_BYTES = 1536 * 1024 * 1024
-# What we SUGGEST, as distinct from what we allow. The deepest zoom that fits
-# is often ~1 GB, which is a long download on a domestic line for a basemap.
-# The default should be quick and genuinely useful; going deeper stays
-# available, but as a deliberate choice rather than the path of least
-# resistance.
-OFFLINE_MAP_COMFORTABLE_BYTES = 400 * 1024 * 1024
 
 START_TIME = time.time()
 
@@ -547,6 +757,24 @@ def _read_config_env(key: str) -> str | None:
     return None
 
 
+def _gps_device_present() -> bool:
+    """Whether a GPS device exists. Mirrors the feeder's own discovery order
+    rather than trusting GPS_DEVICE, which is blank on auto-detect nodes."""
+    dev = (_read_config_env("GPS_DEVICE") or "").strip()
+    if dev:
+        return os.path.exists(dev)
+    import glob
+    return bool(glob.glob("/dev/ttyUSB*") or glob.glob("/dev/ttyACM*"))
+
+
+def _elevation_agl() -> float | None:
+    """Antenna height above ground, if the operator configured one."""
+    try:
+        return float(_read_config_env("NODE_ELEVATION_AGL_M"))
+    except (TypeError, ValueError):
+        return None
+
+
 def get_home_location() -> dict | None:
     """Returns the node's home location for map centering and distance
     rings. Two sources:
@@ -571,13 +799,15 @@ def get_home_location() -> dict | None:
             lat, lon = s.get("lat"), s.get("lon")
             if lat is None or lon is None:
                 return None
-            return {"lat": float(lat), "lon": float(lon), "source": "gps"}
+            return {"lat": float(lat), "lon": float(lon), "source": "gps",
+                    "elevation_agl_m": _elevation_agl()}
         else:
             lat_str = _read_config_env("NODE_LAT")
             lon_str = _read_config_env("NODE_LON")
             if not lat_str or not lon_str:
                 return None
-            return {"lat": float(lat_str), "lon": float(lon_str), "source": "static"}
+            return {"lat": float(lat_str), "lon": float(lon_str),
+                    "source": "static", "elevation_agl_m": _elevation_agl()}
     except Exception:
         return None
 
@@ -740,6 +970,7 @@ def _read_feeder_states() -> dict:
     status as a coarse indicator until then.
     """
     out = {"ble": None, "wifi_2g": None, "wifi_5g": None}
+    names = _adapter_names_by_mac()
     for band in ("2g", "5g"):
         path = f"/run/droneaware/wifi_state_{band}.json"
         try:
@@ -750,6 +981,11 @@ def _read_feeder_states() -> dict:
             # Stale if not refreshed in >180s (heartbeat cycle is 60s;
             # 3 missed cycles = something is wrong)
             s["stale"] = age > 180
+            # Name the hardware, not just the interface. wlan1/wlan2 tells an
+            # operator nothing about which of two dongles they are looking at.
+            mac = (s.get("adapter_mac") or "").lower()
+            if mac and mac in names:
+                s["adapter_name"] = names[mac]
             out[f"wifi_{band}"] = s
         except (OSError, ValueError, json.JSONDecodeError):
             pass
@@ -770,6 +1006,12 @@ def _read_feeder_states() -> dict:
         s["wifi_ok"] = bool(s.get("ble_ok"))
         s["iface"] = s.get("adapter") or "hci0"
         s["health_source"] = "feeder"
+        # v1.5.2.3+ publishes the radio's bus and USB id. Absent on older
+        # feeders, so key off presence rather than assuming onboard.
+        if s.get("adapter_usb_id"):
+            s["adapter_name"] = f"USB adapter {s['adapter_usb_id']}"
+        elif s.get("adapter_bus"):
+            s["adapter_name"] = "Onboard Bluetooth"
         out["ble"] = s
     except (OSError, ValueError, json.JSONDecodeError):
         # No state file — either a pre-v1.5.0.7 ble_feeder, or one that has
@@ -812,7 +1054,12 @@ def api_status():
         "load_5m":     load_5m,
         "load_15m":    load_15m,
         "sse_clients": broker.subscriber_count(),
-        "home":        get_home_location(),  # {lat, lon, source} or null
+        "home":        get_home_location(),  # {lat, lon, source, elevation_agl_m}
+        # The location row's label keys off these two, not off whether a fix
+        # has landed — a mobile node with GPS hardware says "Live GPS" and
+        # then "Awaiting fix", matching nodes.html.
+        "mobile":      (_read_config_env("NODE_MOBILE") or "false").lower() == "true",
+        "has_gps":     _gps_device_present(),
         "node_id":     _read_config_env("NODE_ID") or "this-node",
         # Whether the bundled world-tile MBTiles is available for offline
         # basemap rendering. Frontend uses this to know whether the
@@ -820,6 +1067,12 @@ def api_status():
         # or 404s if CartoDB is unreachable.
         "tiles_local": _mbtiles_conn is not None,
         "tiles_local_max_zoom": WORLD_TILES_MAX_ZOOM if _mbtiles_conn else None,
+        # Whether a Protomaps region pack has been downloaded. When true the
+        # frontend renders vector tiles from /map.pmtiles and needs neither
+        # CartoDB nor the raster bundle — at any zoom, in either theme.
+        "map_pack": _region_pack_path() is not None,
+        "map_pack_bytes": (os.path.getsize(_region_pack_path())
+                           if _region_pack_path() else None),
         # v1.5.0 Gap 3: per-feeder status for the three-row BLE/2.4/5
         # panel in the offline UI (matching My Nodes layout).
         "feeders":     _read_feeder_states(),
@@ -827,49 +1080,22 @@ def api_status():
     return jsonify(s)
 
 
-def _tiles_for_region(lat: float, lon: float, radius_km: float, maxzoom: int) -> int:
-    """Cumulative tile count covering a square region, zoom 0 through maxzoom.
-
-    Exact arithmetic, not a guess — only the bytes-per-tile figure is an
-    estimate. Uses the same Web Mercator maths the tile server does, so the
-    count matches what a download would actually fetch.
-
-    A degree of latitude is ~111.32 km everywhere; a degree of longitude
-    shrinks by cos(lat), which is why the same radius costs more tiles near
-    the equator than near the poles.
-    """
-    dlat = radius_km / 111.32
-    dlon = radius_km / (111.32 * max(math.cos(math.radians(lat)), 1e-6))
-    north = min(lat + dlat, 85.05112878)
-    south = max(lat - dlat, -85.05112878)
-    total = 0
-    for z in range(maxzoom + 1):
-        n = 2 ** z
-        def xtile(lng):
-            return int((lng + 180.0) / 360.0 * n)
-        def ytile(la):
-            r = math.radians(la)
-            return int((1.0 - math.log(math.tan(r) + 1 / math.cos(r)) / math.pi) / 2.0 * n)
-        x0, x1 = xtile(lon - dlon), xtile(lon + dlon)
-        y0, y1 = ytile(north), ytile(south)
-        total += (abs(x1 - x0) + 1) * (abs(y1 - y0) + 1)
-    return total
-
-
 @app.route("/api/offline-map/estimate")
 def api_offline_map_estimate():
-    """Price every zoom depth for a region and say which ones fit on disk.
+    """Price a region pack for three terrain densities.
 
-    Returns the whole table rather than a single recommendation, so the UI can
-    show the operator what each depth costs and grey out the ones that do not
-    fit. A red X that explains itself is worth more than a disabled button.
+    A single number is not honest here. MEASURED against the Protomaps
+    planet build (2026-09-06), same radius, three places:
+
+        10 km radius   rural Montana 0.7 MB
+                       suburban NJ    10 MB
+                       dense NYC      32 MB
+
+    That is a 47x spread, so any bytes-per-area constant is wrong almost
+    everywhere. The operator knows which of the three they live in; the
+    node does not. So return all three and let them read the row that
+    applies, rather than inventing a precision we do not have.
     """
-    # Region selection needs a different default from map centering, and
-    # get_home_location() answers the other question. On a mobile node it
-    # deliberately returns nothing without a live GPS fix, because showing a
-    # stale position as "here" would be wrong. But "roughly where should I
-    # download tiles for" is answered perfectly well by the configured
-    # coordinates — a mobile node with no fix yet still has a home region.
     home = get_home_location() or {}
     if home.get("lat") is None:
         try:
@@ -887,9 +1113,9 @@ def api_offline_map_estimate():
                       "where it is. Set NODE_LAT/NODE_LON, or wait for a GPS fix.",
         }), 400
     try:
-        radius = float(request.args.get("radius_km", 10.0))
+        radius = float(request.args.get("radius_km", 20.0))
     except ValueError:
-        radius = 10.0
+        radius = 20.0
     radius = max(OFFLINE_MAP_MIN_RADIUS_KM, min(radius, OFFLINE_MAP_MAX_RADIUS_KM))
 
     try:
@@ -899,25 +1125,11 @@ def api_offline_map_estimate():
         free = 0
     usable = max(free - OFFLINE_MAP_RESERVE_BYTES, 0)
 
-    zooms, recommended, deepest = [], None, None
-    for z in range(WORLD_TILES_MAX_ZOOM + 1, OFFLINE_MAP_ZOOM_CEILING + 1):
-        tiles = _tiles_for_region(lat, lon, radius, z)
-        size = tiles * OFFLINE_MAP_BYTES_PER_TILE
-        too_big = size > OFFLINE_MAP_MAX_PACK_BYTES
-        no_room = size > usable
-        fits = not (too_big or no_room)
-        zooms.append({
-            "maxzoom": z, "tiles": tiles, "bytes": size, "fits": fits,
-            # Distinguish the two failures. "Too large" is answered by
-            # choosing a smaller radius or depth; "not enough space" is
-            # answered by freeing disk. Telling an operator the wrong one
-            # sends them off fixing something that is not the problem.
-            "reason": None if fits else ("too_large" if too_big else "not_enough_space"),
-        })
-        if fits:
-            deepest = z
-            if size <= OFFLINE_MAP_COMFORTABLE_BYTES:
-                recommended = z
+    est = _pack_size_estimates(radius)
+    # Check disk against the WORST case, not the typical one. Telling an
+    # operator it fits and then filling their card is the failure that
+    # matters; overstating the requirement only costs them a smaller radius.
+    worst = est["city"]
 
     return jsonify({
         "center": {"lat": lat, "lon": lon},
@@ -931,54 +1143,365 @@ def api_offline_map_estimate():
             "reserve_bytes": OFFLINE_MAP_RESERVE_BYTES,
             "usable_bytes": usable,
         },
-        "bytes_per_tile": OFFLINE_MAP_BYTES_PER_TILE,
-        "max_pack_bytes": OFFLINE_MAP_MAX_PACK_BYTES,
+        "estimates": est,          # bytes, keyed rural / suburban / city
+        "fits": worst <= usable,
+        "worst_case_bytes": worst,
+        "maxzoom": PROTOMAPS_MAX_ZOOM,
         "estimate_is_approximate": True,
-        "zooms": zooms,
-        "recommended_maxzoom": recommended,   # quick and useful — the default
-        "deepest_allowed_maxzoom": deepest,   # available, but a deliberate choice
-        "comfortable_bytes": OFFLINE_MAP_COMFORTABLE_BYTES,
     })
 
 
-@app.route("/tiles/<int:z>/<int:x>/<int:y>.png")
-def tile(z, x, y):
-    """Serve a single PNG tile from the bundled world-tile MBTiles file.
-    Used by the Leaflet client as the offline basemap fallback when the
-    browser can't reach CartoDB. Out-of-range zooms (z > WORLD_TILES_MAX_ZOOM)
-    and unknown tile coords both return 404 — Leaflet's tileerror handler
-    treats those as missing-tile placeholders, which is the correct UX
-    (operator zoomed past where the bundle has data)."""
-    if _mbtiles_conn is None:
-        # No bundle loaded — return 404 so the Leaflet client falls back
-        # gracefully (the dual-layer config keeps CartoDB as the primary
-        # source; this route is only hit when CartoDB has failed).
+# USB id -> the name on the box. The descriptor strings report the chipset
+# vendor ("Ralink", "MediaTek Inc.") not the brand an operator bought, which
+# is not much help when two adapters are plugged into one Pi. Unknown ids
+# fall back to the descriptor rather than showing nothing.
+KNOWN_ADAPTERS = {
+    "148f:3070": "Alfa AWUS036NH (Ralink RT3070)",
+    "0e8d:7612": "Alfa AWUS036ACM (MediaTek MT7612U)",
+    "0e8d:7610": "Panda/Alfa (MediaTek MT7610U)",
+    "0bda:8812": "Alfa AWUS036ACH (Realtek RTL8812AU)",
+    "0bda:881a": "Alfa AWUS036ACH (Realtek RTL8812AU)",
+    "0bda:8811": "Alfa AWUS036ACS (Realtek RTL8811AU)",
+    "0bda:a811": "Alfa AWUS036ACS (Realtek RTL8811AU)",
+}
+
+
+def _usb_ancestor(start: str) -> str | None:
+    """Walk up from a net device to the USB device node that owns it."""
+    path = start
+    for _ in range(6):
+        if os.path.isfile(os.path.join(path, "idVendor")):
+            return path
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    return None
+
+
+def _read_first_line(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+# ── Update check and operator actions (v1.6.0) ───────────────────────────────
+# Checking for a release needs no privilege at all — it is one GitHub API
+# call — so it is done here in Python rather than shelling out. Only APPLYING
+# an update needs root, and that goes through the CLI via the narrow sudoers
+# rule in /etc/sudoers.d/droneaware-webui.
+GITHUB_RELEASES_API = (
+    "https://api.github.com/repos/fduflyer/DroneAware-Node-Releases/releases")
+VERSION_FILE = INSTALLED_VERSION_PATH
+
+# Unauthenticated GitHub allows 60 requests/hour per IP. Cache so a panel
+# left open on a wall display cannot exhaust that on its own.
+_update_cache = {"at": 0.0, "data": None}
+_update_lock = threading.Lock()
+
+# One action at a time, with its result kept for the UI to poll. Actions
+# restart feeders, so overlapping runs would fight each other.
+_action_state = {"running": None, "started": 0.0, "last": None}
+_action_lock = threading.Lock()
+
+ACTIONS = {
+    "refresh": ["sudo", "-n", "/usr/local/bin/droneaware", "refresh"],
+    "swap":    ["sudo", "-n", "/usr/local/bin/droneaware", "swap"],
+    "update":  ["sudo", "-n", "/usr/local/bin/droneaware", "update"],
+}
+
+# The CLI writes for a terminal, so its output carries SGR color escapes.
+# Rendered in a browser those show up as literal garbage around the words
+# the operator actually needs to read.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _version_tuple(v: str) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", v or ""))
+
+
+@app.route("/api/update-check")
+def api_update_check():
+    current = _read_first_line(VERSION_FILE) or "unknown"
+    with _update_lock:
+        fresh = (time.time() - _update_cache["at"]) < 900
+        cached = _update_cache["data"]
+    if fresh and cached:
+        return jsonify({**cached, "current": current, "cached": True})
+
+    try:
+        req = urllib.request.Request(
+            GITHUB_RELEASES_API,
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": "droneaware-node"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            releases = json.load(r)
+    except Exception as e:
+        # Offline is the normal case for a deployed node, not an error worth
+        # shouting about — the panel just says it could not check.
+        return jsonify({"current": current, "latest": None,
+                        "available": False, "reachable": False,
+                        "detail": str(e)})
+
+    latest = None
+    for rel in releases:
+        if rel.get("draft") or rel.get("prerelease"):
+            continue
+        # Installer-only releases carry no binaries and must not be offered.
+        if not any(a.get("name") == "wifi_feeder"
+                   for a in rel.get("assets", [])):
+            continue
+        latest = rel.get("tag_name")
+        break
+
+    data = {"latest": latest, "reachable": True,
+            "available": bool(latest
+                              and _version_tuple(latest) > _version_tuple(current))}
+    with _update_lock:
+        _update_cache["at"] = time.time()
+        _update_cache["data"] = data
+    return jsonify({**data, "current": current, "cached": False})
+
+
+def _run_action(name: str) -> None:
+    cmd = ACTIONS[name]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        ok = p.returncode == 0
+        detail = _ANSI_RE.sub("", (p.stdout or p.stderr or "")).strip()
+    except subprocess.TimeoutExpired:
+        ok, detail = False, "timed out"
+    except FileNotFoundError:
+        ok, detail = False, "droneaware CLI not found"
+    except Exception as e:
+        ok, detail = False, str(e)
+    log.info("[action] %s -> %s", name, "ok" if ok else f"FAILED: {detail}")
+    with _action_lock:
+        _action_state["running"] = None
+        _action_state["last"] = {"action": name, "ok": ok,
+                                 "detail": detail[-2000:],
+                                 "at": time.time()}
+
+
+@app.route("/api/action", methods=["GET", "POST"])
+def api_action():
+    if request.method == "GET":
+        with _action_lock:
+            return jsonify(dict(_action_state))
+
+    name = (request.get_json(silent=True) or {}).get("action")
+    if name not in ACTIONS:
+        return jsonify({"error": "unknown_action"}), 400
+    with _action_lock:
+        if _action_state["running"]:
+            return jsonify({"error": "busy",
+                            "detail": f"{_action_state['running']} is still running."}), 409
+        _action_state["running"] = name
+        _action_state["started"] = time.time()
+        _action_state["last"] = None
+    threading.Thread(target=_run_action, args=(name,), daemon=True).start()
+    return jsonify({"ok": True, "started": name})
+
+
+def _enumerate_adapters() -> list:
+    """Live WiFi hardware and the role each adapter currently holds.
+
+    Answers "which of these two identical-looking dongles is doing 5 GHz",
+    which is the question an operator actually has. Shared by /api/adapters
+    and the feeder rows, so both name the same hardware the same way.
+    """
+    roles = {}
+    for key, role in (("WIFI_ADAPTER_2G_MAC", "2.4 GHz"),
+                      ("WIFI_ADAPTER_5G_MAC", "5 GHz"),
+                      ("WIFI_ADAPTER_MAC", "monitor")):
+        mac = (_read_config_env(key) or "").strip().lower()
+        if mac:
+            roles.setdefault(mac, role)
+
+    out = []
+    try:
+        ifaces = sorted(os.listdir("/sys/class/net"))
+    except Exception:
+        ifaces = []
+
+    for iface in ifaces:
+        base = f"/sys/class/net/{iface}"
+        if not os.path.exists(os.path.join(base, "phy80211")):
+            continue
+        mac = _read_first_line(os.path.join(base, "address")).lower()
+        driver = ""
+        try:
+            driver = os.path.basename(
+                os.path.realpath(os.path.join(base, "device", "driver")))
+        except Exception:
+            pass
+
+        usb_id = vendor = product = ""
+        try:
+            dev = os.path.realpath(os.path.join(base, "device"))
+            usb = _usb_ancestor(dev)
+            if usb:
+                vid = _read_first_line(os.path.join(usb, "idVendor"))
+                pid = _read_first_line(os.path.join(usb, "idProduct"))
+                usb_id = f"{vid}:{pid}" if vid and pid else ""
+                vendor = _read_first_line(os.path.join(usb, "manufacturer"))
+                product = _read_first_line(os.path.join(usb, "product"))
+        except Exception:
+            pass
+
+        # Onboard radios are backhaul by architecture and can't do monitor
+        # mode — say so rather than leaving them looking like a candidate.
+        onboard = driver == "brcmfmac" or not usb_id
+        name = KNOWN_ADAPTERS.get(usb_id) or (
+            " ".join(x for x in (vendor, product) if x).strip()
+            or driver or "unknown")
+
+        out.append({
+            "iface": iface,
+            "mac": mac,
+            "driver": driver,
+            "usb_id": usb_id,
+            "name": "Onboard WiFi (network uplink)" if onboard else name,
+            "onboard": onboard,
+            "role": "network uplink" if onboard else roles.get(mac, "unassigned"),
+        })
+
+    return out
+
+
+@app.route("/api/adapters")
+def api_adapters():
+    return jsonify({"adapters": _enumerate_adapters()})
+
+
+def _adapter_names_by_mac() -> dict:
+    """MAC -> product name, for labelling the feeder rows."""
+    try:
+        return {a["mac"]: a["name"] for a in _enumerate_adapters() if a["mac"]}
+    except Exception:
+        return {}
+
+
+@app.route("/api/config")
+def api_config_get():
+    """Current values for every editable key, plus the schema to render.
+
+    Reads config.env directly rather than os.environ: the running process
+    was started with the values as they were at boot, and the point of this
+    page is to show what is on disk now.
+    """
+    on_disk = {}
+    try:
+        with open(CONFIG_ENV_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                on_disk[k.strip()] = v.strip()
+    except Exception:
+        return jsonify({"error": "unreadable",
+                        "detail": "Cannot read config.env."}), 500
+
+    # Allowlist. A secret can never be reached even if it were listed.
+    values = {k: on_disk.get(k, "") for k in CONFIG_EDITABLE}
+    # Identity, shown but never editable — a multi-node operator has to be
+    # able to see which node they are about to change.
+    return jsonify({"schema": CONFIG_SCHEMA, "values": values,
+                    "node_id": on_disk.get("NODE_ID", "")})
+
+
+@app.route("/api/config", methods=["POST"])
+def api_config_set():
+    """Write changed keys back to config.env, preserving everything else.
+
+    Rewrites in place line by line so comments, ordering and untouched keys
+    survive — config.env is heavily commented and those comments are the
+    only documentation some of these knobs have.
+    """
+    payload = request.get_json(silent=True) or {}
+    changes = payload.get("values")
+    if not isinstance(changes, dict):
+        return jsonify({"error": "bad_request"}), 400
+
+    rejected = [k for k in changes if k not in CONFIG_EDITABLE]
+    if rejected:
+        return jsonify({"error": "not_editable", "keys": sorted(rejected)}), 403
+
+    clean = {}
+    for k, v in changes.items():
+        v = "" if v is None else str(v)
+        # A newline would let one field forge additional config lines.
+        if "\n" in v or "\r" in v:
+            return jsonify({"error": "invalid_value", "key": k}), 400
+        clean[k] = v.strip()
+
+    try:
+        with open(CONFIG_ENV_PATH) as f:
+            lines = f.readlines()
+
+        seen = set()
+        out = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                key = stripped.split("=", 1)[0].strip()
+                if key in clean:
+                    out.append(f"{key}={clean[key]}\n")
+                    seen.add(key)
+                    continue
+            out.append(line)
+
+        for key in sorted(set(clean) - seen):
+            out.append(f"{key}={clean[key]}\n")
+
+        # Write via a temp file in the same directory, then replace, so a
+        # crash mid-write cannot leave a node with a truncated config.
+        d = os.path.dirname(CONFIG_ENV_PATH)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".config.env.")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.writelines(out)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, CONFIG_ENV_PATH)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except PermissionError:
+        return jsonify({"error": "read_only",
+                        "detail": "The web service cannot write config.env."}), 403
+    except Exception as e:
+        return jsonify({"error": "write_failed", "detail": str(e)}), 500
+
+    log.info("[config] updated %d key(s) from the local UI: %s",
+             len(clean), ", ".join(sorted(clean)))
+    return jsonify({"ok": True, "written": sorted(clean),
+                    "restart_required": True})
+
+
+@app.route("/map.pmtiles")
+def region_pack():
+    """Serve the downloaded Protomaps region pack.
+
+    conditional=True is load-bearing, not a nicety: PMTiles is read by HTTP
+    byte range. The client fetches the header, then the directory, then
+    individual tiles — all as Range requests. Without it Flask answers 200
+    with the whole archive and the reader cannot seek, so the map renders
+    blank with no error in the console.
+    """
+    path = _region_pack_path()
+    if path is None:
         return Response(status=404)
-    if z > WORLD_TILES_MAX_ZOOM:
-        # Bundle doesn't include high zoom; client should be using
-        # maxNativeZoom on the layer to upscale lower zooms rather than
-        # request these — but if the request lands here anyway, 404 is
-        # the honest answer.
-        return Response(status=404)
-    # MBTiles stores tile_row in TMS scheme (origin = bottom-left);
-    # Leaflet/XYZ uses origin = top-left. Convert: tms_y = 2^z - 1 - y.
-    tms_y = (1 << z) - 1 - y
-    with _mbtiles_lock:
-        cur = _mbtiles_conn.execute(
-            "SELECT tile_data FROM tiles "
-            "WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?",
-            (z, x, tms_y),
-        )
-        row = cur.fetchone()
-    if row is None or not row[0]:
-        return Response(status=404)
-    # Cache aggressively in the browser — tile content for a given (z,x,y)
-    # never changes within a release (the MBTiles file is immutable;
-    # operators get fresh tiles by upgrading the web_ui binary).
-    return Response(
-        row[0],
-        mimetype="image/png",
-        headers={"Cache-Control": "public, max-age=86400, immutable"},
+    return send_file(
+        path,
+        mimetype="application/octet-stream",
+        conditional=True,          # -> 206 Partial Content
+        max_age=86400,
     )
 
 
