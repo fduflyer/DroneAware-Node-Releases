@@ -67,6 +67,8 @@ import sys
 import tempfile
 import threading
 import urllib.request
+
+import requests
 import time
 from queue import Empty, Full, Queue
 
@@ -184,6 +186,58 @@ REGION_PACK_FILENAME = "region.pmtiles"
 # and already droneaware-owned, same as config.env.
 REGION_PACK_PATH = os.environ.get(
     "DRONEAWARE_MAP_PACK_PATH", "/opt/droneaware/region.pmtiles")
+
+# Upstream archive, used until a region pack has been downloaded.
+#
+# A node's browser cannot read this host directly: the bucket's CORS policy
+# lists droneaware.io, and a node's origin is a LAN IP over plain HTTP that
+# differs on every node and every network — there is no set of origins to
+# enumerate. So web_ui forwards the byte ranges itself and the browser reads
+# same-origin, which needs no CORS grant at all.
+#
+# Deliberately NOT a dated filename. Pinning 20260905.pmtiles in firmware
+# would mean a release every time the planet is rebuilt.
+TILE_UPSTREAM_URL = os.environ.get(
+    "DRONEAWARE_TILE_URL", "https://tiles.droneaware.io/planet.pmtiles")
+
+_tile_sess = None
+_tile_sess_lock = threading.Lock()
+
+# Reachability is cached: the map layer asks on every status poll, and a node
+# with no uplink must not spend 8s in a connect timeout each time.
+_tile_reach = {"at": 0.0, "ok": False}
+
+
+def _tile_session() -> "requests.Session":
+    """One session, so range requests reuse the TCP+TLS connection. Without
+    this every range costs a fresh handshake, which is what made a naive
+    per-tile walk take minutes rather than seconds."""
+    global _tile_sess
+    with _tile_sess_lock:
+        if _tile_sess is None:
+            _tile_sess = requests.Session()
+            _tile_sess.headers["User-Agent"] = "droneaware-node"
+        return _tile_sess
+
+
+def _tile_upstream_reachable() -> bool:
+    """Whether the tile host is usable right now. Cached for 60s."""
+    if not TILE_UPSTREAM_URL:
+        return False
+    now = time.time()
+    if now - _tile_reach["at"] < 60:
+        return _tile_reach["ok"]
+    ok = False
+    try:
+        r = _tile_session().get(TILE_UPSTREAM_URL,
+                                headers={"Range": "bytes=0-7"}, timeout=6)
+        # Byte 0-6 spell PMTiles. A captive portal returning 200 with an HTML
+        # login page would otherwise read as a working tile host.
+        ok = r.status_code == 206 and r.content[:7] == b"PMTiles"
+    except Exception:
+        ok = False
+    _tile_reach.update(at=now, ok=ok)
+    return ok
 
 
 def _region_pack_path() -> str | None:
@@ -1070,9 +1124,15 @@ def api_status():
         # Whether a Protomaps region pack has been downloaded. When true the
         # frontend renders vector tiles from /map.pmtiles and needs neither
         # CartoDB nor the raster bundle — at any zoom, in either theme.
-        "map_pack": _region_pack_path() is not None,
+        "map_pack": (_region_pack_path() is not None
+                     or _tile_upstream_reachable()),
         "map_pack_bytes": (os.path.getsize(_region_pack_path())
                            if _region_pack_path() else None),
+        # local  — a downloaded pack, works with no uplink
+        # proxy  — streaming from the tile host through this node
+        # none   — neither; the client keeps its raster fallback
+        "map_source": ("local" if _region_pack_path()
+                       else "proxy" if _tile_upstream_reachable() else "none"),
         # v1.5.0 Gap 3: per-feeder status for the three-row BLE/2.4/5
         # panel in the offline UI (matching My Nodes layout).
         "feeders":     _read_feeder_states(),
@@ -1495,14 +1555,44 @@ def region_pack():
     blank with no error in the console.
     """
     path = _region_pack_path()
-    if path is None:
+    if path is not None:
+        return send_file(
+            path,
+            mimetype="application/octet-stream",
+            conditional=True,          # -> 206 Partial Content
+            max_age=86400,
+        )
+
+    # No local pack yet: forward the range to the tile host. Streamed, never
+    # buffered — the upstream archive is ~138 GB and a single range can be
+    # megabytes.
+    if not TILE_UPSTREAM_URL:
         return Response(status=404)
-    return send_file(
-        path,
-        mimetype="application/octet-stream",
-        conditional=True,          # -> 206 Partial Content
-        max_age=86400,
-    )
+    headers = {}
+    rng = request.headers.get("Range")
+    if rng:
+        headers["Range"] = rng
+    try:
+        up = _tile_session().get(TILE_UPSTREAM_URL, headers=headers,
+                                 stream=True, timeout=(6, 30))
+    except Exception as e:
+        log.warning("[tiles] upstream unreachable: %s", e)
+        return Response(status=504)
+    if up.status_code not in (200, 206):
+        log.warning("[tiles] upstream returned %s", up.status_code)
+        up.close()
+        return Response(status=502)
+
+    out = Response(up.iter_content(chunk_size=65536),
+                   status=up.status_code,
+                   mimetype="application/octet-stream")
+    # Content-Range and Accept-Ranges are what make the reader able to seek;
+    # dropping them turns a working proxy into a blank map.
+    for h in ("Content-Range", "Content-Length", "Accept-Ranges", "ETag"):
+        if h in up.headers:
+            out.headers[h] = up.headers[h]
+    out.headers["Cache-Control"] = "public, max-age=3600"
+    return out
 
 
 @app.route("/events")

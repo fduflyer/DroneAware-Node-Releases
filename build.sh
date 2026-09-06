@@ -109,6 +109,7 @@ echo "      Building web_ui..."
     --name web_ui \
     --add-data "$SCRIPT_DIR/web_static:web_static" \
     --hidden-import flask \
+    --hidden-import requests \
     "$SCRIPT_DIR/web_ui.py" \
     > /dev/null 2>&1
 
