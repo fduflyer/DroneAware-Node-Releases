@@ -1437,6 +1437,24 @@ if candidates:
             warn "web_ui download failed — feeder update will continue."
             warn "Web UI binary will remain at the previously installed version."
         fi
+
+        # Existing nodes predate the offline basemap, so fetch it once if it
+        # is absent. Skipped when already present — this is a static 15 MB
+        # artifact, not something to re-pull on every update.
+        if [[ ! -f "${INSTALL_DIR}/world.pmtiles" ]]; then
+            echo "  Downloading offline basemap (15 MB)..."
+            if curl -fsSL --retry 3 --max-time 300 \
+                    "https://tiles.droneaware.io/world.pmtiles" \
+                    -o "${INSTALL_DIR}/world.pmtiles.part" \
+               && [[ "$(head -c 7 "${INSTALL_DIR}/world.pmtiles.part")" == "PMTiles" ]]; then
+                mv "${INSTALL_DIR}/world.pmtiles.part" "${INSTALL_DIR}/world.pmtiles"
+                chown droneaware:droneaware "${INSTALL_DIR}/world.pmtiles" 2>/dev/null || true
+                info "Offline basemap installed."
+            else
+                rm -f "${INSTALL_DIR}/world.pmtiles.part"
+                warn "Offline basemap download failed — the map will need internet."
+            fi
+        fi
     fi
 
     echo "  Stopping services..."

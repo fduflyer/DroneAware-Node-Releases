@@ -1291,6 +1291,31 @@ install_webui() {
     fi
     chown droneaware:droneaware "${INSTALL_DIR}/web_ui" 2>/dev/null || true
 
+    # Offline basemap. 15 MB, zoom 0-5, global — what the map can still draw
+    # with no internet at all. Non-fatal: the UI works without it, drawing
+    # from the tile host while online, so a failed download must not abort
+    # the Web UI install.
+    echo "    Downloading offline basemap (15 MB)..."
+    if curl -fsSL --retry 3 --max-time 300 \
+            "https://tiles.droneaware.io/world.pmtiles" \
+            -o "${INSTALL_DIR}/world.pmtiles.part"; then
+        # Verify before it becomes the live pack — a truncated file or an
+        # error page renamed into place renders a blank map with nothing to
+        # explain it.
+        if [[ "$(head -c 7 "${INSTALL_DIR}/world.pmtiles.part")" == "PMTiles" ]]; then
+            mv "${INSTALL_DIR}/world.pmtiles.part" "${INSTALL_DIR}/world.pmtiles"
+            chown droneaware:droneaware "${INSTALL_DIR}/world.pmtiles" 2>/dev/null || true
+            info "Offline basemap → ${INSTALL_DIR}/world.pmtiles"
+        else
+            rm -f "${INSTALL_DIR}/world.pmtiles.part"
+            warn "Offline basemap failed verification — the map will need internet."
+        fi
+    else
+        rm -f "${INSTALL_DIR}/world.pmtiles.part"
+        warn "Offline basemap download failed — the map will need internet."
+        warn "Retry later with: sudo droneaware install-webui"
+    fi
+
     # Bump LocalPublisher buffer to match the Web UI's 50 MB cap; add
     # DRONEAWARE_WEB_PORT if not already present.
     if grep -q '^DRONEAWARE_LOCAL_BUFFER_MAX_BYTES=' "${INSTALL_DIR}/config.env"; then
