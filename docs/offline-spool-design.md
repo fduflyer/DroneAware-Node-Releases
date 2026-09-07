@@ -4,10 +4,18 @@
 on power loss. v1.6 actively encourages fully offline operation, so this is
 the release that has to fix it.
 
-**Server dependency: resolved.** The ingest accepts old events and processes
-them by *detection* timestamp, not upload timestamp. Replay is therefore
-correct with no server change. The only open server question is the
-acceptable **drain rate** (§4).
+**Server dependencies.** The ingest accepts old events and processes them by
+*detection* timestamp, not upload timestamp, so replay is correct. The drain
+rate was answered on 2026-09-07 (§4) — and the answer changed the design:
+the server caps a node at 1,500 rows/min and **sheds the excess silently
+behind an HTTP 200**, so releasing a spool segment on status alone would
+lose data permanently.
+
+**Sequencing: server first.** The node side is not blocked. Ship the
+durability work — segments, cursor, SIGTERM handler, truncated-tail
+tolerance — independently. Only the drain pacing waits, and until the
+server raises its ceiling the correct interval is 8.0 s per 200-event
+batch.
 
 ---
 
@@ -172,28 +180,107 @@ without pulling power, protecting the filesystem as much as the buffer.
 
 ---
 
-## 4. Drain rate
+## 4. Drain rate — answered by the server, 2026-09-07
 
-Steady state is `BATCH_SIZE=200` / `FLUSH_INTERVAL=5.0`.
+**The earlier number in this section was 8x too high and would have caused
+silent data loss.** It proposed 200 events per 1.0 s = 12,000 rows/min. The
+server has enforced a hard per-node cap of **1,500 rows/min** since
+2026-08-24, and excess is **dropped silently while still returning HTTP
+200**. At the proposed rate roughly 87% of every backlog would have been
+discarded, the node told it succeeded, and the segment deleted. Measured on
+another node: ~10,000 rows attempted in one minute, 8,500 shed, 200 OK.
 
-Draining 178,000 events at 200 per 5 s takes **74 minutes**; at 200 per 1 s,
-**15 minutes**. A node returning from a weekend in the field holds more.
+The cap is not being raised. It was sized against duplication-driven floods,
+and every node hitting it today has a duplication factor of 1.00 — they are
+backlog replays and spoof rigs, not duplicates. Raising it would double what
+a spoof rig can inject without addressing what actually happens.
 
-- Keep **200 per batch**. The server's ingest is tuned for it.
-- Add `DRONEAWARE_SPOOL_DRAIN_INTERVAL_SEC`, default **1.0**, used *only*
-  while a backlog exists. Steady state stays at 5.0.
-- Honour **429** and **503** with `Retry-After`, exponential backoff, full
-  jitter, cap 60 s. The existing code already treats 408/429 as retryable;
-  this makes it respect the header instead of retrying on a fixed cadence.
-- Never drop a spooled event on a *retryable* failure. Dropping permanent
-  4xx stays correct.
+### Rates
 
-**Open question for the server:** what sustained rate is acceptable from one
-node draining a backlog, and is a slower steady stream preferred over a
-burst? A fleet returning from an event converges at once. The 1.0 s default
-is a placeholder pending that answer — one config key to change.
+| phase | rate | per 200-event batch |
+|---|---|---|
+| sustained floor | 1,500 rows/min | one batch per **8.0 s** |
+| with surge credits | 2,800 rows/min | one batch per **4.3 s** |
 
----
+**Until the server's step 3 ships, 8.0 s is the correct interval.** Credits
+are computed but not granted before then.
+
+### Surge credits — computed locally, never disclosed
+
+```
+credits  = min(CREDIT_MAX, offline_minutes * SUSTAINED)
+
+SUSTAINED       1500 rows/min      guaranteed floor
+CREDIT_MAX      45000              30 min of sustained
+BURST_CEILING   3000 rows/min      hard ceiling, never exceed
+```
+
+Drain at the burst rate while credits remain, then fall back to sustained.
+Both sides compute the same number from the same public formula and the
+node's own offline duration; the server never reports a balance. This is not
+an oracle because credits accrue only from silence at the sustained rate —
+bursting at 2x for 30 minutes requires 30 minutes of silence first, so the
+long-run average can never exceed sustained. A flooder gains nothing.
+
+**Pace at 2,800/min, not 3,000.** Clock skew between node and server
+otherwise pushes the last batch of each minute over the line, where it is
+shed.
+
+**Credits are lost if the server restarts.** The node is then held at 1,500
+— slower, never lossy. Do not try to detect or compensate for this.
+
+### The token bucket must be NODE-WIDE
+
+A dual-adapter node runs `wifi-2g`, `wifi-5g` and `ble` — three processes,
+one `node_id`, **one shared server-side budget**. Three feeders each pacing
+themselves at the ceiling send 300% of it, each believing it is compliant,
+and two thirds of the backlog is shed silently — on precisely the
+dual-adapter nodes the split-feeder design exists to serve.
+
+A per-feeder interval constant cannot fix this. The bucket lives in the
+shared `SpoolQueue` (§5) and is coordinated across processes with a lock
+file or small socket under `/run/droneaware/`.
+
+### Declare the backlog
+
+`RIDBatch` gains an optional `backlog_remaining: int` — rows still spooled
+**after** this batch, so it decrements naturally and reaching 0 is a clean
+"caught up" signal. It never increases what the node is allowed; it is
+self-reported and unverifiable. It lets the server distinguish a node
+catching up from a live flood, schedule shortest-backlog-first when many
+nodes return at once, and give honest drain estimates. Report it honestly —
+the server cross-checks it against silence it observed independently.
+
+### Honour the pacing hint
+
+The ingest response gains `next_batch_after_ms` (0-120,000): wait that long
+before sending the **next** batch. The batch just sent is already banked.
+
+It is deliberately **not a 429**. An error makes a node re-send its buffer,
+which is the amplifier behind a previous incident; accepting the batch and
+pacing the next one breaks that loop rather than feeding it. The value is
+derived from fleet-wide throughput only and is identical for every node at a
+given instant, which is what stops it being an oracle. With a spool, waiting
+costs nothing.
+
+### 🚨 Never delete a segment on HTTP status alone
+
+`Forwarder.flush` currently calls `raise_for_status()` and **never reads the
+response body**, so it treats 200 as "all rows stored". That is survivable
+while the buffer is RAM-only and would be lost regardless. Once a segment is
+deleted on the strength of that 200, a silent shed becomes silent permanent
+loss — the spool would destroy exactly the data it exists to protect.
+
+Segments must only be released when the rows are accounted for in the
+response (`stored` + `deduped` covering what was sent), not on status alone.
+
+**Open question for the server:** the response carries `stored`, so a node
+can already compute `sent - stored - deduped` — which appears to be the shed
+count that §5 of their handoff deliberately withholds. Either that
+subtraction is a usable acknowledgement signal, in which case the spool
+should use it, or `stored` does not mean what it appears to and we need an
+explicit "all rows accounted for" flag. This needs answering before segment
+deletion can be made safe.
 
 ## 5. Scope
 
@@ -204,7 +291,10 @@ is a placeholder pending that answer — one config key to change.
 | 15 s write timer | both feeders |
 | SIGTERM handler | both feeders |
 | `TimeoutStopSec` | both `.service` units |
-| Drain pacing + `Retry-After` | `Forwarder.flush` |
+| **Node-wide token bucket** (lock file or socket under `/run/droneaware/`) | `SpoolQueue` — NOT per feeder |
+| Surge-credit accounting from offline duration | `SpoolQueue` |
+| Honour `next_batch_after_ms`; send `backlog_remaining` | `Forwarder.flush` |
+| Release segments on accounted rows, not HTTP status | `Forwarder.flush` |
 | Spool state in heartbeat + `droneaware status` | feeders, CLI |
 | Shutdown button + sudoers line | `web_ui.py`, `index.html`, sudoers |
 | New config keys | CLI migrate block **and** `install.sh` write_config |
@@ -223,7 +313,9 @@ DRONEAWARE_SPOOL_DIR=/var/lib/droneaware/spool
 DRONEAWARE_SPOOL_MAX_BYTES=524288000
 DRONEAWARE_SPOOL_SEGMENT_BYTES=4194304
 DRONEAWARE_SPOOL_WRITE_INTERVAL_SEC=15.0
-DRONEAWARE_SPOOL_DRAIN_INTERVAL_SEC=1.0
+DRONEAWARE_SPOOL_SUSTAINED_ROWS_PER_MIN=1500
+DRONEAWARE_SPOOL_BURST_ROWS_PER_MIN=2800
+DRONEAWARE_SPOOL_CREDIT_MAX=45000
 ```
 
 ### Must be observable
@@ -236,6 +328,8 @@ Surface in the heartbeat and in `droneaware status`:
 - whether a backlog exists, and estimated drain time
 - oldest spooled detection timestamp
 - count dropped to the cap, if any
+- current drain rate, and whether surge credits are in use
+- last `next_batch_after_ms` received, when non-zero
 
 ### Test matrix
 
@@ -247,6 +341,13 @@ Surface in the heartbeat and in `droneaware status`:
 6. **Disk full → feeder degrades to RAM-only, says so loudly, never wedges.**
 7. Clean `systemctl stop` mid-outage → zero loss.
 8. Power loss while *online* → at most 15 s lost, not the whole window.
+9. **Three feeders draining at once → combined rate stays under the
+   ceiling.** The failure this catches is silent and only appears on
+   dual-adapter nodes.
+10. `next_batch_after_ms` honoured — a large value delays the next
+    batch and does not trigger a retry.
+11. A response that does not account for every row sent → segment is
+    NOT deleted.
 
 Item 6 is the one that must not be got wrong: the spool must never be able
 to stop a node detecting.
