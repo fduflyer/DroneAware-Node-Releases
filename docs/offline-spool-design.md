@@ -39,36 +39,51 @@ today, because nothing flushes on the way down.
 
 ---
 
-## 1. Write cadence — every 10 s, only when there is new data
+## 1. Write cadence — every 15 s, only when there is new data
 
 **Rule: append-only, each event written exactly once, never rewritten.**
 
-Write *amplification* is what kills SD cards, not write *volume*. If every
-event is appended once and delivered segments are deleted whole rather than
-rewritten, total bytes written equals total detection volume — the
-theoretical floor.
-
-- A timer fires every **10 s**. If no events have arrived since the last
+- A timer fires every **15 s**. If no events have arrived since the last
   write it does nothing — no empty writes, no wake-up churn on an idle node.
 - One `fsync` per write. **Never per event.**
-- **Worst-case loss is therefore the last 10 seconds of detections**, and
-  that is a number worth stating plainly in the UI and the release notes.
+- **Worst-case loss is the last 15 seconds of detections**, and that is a
+  number worth stating plainly in the UI and the release notes.
 
-### Wear budget
+### Why 15 s — and why NOT for SD wear
 
-| load | per 10 s write | per day |
-|---|---|---|
-| busy — 10 events/s | 28 KB | **242 MB** |
-| moderate — 1 event/s | 2.8 KB | 24 MB |
-| NJ001 as measured | 28 B | 0.2 MB |
+15 s is chosen for the **loss window**, not for card wear. Field use is
+bursty: an aircraft passes, then nothing, and the node is unplugged long
+after the flying stopped. The exposure rarely coincides with a detection.
 
-For scale, a camera writing one 4 MB photo every 10 s does **34.6 GB/day** —
-the busy node is **143× lighter**, and NJ001 in practice is five orders of
-magnitude lighter. A 32 GB wear-levelled card absorbs the busy case for
-decades.
+**Wear was measured and is not a factor.** Do not "optimize" this to 30 or
+60 s on endurance grounds — the grounds do not exist:
 
-Wear is a non-issue *provided* the no-rewrite rule holds. That is the design
-constraint; the volume is not.
+- Bytes written per day are **identical at any cadence**. Each event is
+  written exactly once, so the timer cannot reduce volume, only the number
+  of write operations.
+- `preferred_erase_size` on a node's card is **8 MB**
+  (`/sys/block/mmcblk0/device/preferred_erase_size`). At that granularity a
+  36-byte batch and a 4 KB batch are indistinguishable — same erase block,
+  and the FTL coalesces sequential appends regardless.
+- Measured on NJ001: the card already absorbs **56.6 MB/day** from the OS
+  alone — journald, logs, apt. The spool at that node's detection rate adds
+  **0.2 MB/day**, about **0.35%** of what the card writes with DroneAware
+  contributing nothing.
+- SD cards report no wear at all. There is no `life_time` or
+  `pre_eol_info` — those are eMMC fields. Any card-life figure is an
+  estimate built on assumed endurance and assumed write amplification, and
+  should be treated as such.
+
+What the cadence *does* cost, linearly, is data:
+
+| load | 10 s | 15 s | 30 s | 60 s |
+|---|---|---|---|---|
+| busy, 10 events/s | 100 events | 150 | 300 | 600 |
+| moderate, 1 event/s | 10 | 15 | 30 | 60 |
+| NJ001 as measured | 0.1 | 0.1 | 0.3 | 0.5 |
+
+Past 15 s the trade is real detections lost in the exact scenario the spool
+exists for, bought with a wear saving that does not register.
 
 ### Spool unconditionally, not only when offline
 
@@ -91,11 +106,11 @@ at the busy end, which the table above puts in perspective.
 It never has to ask. **The spool is the queue.**
 
 ```
-event -> RAM staging (≤10 s) -> spool segment on disk -> POST -> segment deleted
+event -> RAM staging (≤15 s) -> spool segment on disk -> POST -> segment deleted
 ```
 
 The forwarder always sends from the spool. The RAM deque shrinks to a
-10-second staging buffer. Reading back what was just written is served from
+15-second staging buffer. Reading back what was just written is served from
 the page cache, so this costs no real disk reads.
 
 Startup is then not a recovery path at all — it is the ordinary path:
@@ -186,7 +201,7 @@ is a placeholder pending that answer — one config key to change.
 |---|---|
 | `SpoolQueue` (segments, cursor, cap, corrupt-tail tolerance) | new, shared |
 | Forwarder reads from spool instead of deque | `wifi_feeder.py` **and** `ble_feeder.py` |
-| 10 s write timer | both feeders |
+| 15 s write timer | both feeders |
 | SIGTERM handler | both feeders |
 | `TimeoutStopSec` | both `.service` units |
 | Drain pacing + `Retry-After` | `Forwarder.flush` |
@@ -207,7 +222,7 @@ invisible feature, and this codebase has shipped that bug three times.
 DRONEAWARE_SPOOL_DIR=/var/lib/droneaware/spool
 DRONEAWARE_SPOOL_MAX_BYTES=524288000
 DRONEAWARE_SPOOL_SEGMENT_BYTES=4194304
-DRONEAWARE_SPOOL_WRITE_INTERVAL_SEC=10.0
+DRONEAWARE_SPOOL_WRITE_INTERVAL_SEC=15.0
 DRONEAWARE_SPOOL_DRAIN_INTERVAL_SEC=1.0
 ```
 
@@ -231,7 +246,7 @@ Surface in the heartbeat and in `droneaware status`:
 5. Permanent 4xx during drain → that batch dropped, drain continues.
 6. **Disk full → feeder degrades to RAM-only, says so loudly, never wedges.**
 7. Clean `systemctl stop` mid-outage → zero loss.
-8. Power loss while *online* → at most 10 s lost, not the whole window.
+8. Power loss while *online* → at most 15 s lost, not the whole window.
 
 Item 6 is the one that must not be got wrong: the spool must never be able
 to stop a node detecting.
