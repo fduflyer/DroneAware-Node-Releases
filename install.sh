@@ -587,6 +587,103 @@ _check_undervoltage() {
     warn "Continuing on an under-volted Pi at operator request."
 }
 
+# ---------------------------------------------------------------------------
+# apt progress
+#
+# apt on a fresh image can run for several minutes. Both calls below hide
+# stdout, so the installer looked frozen at "Installing System Packages" —
+# indistinguishable from a hung Pi, and abandoning the install there is the
+# worst possible moment for it.
+#
+# apt can report machine-readable progress on a chosen fd (APT::Status-Fd),
+# emitting `pmstatus:<pkg>:<percent>:<description>`, so this is a real
+# percentage rather than a spinner pretending to be one.
+# ---------------------------------------------------------------------------
+
+# Another package manager holding the lock is the single most common cause
+# of a long stall — unattended-upgrades runs automatically for the first few
+# minutes after a Pi's first boot. Say so instead of appearing hung.
+_wait_apt_lock() {
+    local waited=0
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+       || fuser /var/lib/apt/lists/lock  >/dev/null 2>&1; do
+        if [ "$waited" = "0" ]; then
+            echo "  Another package manager is running (this is normal on a"
+            echo "  freshly imaged Pi). Waiting for it to finish..."
+        fi
+        sleep 5
+        waited=$(( waited + 5 ))
+        if [ "$waited" -ge 300 ]; then
+            warn "Still locked after 5 minutes — continuing anyway."
+            return 0
+        fi
+        printf '\r  waited %ss   ' "$waited"
+    done
+    [ "$waited" -gt 0 ] && printf '\r  Lock released after %ss.        \n' "$waited"
+    return 0
+}
+
+_apt_bar() {
+    local label="$1" pct="$2" secs="$3" width=28
+    local filled=$(( pct * width / 100 ))
+    [ "$filled" -gt "$width" ] && filled=$width
+    [ "$filled" -lt 0 ] && filled=0
+    local mins=$(( secs / 60 )) rem=$(( secs % 60 )) elapsed
+    if [ "$mins" -gt 0 ]; then elapsed="${mins}m${rem}s"; else elapsed="${rem}s"; fi
+    printf '\r  %-24s [' "$label"
+    [ "$filled" -gt 0 ] && printf '%0.s#' $(seq 1 "$filled")
+    [ "$(( width - filled ))" -gt 0 ] && printf '%0.s.' $(seq 1 "$(( width - filled ))")
+    printf '] %3d%%  %-7s' "$pct" "$elapsed"
+}
+
+# _apt_run "Label" <apt-get args...>
+_apt_run() {
+    local label="$1"; shift
+    local status rc err tty=0
+    [ -t 1 ] && tty=1
+    status=$(mktemp); rc=$(mktemp); err=$(mktemp)
+
+    (
+        # noninteractive is load-bearing, not tidiness: stdout is suppressed
+        # here, so a debconf prompt would block forever behind a hidden
+        # question with nothing on screen to explain the hang.
+        DEBIAN_FRONTEND=noninteractive \
+        apt-get -o APT::Status-Fd=3 -o Dpkg::Use-Pty=0 "$@" \
+            >/dev/null 2>"$err" 3>"$status"
+        echo $? >"$rc"
+    ) &
+    local pid=$! start=$SECONDS last=0 shown=-1
+    while kill -0 "$pid" 2>/dev/null; do
+        local pct
+        pct=$(grep -aoE '^(pmstatus|dlstatus):[^:]*:[0-9.]+' "$status" 2>/dev/null \
+              | tail -1 | awk -F: '{printf "%d", $3}')
+        [ -n "${pct:-}" ] && last="$pct"
+        if [ "$tty" = "1" ]; then
+            _apt_bar "$label" "$last" "$(( SECONDS - start ))"
+        elif [ "$last" != "$shown" ] && [ $(( last % 20 )) -eq 0 ]; then
+            # Not a terminal (piped to a log): one line per 20%, not 3/sec.
+            printf '  %s %d%%\n' "$label" "$last"
+            shown="$last"
+        fi
+        sleep 0.4
+    done
+    wait "$pid" 2>/dev/null
+    local code; code=$(cat "$rc" 2>/dev/null || echo 1)
+
+    if [ "$code" = "0" ]; then
+        if [ "$tty" = "1" ]; then
+            _apt_bar "$label" 100 "$(( SECONDS - start ))"; printf '\n'
+        else
+            printf '  %s done (%ss)\n' "$label" "$(( SECONDS - start ))"
+        fi
+    else
+        [ "$tty" = "1" ] && printf '\n'
+        cat "$err" >&2
+    fi
+    rm -f "$status" "$rc" "$err"
+    return "$code"
+}
+
 install_packages() {
     heading "Installing System Packages"
 
@@ -631,15 +728,15 @@ install_packages() {
         fatal "Re-run this installer once the above is resolved."
     }
 
-    apt-get update -qq || _apt_failed
+    _wait_apt_lock
+    _apt_run "Reading package lists" update -qq || _apt_failed
     # gpsd-clients gives us `gpsctl` for the GPS protocol auto-fix
     # (SiRF/UBX → NMEA). --no-install-recommends is important: without it
     # apt pulls gpsd itself, which would seize the GPS port and prevent
     # DroneAware from reading it. gpsd-clients works standalone in the
     # `gpsctl -f -n /dev/xxx` direct-to-device mode we use.
-    apt-get install -y --no-install-recommends \
-        bluez bluetooth iw rfkill curl gpsd-clients \
-        > /dev/null || _apt_failed
+    _apt_run "Installing packages" install -y --no-install-recommends \
+        bluez bluetooth iw rfkill curl gpsd-clients || _apt_failed
     # Non-fatal: a node with no Bluetooth hardware can still run the WiFi
     # feeder. Pre-v1.5.0.6 these were bare commands under `set -e`, so a
     # masked or absent bluetooth unit aborted the whole install silently.
