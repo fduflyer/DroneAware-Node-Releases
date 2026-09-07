@@ -1397,6 +1397,8 @@
     // three is close enough to read streets while still showing more area
     // than a drone is likely to be detected in.
     const DEFAULT_RING_FIT = 3;
+    // Deepest zoom the coarse world pack carries geometry for.
+    const WORLD_PACK_MAX_ZOOM = 6;
 
     // Distance-ring stroke for the active theme. The map uses
     // preferCanvas:true, so ring strokes are painted to a <canvas> and CSS
@@ -1442,7 +1444,13 @@
         // diameter, not its radius. Viewport-relative rather than a
         // hardcoded zoom number, so it lands sensibly on a phone too.
         const fit = L.latLng(center).toBounds(2 * DEFAULT_RING_FIT * stepMeters);
-        state.map.setView(center, state.map.getBoundsZoom(fit, true));
+        let z = state.map.getBoundsZoom(fit, true);
+        // The world pack stops at zoom 5. Opening on the 3-mile ring would
+        // put the operator on an empty canvas — there is simply no geometry
+        // at that scale in a world overview. Pull back to where it has
+        // something to draw; a region pack or the proxy has no such limit.
+        if (state.mapSource === "world") z = Math.min(z, WORLD_PACK_MAX_ZOOM);
+        state.map.setView(center, z);
       }
       const ring       = ringStyle();
 
