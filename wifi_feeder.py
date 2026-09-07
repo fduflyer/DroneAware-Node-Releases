@@ -1448,7 +1448,29 @@ class ScanPlanHopper(threading.Thread):
     DEFAULT_DWELL_SOCIAL_5G_S = 1.0
     DEFAULT_DWELL_EXPLORE_S   = 1.0
 
-    DEFAULT_CAMP_TRIGGER_FRAMES     = 2
+    # One frame is enough. Everything that reaches notify_detection has
+    # already matched a vendor-specific IE carrying the ASTM Remote ID OUI
+    # FA:0B:BC with app code 0x0D (or the NAN service ID) — 32 bits of
+    # registered, drone-specific identifier. Nothing else transmits it, so a
+    # single frame is already proof of an aircraft, not a hint of one.
+    #
+    # Requiring two cost far more than it bought. At the F3411 minimum of
+    # 5 Hz and a 1.0 s explore dwell, the chance a dwell arms a camp:
+    #
+    #     frame loss     need 1    need 2
+    #             0%      99.3%     96.0%
+    #            50%      91.8%     71.3%
+    #            80%      63.2%     26.4%
+    #            90%      39.3%      9.0%
+    #
+    # The penalty concentrates on the weakest signals — an aircraft we DID
+    # detect and then swept away from because the second frame did not
+    # arrive in time, which is exactly where the extra dwell was worth most.
+    # What it protected against was a corrupt frame faking the 32-bit match,
+    # 1 in 4.3e9, costing one camp released after 3 s of silence.
+    DEFAULT_CAMP_TRIGGER_FRAMES     = 1
+    # Inert at the default, since one frame arms immediately. It still
+    # governs an operator who raises the frame count.
     DEFAULT_CAMP_TRIGGER_WINDOW_S   = 2.0
     # Silence before a camp is released, split by channel class because the
     # two classes beacon at very different rates.

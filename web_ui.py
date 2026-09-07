@@ -321,17 +321,20 @@ CONFIG_SCHEMA = [
                  "second, so even a short stop usually catches one. Raising "
                  "this makes each channel more reliable but lengthens the "
                  "time before the sweep returns to any given channel."},
-        {"key": "WIFI_CAMP_TRIGGER_FRAMES", "default": "2", "label": "Frames to camp",
+        {"key": "WIFI_CAMP_TRIGGER_FRAMES", "default": "1", "label": "Frames to camp",
          "type": "number",
          "info": "How many Remote ID frames must arrive on a channel before "
-                 "the radio stops sweeping and stays there. Lower reacts "
-                 "faster; too low and one stray frame parks the radio on a "
-                 "quiet channel while the rest go unwatched."},
+                 "the radio stops sweeping and stays there. One is the "
+                 "default: only an aircraft transmits the Remote ID "
+                 "identifier, so a single frame already proves something is "
+                 "flying. Raising this makes the node ignore aircraft it can "
+                 "only hear intermittently, which are usually the distant "
+                 "ones."},
         {"key": "WIFI_CAMP_TRIGGER_WINDOW_SEC", "default": "2.0", "label": "Camp trigger window",
          "type": "number", "unit": "s",
-         "info": "The window those frames have to arrive within. Together "
-                 "with the frame count this is the rule for 'something is "
-                 "really transmitting here' rather than a one-off."},
+         "info": "The window those frames have to arrive within. Has no "
+                 "effect while the frame count is 1, since the first frame "
+                 "arms the camp immediately."},
         {"key": "WIFI_CAMP_SILENCE_SEC", "default": "6.0", "label": "Camp silence (common channels)",
          "type": "number", "unit": "s",
          "info": "How long to keep holding a common channel (2.4 GHz ch6, "
