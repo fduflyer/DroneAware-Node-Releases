@@ -61,7 +61,6 @@ import math
 import os
 import re
 import socket
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -165,8 +164,20 @@ SSE_CLIENT_QUEUE_MAX = 100
 # when the browser can't reach CartoDB. If the bundle is missing (e.g.,
 # dev runs without the file), the tile route returns 404 and the client
 # stays on CartoDB — graceful degradation either way.
-WORLD_TILES_FILENAME = "world-tiles.mbtiles"
-WORLD_TILES_MAX_ZOOM = 6
+# Coarse world pack, downloaded from our own tile host. Replaces a bundled
+# MBTiles file of tiles scraped from CartoDB's CDN — their rendered tiles
+# redistributed inside our binary, the same exposure the live layer had.
+# This is the offline floor: what a node with no region pack and no uplink
+# can still draw.
+WORLD_PACK_PATH = os.environ.get(
+    "DRONEAWARE_WORLD_PACK_PATH", "/opt/droneaware/world.pmtiles")
+WORLD_PACK_URL = os.environ.get(
+    "DRONEAWARE_WORLD_PACK_URL", "https://tiles.droneaware.io/world.pmtiles")
+
+
+def _world_pack_path() -> str | None:
+    """The downloaded coarse world pack, or None."""
+    return WORLD_PACK_PATH if os.path.isfile(WORLD_PACK_PATH) else None
 
 # A downloaded Protomaps region pack: vector tiles (MVT) in a single
 # PMTiles archive, rendered client-side by protomaps-leaflet. Replaces both
@@ -866,44 +877,6 @@ def get_home_location() -> dict | None:
         return None
 
 
-# ---- World-tile bundle (offline basemap) ------------------------------------
-
-# MBTiles is the de facto offline raster-tile container — a SQLite file
-# with a `tiles` table keyed by (zoom_level, tile_column, tile_row,
-# tile_data). The schema uses TMS row indexing (y-axis inverted from
-# Leaflet's XYZ scheme); the route below handles the conversion.
-# Connection is opened lazily once and shared across threads — SQLite
-# handles concurrent reads fine with check_same_thread=False; the lock
-# is belt-and-suspenders for sqlite3 module-version variance.
-
-_mbtiles_path = None
-_mbtiles_conn = None
-_mbtiles_lock = threading.Lock()
-
-
-def _mbtiles_init():
-    """Resolve the MBTiles path from the bundled web_static dir and open
-    a shared read-only connection. Called once at app startup."""
-    global _mbtiles_path, _mbtiles_conn
-    candidate = os.path.join(_static_root(), WORLD_TILES_FILENAME)
-    if os.path.isfile(candidate):
-        try:
-            _mbtiles_conn = sqlite3.connect(
-                f"file:{candidate}?mode=ro", uri=True, check_same_thread=False,
-            )
-            _mbtiles_path = candidate
-            log.info(
-                f"World-tile bundle loaded: {candidate} "
-                f"(offline basemap available up to zoom {WORLD_TILES_MAX_ZOOM})"
-            )
-        except Exception as e:
-            log.warning(f"Failed to open world-tile bundle at {candidate}: {e}")
-    else:
-        log.info(
-            f"No world-tile bundle at {candidate} — offline basemap unavailable. "
-            f"Browser will stay on CartoDB; if CartoDB is unreachable the map "
-            f"will render without a basemap (drone markers still position correctly)."
-        )
 
 
 # ---- Flask app --------------------------------------------------------------
@@ -1119,20 +1092,21 @@ def api_status():
         # basemap rendering. Frontend uses this to know whether the
         # /tiles/{z}/{x}/{y}.png fallback layer will return real tiles
         # or 404s if CartoDB is unreachable.
-        "tiles_local": _mbtiles_conn is not None,
-        "tiles_local_max_zoom": WORLD_TILES_MAX_ZOOM if _mbtiles_conn else None,
+
         # Whether a Protomaps region pack has been downloaded. When true the
         # frontend renders vector tiles from /map.pmtiles and needs neither
         # CartoDB nor the raster bundle — at any zoom, in either theme.
         "map_pack": (_region_pack_path() is not None
-                     or _tile_upstream_reachable()),
+                     or _tile_upstream_reachable()
+                     or _world_pack_path() is not None),
         "map_pack_bytes": (os.path.getsize(_region_pack_path())
                            if _region_pack_path() else None),
         # local  — a downloaded pack, works with no uplink
         # proxy  — streaming from the tile host through this node
         # none   — neither; the client keeps its raster fallback
-        "map_source": ("local" if _region_pack_path()
-                       else "proxy" if _tile_upstream_reachable() else "none"),
+        "map_source": ("region" if _region_pack_path()
+                       else "proxy" if _tile_upstream_reachable()
+                       else "world" if _world_pack_path() else "none"),
         # v1.5.0 Gap 3: per-feeder status for the three-row BLE/2.4/5
         # panel in the offline UI (matching My Nodes layout).
         "feeders":     _read_feeder_states(),
@@ -1566,7 +1540,12 @@ def region_pack():
     # No local pack yet: forward the range to the tile host. Streamed, never
     # buffered — the upstream archive is ~138 GB and a single range can be
     # megabytes.
-    if not TILE_UPSTREAM_URL:
+    if not TILE_UPSTREAM_URL or not _tile_upstream_reachable():
+        # Offline floor: the coarse world pack, if it has been downloaded.
+        world = _world_pack_path()
+        if world:
+            return send_file(world, mimetype="application/octet-stream",
+                             conditional=True, max_age=86400)
         return Response(status=404)
     # Range is obvious. If-Match is load-bearing and easy to miss: the tile
     # archive is replaced in place on a planet rebuild, and a PMTiles client
@@ -1659,7 +1638,6 @@ def main():
              f"Stale threshold: {STALE_AGE_SEC}s")
     log.info(f"Data source: tail {LOCAL_RING_PATH} every {TAIL_POLL_SEC}s")
 
-    _mbtiles_init()
 
     threading.Thread(target=consumer_thread, daemon=True).start()
     threading.Thread(target=prune_thread, daemon=True).start()

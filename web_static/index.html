@@ -1261,16 +1261,9 @@
       selectedMac: null,
       sse: null,
       map: null,
-      // Which basemap is in use: "local", "proxy" or "none".
-      // (offline bundle served by web_ui from MBTiles). Resolved by
-      // navigator.onLine at startup, then maintained by online/offline
-      // window events + Leaflet tileerror auto-swap. tilesLocalAvailable
-      // is set from /api/status at startup so we don't try to swap to a
-      // bundle that doesn't exist on this node.
-      tilesLocalAvailable: false,
-      // A Protomaps region pack, if one has been downloaded. Outranks both
-      // other sources when present: street-level detail at any zoom, both
-      // themes from one file, and no network at all.
+      // Which basemap the node reports it can draw: "region", "proxy",
+      // "world" or "none". The node decides; the client renders whatever
+      // /map.pmtiles gives it.
       mapPackAvailable: false,
       // Display units: "imperial" (ft AGL / mph / mi rings) or "metric"
       // (m AGL / km/h / km rings). Persisted per-browser in localStorage.
@@ -1315,8 +1308,6 @@
 
        CartoDB was removed here: it watermarks unregistered use, and every
        node with internet was pointing browsers at it. */
-    const WORLD_TILES_URL = "/tiles/{z}/{x}/{y}.png";
-    const LOCAL_TILES_MAX_ZOOM = 6;
 
     function applyMapTheme() {
       const theme = document.documentElement.dataset.theme || "dark";
@@ -1337,19 +1328,11 @@
         return;
       }
 
-      // Bundled world overview. Only zoom 0-6, so maxNativeZoom keeps
-      // Leaflet upscaling zoom-6 tiles rather than requesting ones that do
-      // not exist — blurry, but correctly positioned, and markers and rings
-      // stay accurate.
-      state.tileLayer = L.tileLayer(WORLD_TILES_URL, {
-        attribution: '&copy; OpenStreetMap',
-        maxZoom: 19,
-        maxNativeZoom: LOCAL_TILES_MAX_ZOOM,
-      }).addTo(state.map);
-
-      // Rings are Canvas-painted, so a theme swap does not restyle them the
-      // way it does the CSS-driven chrome. Redraw so the stroke color
-      // follows the new basemap instead of staying tuned to the old one.
+      // Nothing to draw. The node reports map_pack=false only when it has
+      // no region pack, no world pack and cannot reach the tile host — so
+      // there is no basemap to fall back TO. Markers, tracks and distance
+      // rings still position correctly on an empty canvas, which is the
+      // honest result rather than a stale or third-party layer.
       if (state.home) drawHomeView(state.home);
     }
 
@@ -2048,10 +2031,6 @@
         document.getElementById("stat-version").textContent = s.version;
         if (s.node_id) state.nodeId = s.node_id;
 
-        // Bundle availability — once known, swap to local immediately if
-        // we started in offline mode (we couldn't swap at init because
-        // tilesLocalAvailable was unknown). After the first /api/status,
-        // tileerror-driven fallback also becomes possible.
         // The vector basemap can appear OR disappear: a downloaded pack is
         // permanent, but the proxied one depends on the node reaching the
         // tile host. Re-apply on either transition.
@@ -2062,12 +2041,6 @@
           applyMapTheme();
         }
 
-        if (s.tiles_local && !state.tilesLocalAvailable) {
-          state.tilesLocalAvailable = true;
-          // Re-apply now that we know the world bundle exists — the first
-          // applyMapTheme() may have run before this status arrived.
-          if (!state.mapPackAvailable) applyMapTheme();
-        }
 
         // Home location may change on mobile nodes as the GPS fix moves.
         // Static nodes: strict equality is fine (config-file source, never
