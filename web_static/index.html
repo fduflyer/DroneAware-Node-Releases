@@ -1261,13 +1261,12 @@
       selectedMac: null,
       sse: null,
       map: null,
-      // Tile source state — "cartocdn" (online, default) or "local"
+      // Which basemap is in use: "local", "proxy" or "none".
       // (offline bundle served by web_ui from MBTiles). Resolved by
       // navigator.onLine at startup, then maintained by online/offline
       // window events + Leaflet tileerror auto-swap. tilesLocalAvailable
       // is set from /api/status at startup so we don't try to swap to a
       // bundle that doesn't exist on this node.
-      tileSource: (typeof navigator !== "undefined" && navigator.onLine === false) ? "local" : "cartocdn",
       tilesLocalAvailable: false,
       // A Protomaps region pack, if one has been downloaded. Outranks both
       // other sources when present: street-level detail at any zoom, both
@@ -1308,41 +1307,25 @@
       return id.startsWith("TEST-") || id.startsWith("DA-TEST") || (evt.mac || "").startsWith("00:00:00");
     }
 
-    /* ----- Map init ----- */
-    // Two tile sources × two themes. CartoDB (live, "cartocdn") is the
-    // primary — full street-level detail any zoom, requires browser to
-    // reach basemaps.cartocdn.com. Local bundle ("local") is the offline
-    // fallback served by web_ui from a bundled MBTiles file (zoom 0-6
-    // worldwide, Dark Matter style only — day variant uses the dark
-    // tiles too since we don't bundle Positron). Active source is
-    // chosen by navigator.onLine + tileerror auto-swap; see below.
-    const TILE_URLS = {
-      cartocdn: {
-        dark: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-        day:  "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-      },
-      local: {
-        // Bundle is dark-only by design — keeps the binary lean
-        // (~15 MB vs ~30 MB for both). Day-mode toggle while offline
-        // leaves the basemap on Dark Matter; everything else (chrome,
-        // popups, sidebar) still flips to day colors.
-        dark: "/tiles/{z}/{x}/{y}.png",
-        day:  "/tiles/{z}/{x}/{y}.png",
-      },
-    };
+    /* ----- Map init -----
+       Two sources, both ours. The vector basemap comes from a PMTiles
+       archive — a downloaded region pack when one exists, otherwise
+       streamed through this node from tiles.droneaware.io. The bundled
+       zoom 0-6 raster world is the last resort when neither is available.
+
+       CartoDB was removed here: it watermarks unregistered use, and every
+       node with internet was pointing browsers at it. */
+    const WORLD_TILES_URL = "/tiles/{z}/{x}/{y}.png";
     const LOCAL_TILES_MAX_ZOOM = 6;
 
     function applyMapTheme() {
       const theme = document.documentElement.dataset.theme || "dark";
-      const source = state.tileSource || "cartocdn";
-      const url = TILE_URLS[source][theme];
-
       if (state.tileLayer) state.map.removeLayer(state.tileLayer);
 
-      // A downloaded region pack wins over both other sources. It is vector,
-      // so one archive covers every zoom and both themes — the flavor is a
-      // render option, not a second download. protomaps-leaflet supplies its
-      // own "Protomaps © OpenStreetMap" attribution, which is what ODbL
+      // Vector wins whenever it is available. One archive covers every zoom
+      // and both themes — the flavor is a render option, not a second
+      // download. protomaps-leaflet supplies its own
+      // "Protomaps © OpenStreetMap" attribution, which is what ODbL
       // requires; do not hand-roll it here.
       if (state.mapPackAvailable) {
         state.tileLayer = protomapsL.leafletLayer({
@@ -1354,53 +1337,20 @@
         return;
       }
 
-      const opts = {
-        attribution: source === "cartocdn"
-          ? '&copy; OpenStreetMap &copy; CARTO'
-          : '&copy; OpenStreetMap &copy; CARTO (offline bundle)',
+      // Bundled world overview. Only zoom 0-6, so maxNativeZoom keeps
+      // Leaflet upscaling zoom-6 tiles rather than requesting ones that do
+      // not exist — blurry, but correctly positioned, and markers and rings
+      // stay accurate.
+      state.tileLayer = L.tileLayer(WORLD_TILES_URL, {
+        attribution: '&copy; OpenStreetMap',
         maxZoom: 19,
-      };
-      if (source === "cartocdn") {
-        opts.subdomains = "abcd";
-      } else {
-        // Bundle only covers zoom 0-6. Leaflet's maxNativeZoom tells it
-        // to keep using zoom-6 tiles for higher zoom levels, scaling
-        // them up (blurry but positioned correctly). Drone markers and
-        // distance rings still place accurately — basemap just degrades.
-        opts.maxNativeZoom = LOCAL_TILES_MAX_ZOOM;
-      }
-
-      state.tileLayer = L.tileLayer(url, opts).addTo(state.map);
+        maxNativeZoom: LOCAL_TILES_MAX_ZOOM,
+      }).addTo(state.map);
 
       // Rings are Canvas-painted, so a theme swap does not restyle them the
-      // way it does the CSS-driven chrome. Redraw so the stroke colour
+      // way it does the CSS-driven chrome. Redraw so the stroke color
       // follows the new basemap instead of staying tuned to the old one.
       if (state.home) drawHomeView(state.home);
-
-      // Listen for tile load failures on the CartoDB layer — first
-      // failure swaps us to the local bundle. Covers the case where
-      // navigator.onLine reports true but the browser can't actually
-      // reach CartoDB (corporate firewall, captive portal, etc.).
-      // Local layer can't fail meaningfully — it's served by the same
-      // Pi the operator is already connected to — so no handler there.
-      if (source === "cartocdn") {
-        state.tileLayer.on("tileerror", switchToLocalTiles);
-      }
-    }
-
-    function switchToLocalTiles() {
-      if (state.tileSource === "local") return;
-      if (!state.tilesLocalAvailable) return;  // no bundle on this node
-      console.info("[map] Switching to bundled offline tiles");
-      state.tileSource = "local";
-      applyMapTheme();
-    }
-
-    function switchToCartoDBTiles() {
-      if (state.tileSource === "cartocdn") return;
-      console.info("[map] Network back — switching to CartoDB tiles");
-      state.tileSource = "cartocdn";
-      applyMapTheme();
     }
 
     // Above this zoom level, the distance rings + labels are hidden from
@@ -1427,7 +1377,14 @@
       });
       state.map = m;
       state.homeLayer = L.layerGroup().addTo(m);   // holds home marker + rings
-      applyMapTheme();
+      // Deliberately NOT applying a basemap here. Which one is correct
+      // depends on whether this node has a pack or can reach the tile host,
+      // and only /api/status knows. The first status response applies it;
+      // this timeout is the backstop for a status call that never returns,
+      // so the map is never permanently blank.
+      state.basemapTimer = setTimeout(() => {
+        if (!state.tileLayer) applyMapTheme();
+      }, 4000);
 
       // Hide the home layer (rings + labels + home marker) at street-level
       // zoom. Layer membership is preserved so re-attaching restores
@@ -2095,22 +2052,21 @@
         // we started in offline mode (we couldn't swap at init because
         // tilesLocalAvailable was unknown). After the first /api/status,
         // tileerror-driven fallback also becomes possible.
-        // A region pack outranks everything else, so apply it as soon as
-        // the first status confirms one exists — including when we started
-        // on CartoDB because the browser reported itself online.
-        if (s.map_pack && !state.mapPackAvailable) {
-          state.mapPackAvailable = true;
+        // The vector basemap can appear OR disappear: a downloaded pack is
+        // permanent, but the proxied one depends on the node reaching the
+        // tile host. Re-apply on either transition.
+        if (!!s.map_pack !== state.mapPackAvailable || !state.tileLayer) {
+          state.mapPackAvailable = !!s.map_pack;
+          state.mapSource = s.map_source || "none";
+          clearTimeout(state.basemapTimer);
           applyMapTheme();
         }
 
         if (s.tiles_local && !state.tilesLocalAvailable) {
           state.tilesLocalAvailable = true;
-          if (state.tileSource === "local") {
-            // Re-apply the layer now that we know the bundle exists —
-            // initial applyMapTheme() may have rendered an empty layer
-            // if we started offline before this status fetch.
-            applyMapTheme();
-          }
+          // Re-apply now that we know the world bundle exists — the first
+          // applyMapTheme() may have run before this status arrived.
+          if (!state.mapPackAvailable) applyMapTheme();
         }
 
         // Home location may change on mobile nodes as the GPS fix moves.
@@ -2454,13 +2410,12 @@ ${multiSerialHTML}
       document.getElementById("btn-theme").addEventListener("click", toggleTheme);
       document.getElementById("btn-units").addEventListener("click", toggleUnits);
 
-      // Network transitions → swap the basemap source. CartoDB if we're
-      // online (full street-level detail), bundled local tiles when
-      // offline (world overview). These are coarse signals — tileerror
-      // on the active CartoDB layer is the ground-truth fallback (see
-      // applyMapTheme).
-      window.addEventListener("online",  switchToCartoDBTiles);
-      window.addEventListener("offline", switchToLocalTiles);
+      // A network transition changes whether the node can proxy the tile
+      // host, which the next status poll reports authoritatively. Ask
+      // immediately rather than waiting out the poll interval; the browser
+      // being online says nothing about whether the NODE can reach it.
+      window.addEventListener("online",  refreshStatus);
+      window.addEventListener("offline", refreshStatus);
 
       // Initial snapshot
       try {

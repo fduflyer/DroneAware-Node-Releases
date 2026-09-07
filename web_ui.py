@@ -1568,16 +1568,35 @@ def region_pack():
     # megabytes.
     if not TILE_UPSTREAM_URL:
         return Response(status=404)
+    # Range is obvious. If-Match is load-bearing and easy to miss: the tile
+    # archive is replaced in place on a planet rebuild, and a PMTiles client
+    # holding a cached header sends If-Match with the ETag it read. Forward
+    # it and a swap mid-session returns 412, so the client re-reads the
+    # header. Strip it — as this did — and the conditional silently always
+    # succeeds, and the client reads at offsets belonging to the previous
+    # archive. That is garbage tiles with no error anywhere.
     headers = {}
-    rng = request.headers.get("Range")
-    if rng:
-        headers["Range"] = rng
+    for h in ("Range", "If-Match", "If-None-Match"):
+        v = request.headers.get(h)
+        if v:
+            headers[h] = v
     try:
         up = _tile_session().get(TILE_UPSTREAM_URL, headers=headers,
                                  stream=True, timeout=(6, 30))
     except Exception as e:
         log.warning("[tiles] upstream unreachable: %s", e)
         return Response(status=504)
+
+    # 412 and 304 are answers, not failures, and both carry no body. Turning
+    # a 412 into a 502 would hide exactly the signal the client needs.
+    if up.status_code in (304, 412):
+        out = Response(status=up.status_code)
+        for h in ("ETag", "Cache-Control"):
+            if h in up.headers:
+                out.headers[h] = up.headers[h]
+        up.close()
+        return out
+
     if up.status_code not in (200, 206):
         log.warning("[tiles] upstream returned %s", up.status_code)
         up.close()
