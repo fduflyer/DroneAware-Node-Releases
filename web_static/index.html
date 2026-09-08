@@ -2748,7 +2748,10 @@ ${multiSerialHTML}
           nm.textContent = a.name;
           const meta = document.createElement("div");
           meta.className = "adapter-meta mono";
-          meta.textContent = [a.iface, a.mac, a.driver, a.usb_id]
+          // Retune last, so it reads as the notable fact rather than more
+          // hardware trivia. It is what decides which adapter should sweep.
+          meta.textContent = [a.iface, a.mac, a.driver,
+                              a.retune_ms ? `${a.retune_ms}ms retune` : null]
             .filter(Boolean).join("  ·  ");
           left.appendChild(nm);
           left.appendChild(meta);
@@ -2760,6 +2763,22 @@ ${multiSerialHTML}
           row.appendChild(left);
           row.appendChild(role);
           box.appendChild(row);
+        }
+
+        // The 5 GHz adapter sweeps ~20 channels a cycle; the 2.4 one mostly
+        // holds ch6. So the faster radio belongs on 5 GHz, and when it is
+        // not, say so rather than leaving the operator to compare numbers.
+        const byRole = {};
+        for (const a of d.adapters) if (a.retune_ms) byRole[a.role] = a;
+        const fast = byRole["2.4 GHz"], slow = byRole["5 GHz"];
+        if (fast && slow && fast.retune_ms < slow.retune_ms) {
+          const hint = document.createElement("p");
+          hint.className = "cfg-help";
+          hint.textContent =
+            `The 5 GHz adapter takes ${slow.retune_ms}ms to change channel `
+            + `against ${fast.retune_ms}ms for the 2.4 GHz one, and 5 GHz `
+            + `sweeps far more. Swapping them would spend less time deaf.`;
+          host.appendChild(hint);
         }
 
         const bar = document.createElement("div");

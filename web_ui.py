@@ -1371,6 +1371,28 @@ def api_action():
     return jsonify({"ok": True, "started": name})
 
 
+def _retune_by_mac() -> dict:
+    """MAC -> measured retune in ms, from the per-band state files.
+
+    The feeder times its own radio at startup. The spread across adapters we
+    have tested is 22-1007 ms, and the radio is deaf for all of it, so this
+    is what tells an operator which of two adapters should be the one
+    sweeping 5 GHz — the sweeper pays the cost on every leg.
+    """
+    out = {}
+    for band in ("2g", "5g", ""):
+        suffix = f"_{band}" if band else ""
+        try:
+            with open(f"/run/droneaware/wifi_state{suffix}.json") as f:
+                st = json.load(f)
+            mac = (st.get("adapter_mac") or "").lower()
+            if mac and st.get("retune_ms"):
+                out[mac] = st["retune_ms"]
+        except (OSError, ValueError):
+            continue
+    return out
+
+
 def _enumerate_adapters() -> list:
     """Live WiFi hardware and the role each adapter currently holds.
 
@@ -1386,6 +1408,7 @@ def _enumerate_adapters() -> list:
         if mac:
             roles.setdefault(mac, role)
 
+    retune = _retune_by_mac()
     out = []
     try:
         ifaces = sorted(os.listdir("/sys/class/net"))
@@ -1432,6 +1455,7 @@ def _enumerate_adapters() -> list:
             "name": "Onboard WiFi (network uplink)" if onboard else name,
             "onboard": onboard,
             "role": "network uplink" if onboard else roles.get(mac, "unassigned"),
+            "retune_ms": retune.get(mac),
         })
 
     return out

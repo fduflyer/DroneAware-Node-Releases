@@ -3310,6 +3310,15 @@ class WiFiFeeder:
                 "scan_mode":    scan_mode,
                 "current_channel": getattr(self.hopper, "current_channel", None)
                                     if hasattr(self, "hopper") else None,
+                # Measured on this radio at startup, not looked up. Spans
+                # 22-1007 ms across adapters we have tested, and the radio is
+                # deaf for the whole of it, so it is the single biggest
+                # factor in how much a given node actually hears. Surfaced so
+                # an operator can see which of their two adapters should be
+                # the one sweeping 5 GHz — the sweeper retunes far more.
+                "retune_ms": (round(1000 * self.hopper.retune_s)
+                              if hasattr(self, "hopper")
+                              and getattr(self.hopper, "retune_s", 0) else None),
                 "wifi_ok":      wifi_ok,
                 "wifi_fault":   wifi_fault,
                 "sent_total":   self.forwarder.sent_total if hasattr(self, "forwarder") else 0,

@@ -1802,9 +1802,28 @@ cmd_status() {
             elif [[ "$mode" == "monitor" ]];         then role="unused — run 'sudo droneaware refresh'"
             else                                          role="not used for detection"
             fi
-            printf "    %-7s %-13s %-8s %-7s %s\n" \
+            # Retune cost, measured by the feeder on this radio at startup.
+            # It spans 22-1007 ms across adapters we have tested and the
+            # radio is deaf for all of it, so it is the number that decides
+            # which of two adapters should be the one sweeping 5 GHz.
+            local rt sf
+            rt=""
+            for sf in /run/droneaware/wifi_state_2g.json \
+                      /run/droneaware/wifi_state_5g.json \
+                      /run/droneaware/wifi_state.json; do
+                [[ -f "$sf" ]] || continue
+                rt=$(python3 -c 'import json,sys
+try: s=json.load(open(sys.argv[1]))
+except Exception: sys.exit()
+if (s.get("adapter_mac") or "").lower()==(sys.argv[2] or "").lower():
+    ms=s.get("retune_ms")
+    if ms: print("%dms retune" % ms)' "$sf" "$mac" 2>/dev/null)
+                [[ -n "$rt" ]] && break
+            done
+            printf "    %-7s %-13s %-8s %-7s %s%s\n" \
                 "$ifn" "${drv:-?}" "${mode:-?}" \
-                "$( [[ -n "$chan" ]] && echo "ch${chan}" || echo "—" )" "$role"
+                "$( [[ -n "$chan" ]] && echo "ch${chan}" || echo "—" )" "$role" \
+                "$( [[ -n "$rt" ]] && echo "  ·  $rt" )"
         done
         echo ""
     fi
