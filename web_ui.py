@@ -842,6 +842,34 @@ def _read_config_env(key: str) -> str | None:
     return None
 
 
+# Whether this node can reach DroneAware. Distinct from whether the BROWSER
+# can reach the node — the header shows both, because they fail separately
+# and mean different things to an operator.
+#
+# Cached: the status poll runs every few seconds and a node with no uplink
+# must not spend a connect timeout on every one of them.
+_uplink = {"at": 0.0, "ok": False}
+
+
+def _server_reachable() -> bool:
+    url = (_read_config_env("SERVER_URL") or "").strip()
+    if not url:
+        return False
+    now = time.time()
+    if now - _uplink["at"] < 30:
+        return _uplink["ok"]
+    ok = False
+    try:
+        # Any answer at all proves the route. A 404 from the wrong path still
+        # means the node reached DroneAware, which is the question asked.
+        r = requests.get(url.rstrip("/") + "/health", timeout=4)
+        ok = r.status_code < 500
+    except Exception:
+        ok = False
+    _uplink.update(at=now, ok=ok)
+    return ok
+
+
 def _gps_device_present() -> bool:
     """Whether a GPS device exists. Mirrors the feeder's own discovery order
     rather than trusting GPS_DEVICE, which is blank on auto-detect nodes."""
@@ -1107,6 +1135,9 @@ def api_status():
         # then "Awaiting fix", matching nodes.html.
         "mobile":      (_read_config_env("NODE_MOBILE") or "false").lower() == "true",
         "has_gps":     _gps_device_present(),
+        # The SERVER_URL itself never leaves the node — only whether
+        # the node can currently reach it.
+        "uplink_ok":   _server_reachable(),
         "node_id":     _read_config_env("NODE_ID") or "this-node",
         # Whether the bundled world-tile MBTiles is available for offline
         # basemap rendering. Frontend uses this to know whether the

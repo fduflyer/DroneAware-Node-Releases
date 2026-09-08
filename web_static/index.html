@@ -144,6 +144,11 @@
       box-shadow: 0 0 6px var(--status-ok);
     }
     .status-pill.offline .dot { background: var(--status-idle); box-shadow: none; }
+    /* Offline but working: amber, not red. The node is doing its job. */
+    .status-pill.scanning { color: var(--fresh-recent); border-color: var(--fresh-recent); }
+    .status-pill.scanning .dot {
+      background: var(--fresh-recent); box-shadow: 0 0 6px var(--fresh-recent);
+    }
 
     .header-right {
       display: flex;
@@ -2016,6 +2021,7 @@
         const s = await r.json();
         renderFeeders(s.feeders);
         renderLocation(s);
+        setHeaderStatus(undefined, s.uplink_ok !== false);
         document.getElementById("stat-buffer").textContent =
           `${s.buffer_pct}% (${(s.buffer_bytes / 1e6).toFixed(1)} MB)`;
         document.getElementById("stat-cpu").textContent =
@@ -2066,21 +2072,37 @@
         try { handleEvent(JSON.parse(e.data)); } catch {}
       };
       es.onerror = () => {
-        setHeaderStatus(false);
+        setHeaderStatus(false, undefined);
         // EventSource auto-reconnects; just visually flip to OFFLINE
       };
-      es.onopen = () => setHeaderStatus(true);
+      es.onopen = () => setHeaderStatus(true, undefined);
       state.sse = es;
     }
-    function setHeaderStatus(live) {
-      const pill = document.getElementById("hdr-status");
+    // Two independent things fail here and they mean different things:
+    //   browser -> node   the page has lost this node; nothing on screen can
+    //                     be trusted, including any claim about scanning
+    //   node -> server    the node is offline but STILL DETECTING, which is
+    //                     the whole point of the spool and worth saying out
+    //                     loud rather than showing a bare "offline"
+    function setHeaderStatus(sseUp, uplinkOk) {
+      if (sseUp !== undefined) state.sseUp = sseUp;
+      if (uplinkOk !== undefined) state.uplinkOk = uplinkOk;
+      const pill  = document.getElementById("hdr-status");
       const label = document.getElementById("hdr-status-label");
-      if (live) {
-        pill.classList.remove("offline");
-        label.textContent = "LIVE";
+
+      if (state.sseUp === false) {
+        pill.className = "status-pill offline";
+        label.textContent = "NO CONNECTION";
+        pill.title = "This page cannot reach the node.";
+      } else if (state.uplinkOk === false) {
+        pill.className = "status-pill scanning";
+        label.textContent = "OFFLINE SCANNING";
+        pill.title = "No route to DroneAware. The node is still detecting; "
+                   + "everything it hears is held until the link returns.";
       } else {
-        pill.classList.add("offline");
-        label.textContent = "OFFLINE";
+        pill.className = "status-pill";
+        label.textContent = "LIVE";
+        pill.title = "Detecting and reporting to DroneAware.";
       }
     }
 
