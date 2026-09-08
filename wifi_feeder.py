@@ -1843,11 +1843,16 @@ class ScanPlanHopper(threading.Thread):
         # been switched off has no social leg, which rendered as a stray
         # leading " + ".
         plan_desc = " + ".join(p for p in (social, explore_desc) if p)
+        # At the default of one frame the window never applies, so printing
+        # it would describe a rule that is not in force — and "1 frames/2.0s"
+        # reads as a bug in its own right.
+        camp_desc = ("camp on first frame" if self.camp_trigger_frames <= 1
+                     else f"camp after {self.camp_trigger_frames} frames/"
+                          f"{self.camp_trigger_window_s}s")
         log.info(
             f"Scan plan {self.plan.upper()} started: {plan_desc} "
             f"({true_cycle:.1f}s cycle incl. {1000*r:.0f}ms retune x{legs_per_cycle}); "
-            f"camp after {self.camp_trigger_frames} frames/"
-            f"{self.camp_trigger_window_s}s, release on {self.camp_silence_s}s silence "
+            f"{camp_desc}, release on {self.camp_silence_s}s silence "
             f"(social) / {self.camp_silence_offsocial_s}s (off-social)"
             + (f", primary leg every {self.camp_release_interval_s}s"
                if self.camp_release else ", no release (partner holds ch6)")

@@ -236,9 +236,11 @@ WIFI_DWELL_EXPLORE_SEC=1.0
 
 # Camping: hold the channel once a drone is heard on it, instead of
 # carrying on sweeping past it.
-#   TRIGGER_FRAMES / TRIGGER_WINDOW_SEC  frames needed to engage. Two
-#       within two seconds — one stray decode must not be able to pin the
-#       radio to an empty channel.
+#   TRIGGER_FRAMES / TRIGGER_WINDOW_SEC  frames needed to engage. One,
+#       because only an aircraft transmits the Remote ID identifier — a
+#       single frame already proves something is flying, and waiting for a
+#       second one mostly loses the distant aircraft heard intermittently.
+#       WINDOW_SEC has no effect at one frame; it governs a raised count.
 #   SILENCE_SEC   let go after this long with nothing heard on a SOCIAL
 #       channel. The timer is per-channel and any frame resets it, so a
 #       second aircraft arriving keeps the node camped after the first one
@@ -255,7 +257,7 @@ WIFI_DWELL_EXPLORE_SEC=1.0
 #       hiding every other drone. Ignored with two adapters, where the
 #       sweeping adapter camps indefinitely because its partner never
 #       leaves ch6.
-WIFI_CAMP_TRIGGER_FRAMES=2
+WIFI_CAMP_TRIGGER_FRAMES=1
 WIFI_CAMP_TRIGGER_WINDOW_SEC=2.0
 WIFI_CAMP_SILENCE_SEC=6.0
 WIFI_CAMP_SILENCE_OFFSOCIAL_SEC=3.0
@@ -417,6 +419,16 @@ EOF
     # EOF
     #       info "Added vX.Y.Z options to config.env"
     #   fi
+
+    # v1.6.0 — the camp trigger dropped from two frames to one. Existing
+    # nodes have 2 written into config.env, and a migrate block that only
+    # adds missing keys would leave every one of them on the old rule
+    # forever. Rewrite it, but only where it still holds the old default —
+    # an operator who deliberately raised it keeps their value.
+    if grep -q '^WIFI_CAMP_TRIGGER_FRAMES=2$' "$cfg" 2>/dev/null; then
+        sed -i 's/^WIFI_CAMP_TRIGGER_FRAMES=2$/WIFI_CAMP_TRIGGER_FRAMES=1/' "$cfg"
+        info "Camp trigger updated to one frame."
+    fi
 
     # v1.5.0+ — detect present monitor-capable USB adapters and set the
     # right adapter mode (single vs dual). Populates the appropriate
