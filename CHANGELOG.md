@@ -10,6 +10,76 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.6.0] — Unreleased
+
+### The map works with no internet, and it is ours
+
+The basemap no longer comes from a third-party tile service. It is drawn from
+OpenStreetMap data served from DroneAware's own storage, and a node can now
+download its own area so the map keeps working with no connection at all.
+
+Three ways a node gets a map, best first:
+
+- **Its own area, downloaded.** Settings → Map, pick a radius, and the node
+  builds a detailed map of that area. It shows the real size before you commit
+  to it — measured for your actual location, not estimated.
+- **Streamed through the node** when it has internet, at full detail, with no
+  download at all.
+- **A world overview** installed with the Web UI, so a node with neither still
+  shows where it is.
+
+Day and night both come from one file, and attribution is handled correctly.
+
+### Settings you can change without SSH
+
+Settings → Node edits the node's configuration from the browser: location,
+GPS, Bluetooth adapter, scanning behaviour, upload buffers and local
+interfaces. Scanning settings explain what they do and can be restored to
+their defaults in one click. Buffers are shown in megabytes.
+
+The node's location can be set by tapping the map instead of typing
+coordinates, which matters on the touchscreen builds some operators have made.
+
+### The node tells you which adapter is the better sweeper
+
+Every feeder times its own radio at startup. That number was only ever in a log
+line; it now appears in `sudo droneaware status` and beside each adapter in
+Settings:
+
+```
+wlan1   rt2800usb   monitor  ch6    2.4 GHz feeder  ·  34ms retune
+wlan2   mt76x2u     monitor  ch112  5 GHz feeder    ·  1006ms retune
+```
+
+The radio is deaf while it changes channel, and the 5 GHz adapter changes
+channel far more often. When the faster adapter is not the one sweeping,
+Settings says so next to the Swap button.
+
+Adapter roles are no longer editable as raw MAC addresses. They show the actual
+hardware by name, with Swap and Refresh buttons, because a hand-typed MAC was
+overwritten on the next refresh.
+
+### Camping starts on the first frame
+
+A node held a channel after hearing two Remote ID frames within two seconds. It
+now holds on the first. Only an aircraft transmits the Remote ID identifier, so
+a single frame already proves something is flying, and waiting for a second
+mostly lost the aircraft heard faintly — the distant ones.
+
+### Installing is no longer silent
+
+`Installing System Packages` could sit for minutes with no output, which is
+indistinguishable from a frozen Pi. It now shows real progress, and says so
+when it is waiting for another package manager to finish rather than appearing
+stuck.
+
+### Live or offline, and still scanning
+
+The header says whether the node is reporting to DroneAware, or offline and
+still detecting. Those are different things and used to look the same.
+
+---
+
 ## [1.5.2.3] — Unreleased
 
 ### Nodes now report which Bluetooth radio they are using

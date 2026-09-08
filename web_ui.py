@@ -155,15 +155,6 @@ PRUNE_INTERVAL_SEC = 1.0
 # blocking the publisher. 100 events buffered per client is comfortable.
 SSE_CLIENT_QUEUE_MAX = 100
 
-# Bundled world-overview tiles for offline operation. Generated once with
-# tilemaker against an OSM extract using the CartoDB Dark Matter style
-# (see docs/world-tiles-generation.md), shipped inside the web_ui binary
-# via web_static/. Covers zoom 0-6 (~5,461 tiles, ~15 MB) — recognizable
-# country / state / metro context worldwide. The Leaflet client uses
-# CartoDB's live tile server when online and falls back to this bundle
-# when the browser can't reach CartoDB. If the bundle is missing (e.g.,
-# dev runs without the file), the tile route returns 404 and the client
-# stays on CartoDB — graceful degradation either way.
 # Coarse world pack, downloaded from our own tile host. Replaces a bundled
 # MBTiles file of tiles scraped from CartoDB's CDN — their rendered tiles
 # redistributed inside our binary, the same exposure the live layer had.
@@ -1139,14 +1130,9 @@ def api_status():
         # the node can currently reach it.
         "uplink_ok":   _server_reachable(),
         "node_id":     _read_config_env("NODE_ID") or "this-node",
-        # Whether the bundled world-tile MBTiles is available for offline
-        # basemap rendering. Frontend uses this to know whether the
-        # /tiles/{z}/{x}/{y}.png fallback layer will return real tiles
-        # or 404s if CartoDB is unreachable.
-
         # Whether a Protomaps region pack has been downloaded. When true the
         # frontend renders vector tiles from /map.pmtiles and needs neither
-        # CartoDB nor the raster bundle — at any zoom, in either theme.
+        # a network round trip nor a second download — any zoom, either theme.
         "map_pack": (_region_pack_path() is not None
                      or _tile_upstream_reachable()
                      or _world_pack_path() is not None),

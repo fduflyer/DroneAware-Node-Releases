@@ -1399,6 +1399,29 @@ install_webui() {
         fi
     fi
 
+    # Let the Web UI run the three operator actions its settings panel
+    # offers. Written to a temp file and validated with `visudo -c` BEFORE
+    # being installed: a malformed file in /etc/sudoers.d locks sudo out
+    # entirely, and this runs on a node the operator may only reach by SSH.
+    #
+    # Commands are exact-match WITH their arguments. Granting bare
+    # /usr/local/bin/droneaware would also grant `uninstall`.
+    _sudoers_tmp="$(mktemp)"
+    cat > "$_sudoers_tmp" <<'SUDOERS'
+droneaware ALL=(root) NOPASSWD: /usr/local/bin/droneaware refresh
+droneaware ALL=(root) NOPASSWD: /usr/local/bin/droneaware swap
+droneaware ALL=(root) NOPASSWD: /usr/local/bin/droneaware update
+SUDOERS
+    if visudo -c -f "$_sudoers_tmp" >/dev/null 2>&1; then
+        install -m 0440 -o root -g root "$_sudoers_tmp" \
+            /etc/sudoers.d/droneaware-webui
+        info "Web UI may run refresh / swap / update."
+    else
+        warn "sudoers rule failed validation — Refresh, Swap and Install"
+        warn "buttons in the Web UI will not work. Nothing was changed."
+    fi
+    rm -f "$_sudoers_tmp"
+
     # Ensure droneaware user exists for User=droneaware in the unit.
     # The Pi OS imager typically creates a 'droneaware' user during initial
     # setup, but operators who picked a different username need it created

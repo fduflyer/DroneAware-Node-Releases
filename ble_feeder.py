@@ -196,15 +196,26 @@ def _try_heal_cli() -> bool:
     return False
 
 
-def _read_fw_version(fallback: str) -> str:
+INSTALLED_VERSION_PATH = "/opt/droneaware/version"
+
+
+def _read_fw_version() -> str:
     try:
         with open("/opt/droneaware/version") as f:
             v = f.read().strip()
             return v if v else fallback
     except Exception:
-        return fallback
+        pass
+    try:
+        with open(INSTALLED_VERSION_PATH) as f:
+            installed = f.read().strip()
+        if installed:
+            return installed
+    except Exception:
+        pass
+    return "dev"
 
-FW_VERSION = _read_fw_version("1.1.3")
+FW_VERSION = _read_fw_version()
 
 # -- Constants -----------------------------------------------------------------
 REMOTE_ID_SERVICE_UUID = "0000fffa-0000-1000-8000-00805f9b34fb"

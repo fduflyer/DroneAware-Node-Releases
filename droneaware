@@ -257,6 +257,14 @@ WIFI_DWELL_EXPLORE_SEC=1.0
 #       hiding every other drone. Ignored with two adapters, where the
 #       sweeping adapter camps indefinitely because its partner never
 #       leaves ch6.
+# Antenna height above ground. Used for detection-range calibration and shown
+# on the local map; blank is fine if it is unknown.
+NODE_ELEVATION_AGL_M=
+
+# Total size of each feeder's rotated logs. Roughly six months of history at
+# the default; the cap exists to stop a fault loop filling the card.
+DRONEAWARE_LOG_MAX_BYTES=40000000
+
 WIFI_CAMP_TRIGGER_FRAMES=1
 WIFI_CAMP_TRIGGER_WINDOW_SEC=2.0
 WIFI_CAMP_SILENCE_SEC=6.0
@@ -1448,6 +1456,25 @@ if candidates:
         else
             warn "web_ui download failed — feeder update will continue."
             warn "Web UI binary will remain at the previously installed version."
+        fi
+
+        # Nodes installed before the settings panel have no sudoers rule, so
+        # its Refresh / Swap / Install buttons would fail. Validated before
+        # installing — a malformed file in /etc/sudoers.d locks sudo out.
+        if [[ ! -f /etc/sudoers.d/droneaware-webui ]]; then
+            _sd="$(mktemp)"
+            cat > "$_sd" <<'SUDOERS'
+droneaware ALL=(root) NOPASSWD: /usr/local/bin/droneaware refresh
+droneaware ALL=(root) NOPASSWD: /usr/local/bin/droneaware swap
+droneaware ALL=(root) NOPASSWD: /usr/local/bin/droneaware update
+SUDOERS
+            if visudo -c -f "$_sd" >/dev/null 2>&1; then
+                install -m 0440 -o root -g root "$_sd" /etc/sudoers.d/droneaware-webui
+                info "Web UI may run refresh / swap / update."
+            else
+                warn "sudoers rule failed validation — Web UI buttons unavailable."
+            fi
+            rm -f "$_sd"
         fi
 
         # pmtiles is newer than most installs — fetch it when absent so the
