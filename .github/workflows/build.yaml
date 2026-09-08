@@ -89,6 +89,8 @@ jobs:
           gh release create "${VERSION}" "${DL_PATH}/ble_feeder" \
             "${DL_PATH}/wifi_feeder" \
             "${DL_PATH}/web_ui" \
+            "${DL_PATH}/pmtiles" \
+            "${DL_PATH}/pmtiles.LICENSE" \
             install.sh \
             droneaware \
             droneaware-bt-select \

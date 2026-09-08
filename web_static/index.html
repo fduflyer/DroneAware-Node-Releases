@@ -1173,20 +1173,8 @@
         <!-- Three densities, not one number. Measured spread at the same
              radius is ~47x between open country and a dense city, so a
              single figure would be wrong nearly everywhere. -->
-        <div class="density-table">
-          <div class="density-col">
-            <span class="density-head">Rural</span>
-            <b id="om-rural">—</b>
-          </div>
-          <div class="density-col">
-            <span class="density-head">Suburban</span>
-            <b id="om-suburban">—</b>
-          </div>
-          <div class="density-col">
-            <span class="density-head">City</span>
-            <b id="om-city">—</b>
-          </div>
-        </div>
+        <div class="estimate-row"><span>Download size</span><b id="om-size">—</b></div>
+        <div class="estimate-row"><span>Map tiles</span><b id="om-tiles">—</b></div>
         <div class="estimate-row"><span>Free space</span><b id="om-free">—</b></div>
         <div class="verdict" id="om-verdict">
           <span class="mark" id="om-mark"></span>
@@ -2472,11 +2460,12 @@ ${multiSerialHTML}
       },
       render() {
         const d = om.est; if (!d) return;
-        const e = d.estimates;
-        document.getElementById("om-rural").textContent    = om.fmtBytes(e.rural);
-        document.getElementById("om-suburban").textContent = om.fmtBytes(e.suburban);
-        document.getElementById("om-city").textContent     = om.fmtBytes(e.city);
-        document.getElementById("om-free").textContent =
+        // Not an estimate any more — pmtiles reports what the archive will
+        // actually be for this location, in about a second and a half.
+        document.getElementById("om-size").textContent  = om.fmtBytes(d.bytes);
+        document.getElementById("om-tiles").textContent =
+          d.tiles ? d.tiles.toLocaleString() : "—";
+        document.getElementById("om-free").textContent  =
           om.fmtBytes(d.disk.free_bytes);
 
         const v    = document.getElementById("om-verdict");
@@ -2484,23 +2473,57 @@ ${multiSerialHTML}
         const text = document.getElementById("om-verdict-text");
         const btn  = document.getElementById("om-download");
 
-        // Judged against the CITY figure. Saying it fits and then filling
-        // someone's card is the failure that matters; overstating the
-        // requirement only costs them a smaller radius.
         if (d.fits) {
           v.className = "verdict ok"; mark.textContent = "\u2713";
-          text.textContent = `Pick the column that matches your area. Even a `
-            + `city-density download leaves `
-            + `${om.fmtBytes(d.disk.free_bytes - d.worst_case_bytes)} free.`;
+          text.textContent = `${om.fmtBytes(d.bytes)} for ${d.radius_km} km `
+            + `around this node, leaving `
+            + `${om.fmtBytes(d.disk.free_bytes - d.bytes)} free.`;
           btn.disabled = false;
         } else {
           v.className = "verdict bad"; mark.textContent = "\u2717";
-          text.textContent = `A city-density area at this radius needs `
-            + `${om.fmtBytes(d.worst_case_bytes)}, but only `
+          text.textContent = `Needs ${om.fmtBytes(d.bytes)} but only `
             + `${om.fmtBytes(d.disk.usable_bytes)} is free once space is kept `
             + `for detection logs. Reduce the area.`;
           btn.disabled = true;
         }
+      },
+      async download() {
+        const btn = document.getElementById("om-download");
+        const text = document.getElementById("om-verdict-text");
+        const radius = document.getElementById("om-radius").value;
+        btn.disabled = true;
+        const was = btn.textContent;
+        btn.textContent = "Building map\u2026";
+        try {
+          const r = await (await fetch("/api/offline-map/download", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ radius_km: Number(radius) }),
+          })).json();
+          if (r.error) throw new Error(r.detail || r.error);
+          // The node reports when it is done; extraction is tens of seconds,
+          // not instant, and a spinner that lies about progress is worse
+          // than one that just says it is working.
+          for (let i = 0; i < 240; i++) {
+            await new Promise(res => setTimeout(res, 2000));
+            const st = await (await fetch("/api/offline-map/download")).json();
+            if (!st.running) {
+              if (st.error) throw new Error(st.error);
+              text.textContent = `Offline map ready — ${om.fmtBytes(st.bytes)}. `
+                + `This node can now draw its area with no internet.`;
+              document.getElementById("om-verdict").className = "verdict ok";
+              // The map itself should switch to the new pack immediately.
+              refreshStatus();
+              break;
+            }
+          }
+        } catch (e) {
+          document.getElementById("om-verdict").className = "verdict bad";
+          document.getElementById("om-mark").textContent = "\u2717";
+          text.textContent = `Could not build the map: ${e.message}`;
+        }
+        btn.textContent = was;
+        btn.disabled = false;
       },
       fail(msg) {
         document.getElementById("om-verdict").className = "verdict bad";
@@ -2928,6 +2951,7 @@ ${multiSerialHTML}
     });
     document.querySelectorAll(".settings-tab").forEach(t =>
       t.addEventListener("click", () => om.showPage(t.dataset.page)));
+    document.getElementById("om-download").addEventListener("click", om.download);
     document.getElementById("om-radius").addEventListener("input", om.refresh);
     document.getElementById("om-edit-center").addEventListener("click", () => {
       om.showPage("node");

@@ -1438,6 +1438,22 @@ if candidates:
             warn "Web UI binary will remain at the previously installed version."
         fi
 
+        # pmtiles is newer than most installs — fetch it when absent so the
+        # offline map builder appears on update, not only on fresh installs.
+        if [[ ! -x "${INSTALL_DIR}/pmtiles" ]]; then
+            echo "  Downloading pmtiles (offline map builder)..."
+            if curl -fsSL --retry 3 "${BASE}/pmtiles" -o "${INSTALL_DIR}/pmtiles"; then
+                chmod +x "${INSTALL_DIR}/pmtiles"
+                curl -fsSL --retry 2 "${BASE}/pmtiles.LICENSE" \
+                     -o "${INSTALL_DIR}/pmtiles.LICENSE" 2>/dev/null || true
+                chown droneaware:droneaware "${INSTALL_DIR}/pmtiles" 2>/dev/null || true
+                info "pmtiles installed."
+            else
+                rm -f "${INSTALL_DIR}/pmtiles"
+                warn "pmtiles download failed — offline map downloads unavailable."
+            fi
+        fi
+
         # Existing nodes predate the offline basemap, so fetch it once if it
         # is absent. Skipped when already present — this is a static 15 MB
         # artifact, not something to re-pull on every update.

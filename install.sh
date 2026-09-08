@@ -1365,6 +1365,27 @@ install_webui() {
     ln -sf "${INSTALL_DIR}/web_ui" /usr/local/bin/web_ui 2>/dev/null || true
     info "web_ui binary → ${INSTALL_DIR}/web_ui"
 
+    # pmtiles — used by the Web UI to build an offline map of the node's own
+    # area. Non-fatal: without it the map still works from the tile host and
+    # the bundled world pack, it just cannot build a local detail pack.
+    echo "    Installing pmtiles (offline map builder)..."
+    if [[ "$LOCAL_INSTALL" == "1" ]]; then
+        cp "${LOCAL_DIST}/pmtiles" "${INSTALL_DIR}/pmtiles" 2>/dev/null \
+            && cp "${LOCAL_DIST}/pmtiles.LICENSE" "${INSTALL_DIR}/" 2>/dev/null \
+            && chmod +x "${INSTALL_DIR}/pmtiles" \
+            && info "pmtiles → ${INSTALL_DIR}/pmtiles" \
+            || warn "pmtiles not installed — offline map downloads unavailable."
+    elif curl -fsSL --retry 3 "${base_url}/pmtiles" -o "${INSTALL_DIR}/pmtiles"; then
+        chmod +x "${INSTALL_DIR}/pmtiles"
+        # BSD-3-Clause requires the notice to accompany the binary.
+        curl -fsSL --retry 2 "${base_url}/pmtiles.LICENSE" \
+             -o "${INSTALL_DIR}/pmtiles.LICENSE" 2>/dev/null || true
+        info "pmtiles → ${INSTALL_DIR}/pmtiles"
+    else
+        rm -f "${INSTALL_DIR}/pmtiles"
+        warn "pmtiles download failed — offline map downloads unavailable."
+    fi
+
     echo "    Installing systemd unit..."
     if [[ "$LOCAL_INSTALL" == "1" ]]; then
         cp "${local_root}/droneaware-web.service" /etc/systemd/system/droneaware-web.service

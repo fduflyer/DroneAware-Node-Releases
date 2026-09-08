@@ -406,48 +406,65 @@ PROTOMAPS_MAX_ZOOM = 15
 OFFLINE_MAP_MIN_RADIUS_KM = 1.0
 OFFLINE_MAP_MAX_RADIUS_KM = 30.0
 
-# MEASURED 2026-09-06 with `pmtiles extract --dry-run` against the planet
-# build, three places at matched radii. Archive size in MB:
-#
-#     radius   rural MT   suburban NJ   dense NYC
-#        1        0.47        1.6          2.5
-#        2        0.48        2.7          3.9
-#        5        0.55        4.0         12
-#       10        0.68       10           32
-#       20        1.3        32           84
-#       30        2.5        66          129
-#
-# A 47x spread at 10 km is why this is a table and not a constant: any
-# bytes-per-area figure would be wrong nearly everywhere. The operator knows
-# which column describes where they live; the node does not, so it shows all
-# three rather than inventing a precision it does not have.
-#
-# The ~0.47 MB floor in the rural column is the low-zoom world coverage every
-# pack carries regardless of radius.
-PACK_SIZE_SAMPLES_MB = {
-    "rural":    [(1, 0.47), (2, 0.48), (5, 0.55), (10, 0.68), (20, 1.3), (30, 2.5)],
-    "suburban": [(1, 1.6),  (2, 2.7),  (5, 4.0),  (10, 10.0), (20, 32.0), (30, 66.0)],
-    "city":     [(1, 2.5),  (2, 3.9),  (5, 12.0), (10, 32.0), (20, 84.0), (30, 129.0)],
-}
+# The pmtiles binary ships alongside the feeders. It reads the planet by HTTP
+# range — it never downloads the 128 GiB archive — so a region extract costs
+# tens of requests and seconds, not a mirror of the source.
+PMTILES_BIN = os.environ.get("DRONEAWARE_PMTILES_BIN", "/opt/droneaware/pmtiles")
+
+_MERC_LAT_MAX = 85.051129        # Web Mercator's own latitude limit
 
 
-def _pack_size_estimates(radius_km: float) -> dict:
-    """Interpolate the measured table. Returns bytes keyed by density."""
-    out = {}
-    for density, samples in PACK_SIZE_SAMPLES_MB.items():
-        if radius_km <= samples[0][0]:
-            mb = samples[0][1]
-        elif radius_km >= samples[-1][0]:
-            mb = samples[-1][1]
-        else:
-            mb = samples[-1][1]
-            for (r0, m0), (r1, m1) in zip(samples, samples[1:]):
-                if r0 <= radius_km <= r1:
-                    t = (radius_km - r0) / (r1 - r0)
-                    mb = m0 + t * (m1 - m0)
-                    break
-        out[density] = int(mb * 1024 * 1024)
-    return out
+def _bbox(lat: float, lon: float, km: float) -> tuple:
+    """Bounding box of +/- km around a point, as (w, s, e, n).
+
+    The cos(lat) term is load-bearing: the same 50 km spans 1.18 deg of
+    longitude at 40 N but 2.59 deg at 70 N. Without it a northern node gets
+    a box less than half the width it asked for. max(cos, 0.01) stops the
+    division exploding near the poles.
+
+    Does NOT handle the antimeridian — a node at 179.8 E clamps to 180 and
+    silently loses its eastern half. A single bbox cannot express a wrapped
+    box; it needs two extracts merged. Left unhandled deliberately.
+    """
+    dlat = km / 111.0
+    dlon = km / (111.0 * max(math.cos(math.radians(lat)), 0.01))
+    return (max(-180.0, lon - dlon), max(-_MERC_LAT_MAX, lat - dlat),
+            min(180.0, lon + dlon), min(_MERC_LAT_MAX, lat + dlat))
+
+
+_SIZE_RE  = re.compile(r"archive size of ([\d.]+)\s*([kMG]?B)")
+_TILES_RE = re.compile(r"fetching (\d+) tiles")
+_UNIT = {"B": 1, "kB": 1000, "MB": 1000_000, "GB": 1000_000_000}
+
+
+def _pmtiles_dry_run(bbox: tuple, maxzoom: int, timeout: int = 45) -> dict:
+    """Ask pmtiles what a region would actually cost. Seconds, downloads nothing.
+
+    Strictly better than modelling it. Pack size varies roughly 47x between
+    open country and a dense city at the same radius, so an interpolated
+    estimate is wrong nearly everywhere; this is exact for THIS location.
+    """
+    if not os.path.isfile(PMTILES_BIN):
+        return {"error": "no_binary",
+                "detail": "The map extractor is not installed on this node."}
+    cmd = [PMTILES_BIN, "extract", TILE_UPSTREAM_URL, os.devnull,
+           "--bbox=%.6f,%.6f,%.6f,%.6f" % bbox,
+           f"--maxzoom={maxzoom}", "--dry-run"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"error": "timeout", "detail": "The tile host did not respond."}
+    except Exception as e:
+        return {"error": "failed", "detail": str(e)}
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        return {"error": "failed", "detail": out.strip()[-300:] or "extract failed"}
+    m = _SIZE_RE.search(out)
+    if not m:
+        return {"error": "unparsed", "detail": out.strip()[-300:]}
+    tiles = _TILES_RE.search(out)
+    return {"bytes": int(float(m.group(1)) * _UNIT.get(m.group(2), 1)),
+            "tiles": int(tiles.group(1)) if tiles else None}
 
 
 # Headroom that must survive the download. A node that stops recording
@@ -1162,29 +1179,41 @@ def api_offline_map_estimate():
         free = 0
     usable = max(free - OFFLINE_MAP_RESERVE_BYTES, 0)
 
-    est = _pack_size_estimates(radius)
-    # Check disk against the WORST case, not the typical one. Telling an
-    # operator it fits and then filling their card is the failure that
-    # matters; overstating the requirement only costs them a smaller radius.
-    worst = est["city"]
+    try:
+        maxzoom = int(request.args.get("maxzoom", PROTOMAPS_MAX_ZOOM))
+    except ValueError:
+        maxzoom = PROTOMAPS_MAX_ZOOM
+    maxzoom = max(6, min(maxzoom, PROTOMAPS_MAX_ZOOM))
 
+    box = _bbox(lat, lon, radius)
+    est = _pmtiles_dry_run(box, maxzoom)
+    if "error" in est:
+        return jsonify({**est, "center": {"lat": lat, "lon": lon},
+                        "radius_km": radius, "maxzoom": maxzoom}), 503
+
+    # Judge against the real number plus headroom. Telling an operator it
+    # fits and then filling their card is the failure that matters.
+    need = est["bytes"]
     return jsonify({
         "center": {"lat": lat, "lon": lon},
+        "bbox": {"w": box[0], "s": box[1], "e": box[2], "n": box[3]},
         "radius_km": radius,
+        "maxzoom": maxzoom,
         "limits": {
             "radius_km_min": OFFLINE_MAP_MIN_RADIUS_KM,
             "radius_km_max": OFFLINE_MAP_MAX_RADIUS_KM,
+            "maxzoom_max": PROTOMAPS_MAX_ZOOM,
         },
         "disk": {
             "free_bytes": free,
             "reserve_bytes": OFFLINE_MAP_RESERVE_BYTES,
             "usable_bytes": usable,
         },
-        "estimates": est,          # bytes, keyed rural / suburban / city
-        "fits": worst <= usable,
-        "worst_case_bytes": worst,
-        "maxzoom": PROTOMAPS_MAX_ZOOM,
-        "estimate_is_approximate": True,
+        "bytes": need,
+        "tiles": est.get("tiles"),
+        "fits": need <= usable,
+        # No longer an estimate — pmtiles reports what the archive will be.
+        "estimate_is_approximate": False,
     })
 
 
@@ -1519,6 +1548,115 @@ def api_config_set():
              len(clean), ", ".join(sorted(clean)))
     return jsonify({"ok": True, "written": sorted(clean),
                     "restart_required": True})
+
+
+# ── Region pack extraction (v1.6.0) ──────────────────────────────────────────
+# The node builds its own pack from its own coordinates. pmtiles reads the
+# planet by HTTP range, so this is tens of requests and seconds — the archive
+# is never mirrored.
+_ex = {"running": False, "pct": 0, "error": None, "bytes": 0, "at": 0.0}
+_ex_lock = threading.Lock()
+
+
+def _run_extract(lat: float, lon: float, radius_km: float, maxzoom: int) -> None:
+    box = _bbox(lat, lon, radius_km)
+    tmp = REGION_PACK_PATH + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(REGION_PACK_PATH), exist_ok=True)
+        # Two threads rather than the default four: kinder to a node on
+        # domestic broadband, and the whole job is only tens of requests.
+        cmd = [PMTILES_BIN, "extract", TILE_UPSTREAM_URL, tmp,
+               "--bbox=%.6f,%.6f,%.6f,%.6f" % box,
+               f"--maxzoom={maxzoom}", "--download-threads=2"]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        if r.returncode != 0:
+            raise RuntimeError(_ANSI_RE.sub(
+                "", (r.stderr or r.stdout or "")).strip()[-300:] or "extract failed")
+
+        # Verify before it becomes the live map. A truncated or failed
+        # extract renamed into place renders a blank map with no explanation.
+        with open(tmp, "rb") as f:
+            if f.read(7) != b"PMTiles":
+                raise RuntimeError("extract produced a file that is not PMTiles")
+        size = os.path.getsize(tmp)
+        os.replace(tmp, REGION_PACK_PATH)   # atomic on the same filesystem
+
+        # Record what produced this pack so the node can later answer "is my
+        # map still right for where I am?" without guessing.
+        with open(REGION_PACK_PATH + ".json", "w") as f:
+            json.dump({"lat": lat, "lon": lon, "radius_km": radius_km,
+                       "maxzoom": maxzoom, "bytes": size,
+                       "created": time.time()}, f)
+        log.info("[pack] region pack built: %.1f MB, %.0f km, z%d",
+                 size / 1e6, radius_km, maxzoom)
+        with _ex_lock:
+            _ex.update(running=False, pct=100, bytes=size, error=None,
+                       at=time.time())
+    except Exception as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        log.warning("[pack] region extract failed: %s", e)
+        with _ex_lock:
+            _ex.update(running=False, error=str(e), at=time.time())
+
+
+@app.route("/api/offline-map/download", methods=["GET", "POST"])
+def api_pack_download():
+    if request.method == "GET":
+        with _ex_lock:
+            return jsonify(dict(_ex))
+
+    if not os.path.isfile(PMTILES_BIN):
+        return jsonify({"error": "no_binary",
+                        "detail": "The map extractor is not installed."}), 503
+
+    body = request.get_json(silent=True) or {}
+    home = get_home_location() or {}
+    try:
+        lat = float(body.get("lat", home.get("lat")))
+        lon = float(body.get("lon", home.get("lon")))
+    except (TypeError, ValueError):
+        return jsonify({"error": "no_location",
+                        "detail": "This node does not know where it is."}), 400
+    try:
+        radius = float(body.get("radius_km", 20.0))
+    except (TypeError, ValueError):
+        radius = 20.0
+    radius = max(OFFLINE_MAP_MIN_RADIUS_KM,
+                 min(radius, OFFLINE_MAP_MAX_RADIUS_KM))
+    try:
+        maxzoom = int(body.get("maxzoom", PROTOMAPS_MAX_ZOOM))
+    except (TypeError, ValueError):
+        maxzoom = PROTOMAPS_MAX_ZOOM
+    maxzoom = max(6, min(maxzoom, PROTOMAPS_MAX_ZOOM))
+
+    # Price it first and refuse if it will not fit. A node that stops
+    # recording detections because the card filled with map tiles is
+    # strictly worse than a node with no offline map.
+    est = _pmtiles_dry_run(_bbox(lat, lon, radius), maxzoom)
+    if "error" in est:
+        return jsonify(est), 503
+    try:
+        st = os.statvfs(os.path.dirname(REGION_PACK_PATH))
+        usable = max(st.f_bavail * st.f_frsize - OFFLINE_MAP_RESERVE_BYTES, 0)
+    except OSError:
+        usable = 0
+    if est["bytes"] > usable:
+        return jsonify({"error": "no_space",
+                        "detail": f"Needs {est['bytes'] // 1_000_000} MB but only "
+                                  f"{usable // 1_000_000} MB is free once space is "
+                                  f"kept for detection logs."}), 507
+
+    with _ex_lock:
+        if _ex["running"]:
+            return jsonify({"error": "busy",
+                            "detail": "A map download is already running."}), 409
+        _ex.update(running=True, pct=0, error=None, bytes=0)
+    threading.Thread(target=_run_extract,
+                     args=(lat, lon, radius, maxzoom), daemon=True).start()
+    return jsonify({"ok": True, "bytes": est["bytes"], "tiles": est.get("tiles")})
 
 
 @app.route("/map.pmtiles")
