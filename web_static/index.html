@@ -297,6 +297,83 @@
     }
     /* CLI output is preformatted and can run long — wrap rather than
        overflow the panel. */
+    /* Channel picker. Presets read as prose, the grid as hardware — the
+       default answer is "scan everything", so the grid is deliberately the
+       second thing you reach, not the first. */
+    .chan-preset {
+      display: flex; gap: 10px; align-items: flex-start;
+      padding: 8px 0; cursor: pointer; font-size: 13px;
+      min-height: 44px;                      /* touchscreen builds */
+    }
+    .chan-preset input { margin-top: 3px; accent-color: var(--accent); flex: none; }
+    .chan-preset strong { display: block; color: var(--text-primary); font-weight: 600; }
+    .chan-note {
+      display: block; color: var(--text-dim); font-size: 12px;
+      line-height: 1.45; margin-top: 2px;
+    }
+    .chan-advanced { margin-top: 10px; border-top: 1px solid rgba(0,229,255,0.15); }
+    .chan-advanced > summary {
+      cursor: pointer; padding: 11px 0; font-size: 13px; color: var(--accent);
+      min-height: 44px; display: flex; align-items: center;
+    }
+    .chan-warning {
+      background: rgba(245,158,11,0.10); border: 1px solid rgba(245,158,11,0.45);
+      border-radius: 6px; padding: 10px 12px; margin: 0 0 12px;
+      font-size: 12px; line-height: 1.5; color: #F59E0B;
+    }
+    .chan-band { margin-bottom: 12px; }
+    .chan-band-name {
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
+      color: var(--text-dim); margin-bottom: 5px;
+    }
+    .chan-grid { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chan-cell {
+      display: flex; align-items: center; gap: 5px;
+      min-width: 44px; min-height: 44px; padding: 0 9px;
+      border: 1px solid var(--border); border-radius: 6px;
+      font-size: 13px; cursor: pointer; user-select: none;
+    }
+    .chan-cell:has(input:checked) {
+      border-color: var(--accent); background: rgba(0,229,255,0.08);
+    }
+    .chan-cell input { accent-color: var(--accent); }
+    .chan-unsupported { opacity: 0.35; cursor: not-allowed; }
+    .chan-held {
+      font-style: normal; font-size: 10px; text-transform: uppercase;
+      letter-spacing: 0.04em; color: var(--accent);
+    }
+    .chan-count { font-size: 12px; color: var(--text-dim); margin: 10px 0 0; }
+    .chan-count.chan-empty { color: #F59E0B; }
+    /* Destructive actions read as destructive. Amber rather than red: this
+       is disruptive, not dangerous — nothing is lost by shutting down. */
+    .danger-row {
+      margin-top: 22px; padding-top: 16px;
+      border-top: 1px solid var(--border);
+    }
+    .btn-danger {
+      min-height: 44px; padding: 0 18px; border-radius: 8px;
+      background: transparent; color: #F59E0B;
+      border: 1px solid rgba(245,158,11,0.55);
+      font-size: 13px; font-weight: 600; cursor: pointer;
+    }
+    .btn-danger:hover { background: rgba(245,158,11,0.12); }
+    .confirm-backdrop {
+      position: fixed; inset: 0; z-index: 3000;
+      display: flex; align-items: center; justify-content: center;
+      background: rgba(4,10,20,0.72); padding: 20px;
+    }
+    .confirm-backdrop[hidden] { display: none; }
+    .confirm-box {
+      background: var(--bg-elevated); border: 1px solid var(--border);
+      border-radius: 12px; padding: 22px; max-width: 380px; width: 100%;
+      box-shadow: 0 18px 50px rgba(0,0,0,0.6);
+    }
+    .confirm-box h3 { margin: 0 0 10px; font-size: 16px; color: var(--text-primary); }
+    .confirm-box p {
+      margin: 0 0 18px; font-size: 13px; line-height: 1.5; color: var(--text-dim);
+    }
+    .confirm-actions { display: flex; gap: 10px; justify-content: flex-end; }
+    .confirm-actions button { min-height: 44px; }
     .cfg-status-text { white-space: pre-wrap; overflow-wrap: anywhere; }
     /* Location picking. The backdrop stops intercepting clicks so the map
        underneath stays usable, and the panel drops to a bar at the bottom. */
@@ -515,6 +592,10 @@
       gap: 12px;
       padding: 12px;
       border: 1px solid var(--border);
+      /* The accent bar down the left edge, as on droneaware.io/live.html:
+         it fills in when a card is selected, so the sidebar and the map agree
+         about which aircraft you are looking at. */
+      border-left: 2px solid rgba(0,229,255,0.2);
       border-radius: 6px;
       background: var(--bg-surface);
       margin-bottom: 6px;
@@ -524,8 +605,13 @@
     .card:hover {
       background: var(--bg-elevated);
       border-color: var(--border-hover);
+      border-left-color: rgba(0,229,255,0.45);
     }
-    .card.selected { border-color: var(--accent); }
+    .card.selected {
+      border-color: var(--border);
+      border-left-color: var(--accent);
+      background: rgba(0,229,255,0.08);
+    }
     .card-thumb {
       flex-shrink: 0;
       width: 36px; height: 36px;
@@ -635,10 +721,74 @@
     .empty .sub { font-size: 12px; }
 
     /* ========== Map ========== */
+    /* The map now lives inside a column so the replay bar can sit above it
+       and shrink it, rather than floating over the airspace it exists to
+       explain. */
+    .map-wrap { flex: 1; height: 100%; display: flex; flex-direction: column; min-width: 0; }
     .map {
       flex: 1;
-      height: 100%;
+      min-height: 0;
       background: var(--bg-primary);
+    }
+
+    /* ---- Replay ---- */
+    .replay-bar {
+      flex: none; padding: 10px 16px 12px;
+      background: var(--bg-elevated);
+      border-bottom: 1px solid var(--border);
+    }
+    .replay-head {
+      display: flex; align-items: center; gap: 10px; margin-bottom: 8px;
+    }
+    .replay-title {
+      font-size: 11px; letter-spacing: 0.06em; color: var(--accent); font-weight: 700;
+    }
+    .replay-window {
+      font-size: 12px; color: var(--text-primary); flex: 1;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    /* The two inputs are transparent and stacked over a painted track: a
+       native range track cannot carry a per-pixel background, and two handles
+       need two inputs. */
+    .replay-slider { position: relative; height: 44px; }
+    .replay-track {
+      position: absolute; left: 0; right: 0; top: 13px; height: 18px;
+      border-radius: 4px; overflow: hidden;
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+    }
+    .replay-slider input[type="range"] {
+      position: absolute; left: 0; width: 100%; margin: 0;
+      top: 0; height: 44px;                 /* 44px touch target */
+      -webkit-appearance: none; appearance: none;
+      background: none; pointer-events: none;
+    }
+    .replay-slider input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none; pointer-events: auto; cursor: ew-resize;
+      width: 14px; height: 30px; border-radius: 3px;
+      background: var(--accent); border: 2px solid var(--bg-elevated);
+      box-shadow: 0 1px 4px rgba(0,0,0,0.5);
+    }
+    .replay-slider input[type="range"]::-moz-range-thumb {
+      pointer-events: auto; cursor: ew-resize;
+      width: 14px; height: 30px; border-radius: 3px;
+      background: var(--accent); border: 2px solid var(--bg-elevated);
+    }
+    .replay-foot {
+      display: flex; align-items: center; gap: 10px; margin-top: 2px;
+      font-size: 11px; color: var(--text-dim);
+    }
+    .replay-foot #replay-right { margin-left: auto; }
+    .replay-key { display: flex; align-items: center; gap: 6px; font-size: 10px; }
+    .replay-key i {
+      display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+      margin-right: 2px; vertical-align: -1px;
+    }
+    .k-det  { background: var(--accent); }
+    .k-live { background: #3f6f8c; }
+    .k-gap  { background: transparent; border: 1px solid var(--border); }
+    .replay-note {
+      margin: 8px 0 0; font-size: 11px; line-height: 1.45; color: #F59E0B;
     }
     .leaflet-container {
       background: var(--bg-primary);
@@ -648,11 +798,35 @@
       transform-origin: center;
     }
     .drone-marker svg {
-      width: 24px; height: 24px;
+      /* 28px, up from 24. The mark's silhouette carries less ink than the
+         paper plane it replaced — its wings taper to points — so it needs a
+         little more room to read at the same map zoom. */
+      width: 28px; height: 28px;
       transition: color 0.2s;
+      /* 🚨 A dark casing on EVERY marker, not a coloured glow.
+         The basemap paints water #80deea in its light flavour, which is
+         within a few degrees of hue of the live cyan — a live drone over a
+         lake or a river was very nearly invisible. The previous rule made it
+         worse rather than better: it bloomed the marker's OWN colour outward,
+         so a cyan aircraft on cyan water smeared into it.
+         A dark casing is the cartographic answer — it separates the mark from
+         whatever is beneath it (water, parkland, roads) without spending any
+         of the palette, so live/recent/older keep their meaning. Tested
+         against all four basemap surfaces in both flavours. */
+      filter: drop-shadow(0 0 1.5px rgba(0,0,0,0.95))
+              drop-shadow(0 0 3px rgba(0,0,0,0.7));
     }
+    /* Live aircraft pulse instead of glowing. Motion reads at a glance and
+       costs no colour, so it cannot collide with anything the map paints. */
     .drone-marker.live svg {
-      filter: drop-shadow(0 0 8px var(--fresh-live));
+      animation: marker-pulse 1.8s ease-in-out infinite;
+    }
+    @keyframes marker-pulse {
+      0%, 100% { transform: scale(1);    }
+      50%      { transform: scale(1.16); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .drone-marker.live svg { animation: none; }
     }
     /* Pulse rule applies to the INNER dot, NOT the Leaflet wrapper.
        Leaflet positions markers via transform: translate3d() on the
@@ -1024,6 +1198,8 @@
       </span>
     </div>
     <div class="header-right">
+      <button class="icon-btn" id="btn-replay" title="Replay recorded history"
+              aria-label="Replay" aria-expanded="false" style="font-size: 16px;">↺</button>
       <button class="icon-btn" id="btn-units" title="Toggle units (imperial / metric)" aria-label="Toggle units" style="font-size: 12px; font-weight: 700; letter-spacing: 0.5px;">ft</button>
       <button class="icon-btn" id="btn-theme" title="Toggle theme" aria-label="Toggle theme">◐</button>
       <button class="icon-btn" id="btn-settings" title="Settings" aria-label="Settings" style="font-size: 17px;">☰</button>
@@ -1110,7 +1286,57 @@
         </div>
       </div>
     </div>
-    <div class="map" id="map"></div>
+    <div class="map-wrap">
+      <!-- Replay. Hidden until the ⏱ button is pressed, because a node with no
+           recorded history has nothing to scrub and an always-visible slider
+           would be a control that does nothing. -->
+      <div class="replay-bar" id="replay-bar" hidden>
+        <div class="replay-head">
+          <span class="replay-title">REPLAY</span>
+          <span class="replay-window" id="replay-window">—</span>
+          <button class="btn-inline" id="replay-reset" type="button">Reset</button>
+          <button class="icon-btn" id="replay-close" type="button"
+                  title="Close replay" aria-label="Close replay">✕</button>
+        </div>
+        <div class="replay-slider" id="replay-slider">
+          <div class="replay-track" id="replay-track"></div>
+          <input type="range" id="replay-from" min="0" max="1000" value="0"
+                 aria-label="Start of replay window">
+          <input type="range" id="replay-to" min="0" max="1000" value="1000"
+                 aria-label="End of replay window">
+        </div>
+        <div class="replay-foot">
+          <span id="replay-left">—</span>
+          <span class="replay-key">
+            <i class="k-det"></i>detections
+            <i class="k-live"></i>listening
+            <i class="k-gap"></i>not recording
+          </span>
+          <span id="replay-right">Now</span>
+        </div>
+        <p class="replay-note" id="replay-note" hidden></p>
+      </div>
+      <div class="map" id="map"></div>
+    </div>
+  </div>
+
+  <!-- Confirm before powering down. Centred over whatever is on screen,
+       because this is the one control here that cannot be undone from the
+       same browser: the page it was pressed from will stop answering. -->
+  <div class="confirm-backdrop" id="confirm-backdrop" hidden>
+    <div class="confirm-box" role="dialog" aria-modal="true"
+         aria-labelledby="confirm-title">
+      <h3 id="confirm-title">Shut down this node?</h3>
+      <p id="confirm-body">
+        Detection stops and the node powers off. Everything it has recorded is
+        saved first. To start it again you will need to unplug it and plug it
+        back in.
+      </p>
+      <div class="confirm-actions">
+        <button class="btn-inline" id="confirm-cancel" type="button">Cancel</button>
+        <button class="btn-danger" id="confirm-ok" type="button">Shut down</button>
+      </div>
+    </div>
   </div>
 
   <!-- Status bar -->
@@ -1200,6 +1426,19 @@
         <div id="cfg-form"></div>
 
         <button class="btn-download" id="cfg-save">Save changes</button>
+
+        <!-- Shutting down cleanly is what makes the detection database
+             survive being moved: systemd sends SIGTERM, the feeders flush
+             what they are holding to disk, and nothing is lost. For the
+             operator carrying a node in a vehicle with no keyboard on it. -->
+        <div class="danger-row">
+          <button class="btn-danger" id="cfg-shutdown" type="button">Shut down node</button>
+          <p class="cfg-help">
+            Stops the feeders cleanly and powers the node off, so nothing it
+            has recorded is lost. You will need to unplug and replug it to
+            start it again.
+          </p>
+        </div>
       </section>
 
       <!-- Shown INSTEAD of the pages while picking a location on the map.
@@ -1229,7 +1468,29 @@
        ========================================================================= */
 
     // FA paper-plane SVG (drone marker) — color via currentColor.
-    const DRONE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="currentColor"><path d="M498.1 5.6c10.1 7 15.4 19.1 13.5 31.2l-64 416c-1.5 9.7-7.4 18.2-16 23s-18.9 5.4-28 1.6L284 427.7l-68.5 74.1c-8.9 9.7-22.9 12.9-35.2 8.1S160 493.2 160 480V396.4c0-4 1.5-7.8 4.2-10.7L331.8 202.8c5.8-6.3 5.6-16-.4-22s-15.7-6.4-22-.7L106 360.8 17.7 316.6C7.1 311.3 .3 300.7 0 288.9s5.9-22.8 16.1-28.7l448-256c10.7-6.1 23.9-5.5 34 1.4z"/></svg>`;
+    // Map marker: the DroneAware mark, with its two wings drawn separately.
+    //
+    // The logo as drawn is a stroked outline. That is right for a wordmark and
+    // wrong for a 16px marker — the colour ends up carried by a ~1.5px line,
+    // and on this map the colour IS the message (live / recent / older).
+    // Filling it solid fixes legibility but flattens the dart into a blob.
+    //
+    // Splitting at the fold line the logo already has (216,330 -> 268,274, both
+    // existing vertices, so the two halves tile the shape exactly) gets both:
+    // the leading wing solid, the trailing wing at 40% of the SAME hue. The
+    // fold reads, and every pixel of the icon still carries the recency colour
+    // rather than sharing it with a second one.
+    //
+    // Points north at -45deg, the same offset the Font Awesome plane needed,
+    // so the heading maths below is unchanged.
+    const BRAND_WING_LEAD  = "M216 330 L120 300 L192.8 266.6 L247.4 241.6 L302 216.5 L268 274 Z";
+    const BRAND_WING_TRAIL = "M268 274 L333 249.5 L308.1 300.7 L283.2 351.8 L250 420 L216 330 Z";
+    const BRAND_DRONE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="65 200 250 245">`
+      + `<g transform="translate(-35 2.5)" stroke-linejoin="round" stroke="currentColor" fill="currentColor">`
+      + `<path d="${BRAND_WING_TRAIL}" fill-opacity="0.4" stroke-opacity="0.4" stroke-width="8"/>`
+      + `<path d="${BRAND_WING_LEAD}" stroke-width="8"/>`
+      + `</g></svg>`;
+
 
     // Freshness scale matches the public droneaware.io/live.html — three tiers
     // (< 2 min / < 10 min / > 10 min) so operators see the same color story
@@ -1246,6 +1507,8 @@
     /* ----- State ----- */
     const state = {
       macs: new Map(),               // mac -> { event, first_seen, last_seen, marker, card, trail, polyline, showTrail, opMarker, connector }
+      // nodeClockOffset = node time - browser time, in seconds. See nodeNow().
+      nodeClockOffset: 0,
       filters: {
         freshness: new Set(["live", "recent", "older"]),
         radio:     new Set(["wifi", "ble"]),
@@ -1274,6 +1537,31 @@
       for (const f of FRESHNESS) if (ageSec < f.maxAge) return f;
       return { tier: "gray", color: "var(--fresh-gray)", label: "GRAY" };
     }
+    // 🚨 Every age on this page is measured against the NODE's clock, never
+    // the browser's. last_seen is stamped by the feeder when it captured the
+    // packet, so subtracting a browser Date.now() measures the gap between two
+    // machines' clocks as well as the true age of the detection.
+    //
+    // That is not hypothetical. A Raspberry Pi has no RTC, and a node used
+    // offline — the case this whole UI exists for — has no NTP either, so its
+    // clock resumes from whatever was last written to disk. A node that spent
+    // an hour powered off comes back an hour behind the phone looking at it,
+    // and every live aircraft renders as "1h ago" in both the age text and the
+    // freshness colour while its marker moves across the map. Reported from
+    // the field 2026-09-09 and reproduced exactly at 1h 19m of skew.
+    //
+    // Re-measured on every status poll, so it tracks the node's clock being
+    // corrected by NTP mid-session. Request latency inflates it — single-digit
+    // milliseconds on a LAN, against a 60-second LIVE threshold.
+    function nodeNow() {
+      return Date.now() / 1000 + state.nodeClockOffset;
+    }
+
+    function setNodeClock(nodeTime) {
+      if (typeof nodeTime !== "number" || !isFinite(nodeTime)) return;
+      state.nodeClockOffset = nodeTime - Date.now() / 1000;
+    }
+
     function relTime(secAgo) {
       if (secAgo < 60)  return Math.floor(secAgo) + "s ago";
       if (secAgo < 3600) return Math.floor(secAgo / 60) + "m ago";
@@ -1493,11 +1781,11 @@
 
     /* ----- Markers ----- */
     function makeDroneIcon(color, isLive, heading) {
-      const tilt = (heading || 0) - 45;  // FA paper-plane "forward" is upper-right
+      const tilt = (heading || 0) - 45;  // the mark's nose sits upper-right
       const cls = "drone-marker" + (isLive ? " live" : "");
       return L.divIcon({
         className: cls,
-        html: `<div style="color: ${color}; transform: rotate(${tilt}deg);">${DRONE_SVG}</div>`,
+        html: `<div style="color: ${color}; transform: rotate(${tilt}deg);">${BRAND_DRONE_SVG}</div>`,
         iconSize: [40, 40],
         iconAnchor: [20, 20],
       });
@@ -1511,12 +1799,15 @@
     // maintain — currently 10,000 (~2.8h of visible flight at 1 Hz).
     const TRAIL_MAX = 10000;
 
-    function appendTrail(entry, lat, lon) {
+    function appendTrail(entry, lat, lon, alt) {
       if (!entry.trail) entry.trail = [];
       // Skip dupes (same lat/lon as last point — no movement, no new vertex)
       const last = entry.trail[entry.trail.length - 1];
       if (last && last[0] === lat && last[1] === lon) return;
-      entry.trail.push([lat, lon]);
+      // Third element is altitude. Leaflet takes [lat, lng, alt] triples
+      // anywhere it takes a LatLng, so the path carries the height it needs
+      // for the altitude dots without a second parallel array.
+      entry.trail.push([lat, lon, (typeof alt === "number") ? alt : null]);
       if (entry.trail.length > TRAIL_MAX) entry.trail.shift();
     }
 
@@ -1528,7 +1819,7 @@
       const lon = evt.lon || evt.longitude;
       if (typeof lat !== "number" || typeof lon !== "number") return;
 
-      const age = (Date.now() / 1000) - entry.last_seen;
+      const age = nodeNow() - entry.last_seen;
       const f = freshnessFor(age);
       const icon = makeDroneIcon(f.color, f.tier === "live", evt.heading || evt.hdg || 0);
 
@@ -1571,7 +1862,7 @@
       // the "Show Flight Path" button in the drone popup. The trail
       // array stays current either way, so the polyline appears with
       // full history the moment the user toggles it on.
-      appendTrail(entry, lat, lon);
+      appendTrail(entry, lat, lon, altitudeSource(evt));
       if (entry.showTrail) renderTrailPolyline(entry, f.color);
 
       // Operator location ("H" marker) + dashed connector to the drone,
@@ -1616,7 +1907,7 @@
     function removeMarker(mac) {
       const entry = state.macs.get(mac);
       if (entry) {
-        for (const k of ["marker", "polyline", "opMarker", "connector"]) {
+        for (const k of ["marker", "polyline", "waypoints", "opMarker", "connector"]) {
           if (entry[k]) {
             state.map.removeLayer(entry[k]);
             entry[k] = null;
@@ -1631,7 +1922,7 @@
       const entry = state.macs.get(mac);
       if (!entry) return;
       const evt = entry.event;
-      const age = (Date.now() / 1000) - entry.last_seen;
+      const age = nodeNow() - entry.last_seen;
       const f = freshnessFor(age);
       // Normalize radio for display: wifi_beacon / wifi_nan / wifi all
       // render as "WIFI"; ble renders as "BLE". Keeps the card visually
@@ -1678,7 +1969,7 @@
         : "";
 
       card.innerHTML = `
-        <div class="card-thumb" style="color: ${f.color};">${DRONE_SVG}</div>
+        <div class="card-thumb" style="color: ${f.color};">${BRAND_DRONE_SVG}</div>
         <div class="card-body">
           <div class="card-row">
             <div class="card-id mono">${escapeHtml(id)}</div>
@@ -1719,7 +2010,7 @@
       );
       for (const [mac, entry] of sorted) {
         const evt = entry.event;
-        const age = (Date.now() / 1000) - entry.last_seen;
+        const age = nodeNow() - entry.last_seen;
         const tier = freshnessFor(age).tier;
         const radio = (evt.radio || "").toLowerCase();
         // Normalize radio variants: LocalPublisher emits "wifi_beacon",
@@ -1803,6 +2094,10 @@
     }
 
     function handleEvent(evt) {
+      // While the map is showing recorded history, a live detection arriving
+      // over SSE would drop a "now" aircraft into an hour-old scene. The node
+      // keeps recording either way; hide() reloads the live picture from it.
+      if (replay.active) return;
       const mac = evt.mac || evt.source_mac;
       if (!mac) return;
       classifyIds(evt);
@@ -1822,7 +2117,7 @@
         const parsed = Date.parse(eventTs);
         eventTs = Number.isNaN(parsed) ? null : parsed / 1000;
       }
-      if (typeof eventTs !== "number") eventTs = Date.now() / 1000;
+      if (typeof eventTs !== "number") eventTs = nodeNow();
       let entry = state.macs.get(mac);
       if (!entry) {
         entry = { event: evt, first_seen: eventTs, last_seen: eventTs, marker: null, card: null };
@@ -1847,6 +2142,8 @@
     }
 
     function handleSnapshot(snap) {
+      // snapshot_at is the node's wall clock when it built this response.
+      setNodeClock(snap.snapshot_at);
       for (const m of (snap.macs || [])) {
         const evt = m.latest;
         if (!evt) continue;
@@ -1867,9 +2164,332 @@
       }
     }
 
+    /* ----- Replay -------------------------------------------------------
+       A PERIOD, not a moment. The server's history page uses a moment
+       scrubber with jump-to-next-detection arrows because it spans all of
+       time and every node, so you have to hunt for where the data is. A node
+       does not have that problem: its history is bounded and knowable, so the
+       slider's own extent answers "how much do I have", and the painted track
+       answers "where is anything". Two handles also match how people describe
+       this — "yesterday evening's flight", not "21:07:00".
+
+       🚨 Labels are RELATIVE by default and only become calendar dates when
+       the node's clock is actually disciplined. A Pi has no RTC and an offline
+       node has no NTP, so its clock can be hours or days out. "3h ago" stays
+       true on such a node because both ends of the subtraction come from the
+       same clock; "14:32 on the 9th" does not. Printing a date the node cannot
+       stand behind is worse than printing no date at all. */
+    const replay = {
+      bounds: null,
+      from: 0, to: 0,          // node-clock seconds
+      open: false,
+      active: false,           // true while the map is showing history
+      loading: false,
+      savedFreshness: null,
+
+      async show() {
+        const bar = document.getElementById("replay-bar");
+        let b;
+        try {
+          b = await (await fetch("/api/history/bounds")).json();
+        } catch (e) {
+          return replay.unavailable("Could not read the node's history.");
+        }
+        if (b.error) return replay.unavailable(b.detail || "History unavailable.");
+        replay.bounds = b;
+        setNodeClock(b.now);
+
+        // No history is a real answer, not an error. Say why rather than
+        // showing a slider with nothing behind it.
+        if (!b.oldest || !b.newest || b.newest <= b.oldest) {
+          return replay.unavailable(
+            "This node has not recorded any history yet. Detections are saved "
+            + "to disk as they arrive; come back once it has been running.");
+        }
+        bar.hidden = false;
+        replay.open = true;
+        document.getElementById("btn-replay").setAttribute("aria-expanded", "true");
+        replay.reset();
+        // Leaflet sizes itself to its container, which just got shorter.
+        if (state.map) setTimeout(() => state.map.invalidateSize(), 60);
+      },
+
+      unavailable(msg) {
+        const bar = document.getElementById("replay-bar");
+        bar.hidden = false;
+        replay.open = true;
+        document.getElementById("replay-slider").style.display = "none";
+        document.getElementById("replay-foot") &&
+          (document.getElementById("replay-foot").style.display = "none");
+        replay.note(msg, true);
+      },
+
+      async hide() {
+        document.getElementById("replay-bar").hidden = true;
+        replay.open = false;
+        document.getElementById("btn-replay").setAttribute("aria-expanded", "false");
+        if (replay.active) {
+          replay.active = false;
+          if (replay.savedFreshness) state.filters.freshness = replay.savedFreshness;
+          replay.savedFreshness = null;
+          // Rebuild from the node rather than from whatever the page happened
+          // to be holding before: SSE was ignored throughout replay, so the
+          // in-page picture is stale by exactly the length of the detour.
+          replay.clearView();
+          try {
+            const r = await fetch("/api/detections");
+            if (r.ok) handleSnapshot(await r.json());
+          } catch (e) {}
+          applyFilters();
+        }
+        if (state.map) setTimeout(() => state.map.invalidateSize(), 60);
+      },
+
+      reset() {
+        const b = replay.bounds;
+        if (!b) return;
+        replay.from = b.oldest;
+        replay.to = b.newest;
+        document.getElementById("replay-from").value = 0;
+        document.getElementById("replay-to").value = 1000;
+        replay.paint();
+        replay.render();
+        replay.load();
+      },
+
+      // Slider positions are 0-1000 over the node's own extent, so the handles
+      // cannot select a period the node has no data for.
+      posToTime(pos) {
+        const b = replay.bounds;
+        return b.oldest + (b.newest - b.oldest) * (pos / 1000);
+      },
+
+      async paint() {
+        const b = replay.bounds;
+        const el = document.getElementById("replay-track");
+        const cols = Math.max(60, Math.min(Math.round(el.clientWidth || 600), 1200));
+        let tones;
+        try {
+          const r = await fetch(
+            `/api/history/track?from=${b.oldest}&to=${b.newest}&columns=${cols}`);
+          tones = (await r.json()).tones || [];
+        } catch (e) { return; }
+        // Painted as a hard-stop gradient: one paint for the whole track
+        // rather than a thousand elements, and it survives a resize.
+        const TONE = ["transparent", "#3f6f8c", "var(--accent)"];
+        const n = tones.length || 1;
+        const stops = [];
+        for (let i = 0; i < n; i++) {
+          const a = (i * 100 / n).toFixed(3), z = ((i + 1) * 100 / n).toFixed(3);
+          stops.push(`${TONE[tones[i]] || "transparent"} ${a}% ${z}%`);
+        }
+        el.style.background = `linear-gradient(to right, ${stops.join(",")})`;
+      },
+
+      render() {
+        const b = replay.bounds;
+        const synced = !!b.clock_synced;
+        const now = nodeNow();
+
+        // The ends of the track: how far back the history goes, and "Now".
+        document.getElementById("replay-left").textContent =
+          relTime(now - b.oldest).replace(" ago", " ago");
+        document.getElementById("replay-right").textContent =
+          (now - b.newest) < 120 ? "Now" : relTime(now - b.newest);
+
+        // The selected window. Relative always; a real date only when the
+        // node's clock has been disciplined by a time source.
+        const span = replay.to - replay.from;
+        let text = `${relTime(now - replay.from)} → `
+                 + (((now - replay.to) < 120) ? "now" : relTime(now - replay.to))
+                 + `  ·  ${fmtSpan(span)} selected`;
+        if (synced) text += `  ·  ${fmtAbsRange(replay.from, replay.to)}`;
+        document.getElementById("replay-window").textContent = text;
+
+        replay.note(synced ? "" :
+          "The node's clock has not been set from a time source, so these are "
+          + "shown as time before now rather than as dates. Ordering and "
+          + "durations are still exact.", false);
+      },
+
+      // Put the selected period on the map. The live view is replaced rather
+      // than overlaid: two sets of aircraft on one map, one from an hour ago
+      // and one from now, is not a picture anyone can read.
+      async load() {
+        if (!replay.bounds) return;
+        replay.loading = true;
+        let d;
+        try {
+          d = await (await fetch(
+            `/api/history/range?from=${replay.from}&to=${replay.to}`)).json();
+        } catch (e) {
+          replay.loading = false;
+          return replay.note("Could not read that period from the node.", true);
+        }
+        replay.loading = false;
+        if (d.error) return replay.note(d.detail || "Could not read that period.", true);
+
+        // Take over the live view. handleEvent() and the prune sweep both
+        // check replay.active, so nothing arriving over SSE disturbs this and
+        // nothing here gets pruned for being older than the stale window —
+        // which every historical record is, by definition.
+        if (!replay.active) {
+          replay.active = true;
+          replay.savedFreshness = new Set(state.filters.freshness);
+        }
+        // Historical records are old by definition, so the freshness chips
+        // would filter the entire result set away.
+        state.filters.freshness = new Set(["live", "recent", "older"]);
+
+        replay.clearView();
+
+        for (const evt of (d.events || [])) {
+          const mac = evt.mac;
+          if (!mac) continue;
+          const ts = typeof evt.t === "number" ? evt.t : replay.from;
+          let entry = state.macs.get(mac);
+          if (!entry) {
+            entry = { event: evt, first_seen: ts, last_seen: ts, trail: [],
+                      // On by default here, unlike the live view: the whole
+                      // reason to open replay is to see where something went.
+                      showTrail: true,
+                      marker: null, card: null, polyline: null,
+                      opMarker: null, connector: null };
+            state.macs.set(mac, entry);
+          } else {
+            entry.event = mergeNonNull(entry.event, evt);
+            if (ts > entry.last_seen) entry.last_seen = ts;
+            if (ts < entry.first_seen) entry.first_seen = ts;
+          }
+          if (typeof evt.lat === "number" && typeof evt.lon === "number") {
+            // Shared with the live path so replayed flights carry altitude
+            // and get the same hue-coded waypoint dots.
+            appendTrail(entry, evt.lat, evt.lon, altitudeSource(evt));
+          }
+          if (evt.serial_number) {
+            (entry.serials || (entry.serials = new Set())).add(evt.serial_number);
+          }
+        }
+        for (const mac of state.macs.keys()) { updateMarker(mac); renderCard(mac); }
+        applyFilters();
+
+        const n = state.macs.size;
+        if (n) {
+          replay.note(
+            `Showing ${d.count} recorded detection${d.count === 1 ? "" : "s"} `
+            + `from ${n} aircraft. Live view is paused.`
+            + (d.truncated ? " Only the first part of this period is shown — "
+                           + "narrow the window to see the rest." : ""), false);
+        } else {
+          // 🚨 "Nothing here" has two meanings and they are not the same
+          // answer. Saying "the node was listening" over a period when it was
+          // switched off reintroduces exactly the ambiguity the three-tone
+          // track exists to resolve — and it is the case this release is for:
+          // the drive out and back is not a quiet sky.
+          replay.note(await replay.whyEmpty(), false);
+        }
+      },
+
+      // removeMarker() only takes the marker off the map. The card is a DOM
+      // node parked in a tier bucket, so without this every window loaded
+      // leaves its cards behind and the sidebar accumulates aircraft the map
+      // is no longer showing.
+      clearView() {
+        for (const mac of [...state.macs.keys()]) {
+          const entry = state.macs.get(mac);
+          removeMarker(mac);
+          if (entry && entry.card && entry.card.parentNode) entry.card.remove();
+        }
+        state.macs.clear();
+      },
+
+      // Ask the track what the node was actually doing across this window,
+      // rather than assuming it was listening.
+      async whyEmpty() {
+        let tones = [];
+        try {
+          const r = await fetch(
+            `/api/history/track?from=${replay.from}&to=${replay.to}&columns=120`);
+          tones = (await r.json()).tones || [];
+        } catch (e) { /* fall through to the neutral wording */ }
+        const listening = tones.filter(t => t >= 1).length;
+        if (!tones.length) return "No detections recorded in that period.";
+        if (!listening) {
+          return "The node was not recording during this period — it was "
+               + "switched off, or its feeders were not running. This is not "
+               + "the same as a quiet sky.";
+        }
+        if (listening === tones.length) {
+          return "The node was recording throughout this period and heard "
+               + "nothing. The sky was quiet.";
+        }
+        const pct = Math.round(listening * 100 / tones.length);
+        return `The node was recording for about ${pct}% of this period and `
+             + "heard nothing; for the rest it was not recording at all.";
+      },
+
+      note(msg, bad) {
+        const el = document.getElementById("replay-note");
+        el.textContent = msg;
+        el.hidden = !msg;
+        el.style.color = bad ? "#F59E0B" : "";
+      },
+    };
+
+    function fmtSpan(sec) {
+      sec = Math.max(0, Math.round(sec));
+      const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      if (d) return `${d}d ${h}h`;
+      if (h) return `${h}h ${m}m`;
+      if (m) return `${m}m`;
+      return `${sec}s`;
+    }
+
+    // Only ever called when the node reports a disciplined clock.
+    function fmtAbsRange(t0, t1) {
+      const a = new Date(t0 * 1000), b = new Date(t1 * 1000);
+      const day = { month: "short", day: "numeric" };
+      const hm = { hour: "2-digit", minute: "2-digit" };
+      const sameDay = a.toDateString() === b.toDateString();
+      return sameDay
+        ? `${a.toLocaleDateString([], day)} ${a.toLocaleTimeString([], hm)}–${b.toLocaleTimeString([], hm)}`
+        : `${a.toLocaleDateString([], day)} ${a.toLocaleTimeString([], hm)} – `
+          + `${b.toLocaleDateString([], day)} ${b.toLocaleTimeString([], hm)}`;
+    }
+
+    function initReplay() {
+      const lo = document.getElementById("replay-from");
+      const hi = document.getElementById("replay-to");
+      const onInput = () => {
+        // Handles must not cross; whichever is being dragged pushes the other.
+        let a = Number(lo.value), z = Number(hi.value);
+        if (a > z) { const t = a; a = z; z = t; lo.value = a; hi.value = z; }
+        replay.from = replay.posToTime(a);
+        replay.to = replay.posToTime(z);
+        replay.render();
+      };
+      lo.addEventListener("input", onInput);
+      hi.addEventListener("input", onInput);
+      // Load on release. Fetching on every input event would fire a range
+      // query per pixel of drag.
+      lo.addEventListener("change", () => replay.load());
+      hi.addEventListener("change", () => replay.load());
+      document.getElementById("replay-reset").addEventListener("click", replay.reset);
+      document.getElementById("replay-close").addEventListener("click", replay.hide);
+      document.getElementById("btn-replay").addEventListener("click", () => {
+        replay.open ? replay.hide() : replay.show();
+      });
+      window.addEventListener("resize", () => { if (replay.open) replay.paint(); });
+    }
+
     /* ----- Freshness refresh + prune ----- */
     function refreshFreshness() {
-      const now = Date.now() / 1000;
+      // Every replayed record is older than the stale window — that is what
+      // makes it history — so the prune sweep would empty the map within a
+      // second of loading it.
+      if (replay.active) return;
+      const now = nodeNow();
       const toPrune = [];
       for (const [mac, entry] of state.macs) {
         const age = now - entry.last_seen;
@@ -2019,6 +2639,10 @@
         const r = await fetch("/api/status");
         if (!r.ok) return;
         const s = await r.json();
+        // Re-measure the node/browser clock offset every poll, so a node whose
+        // clock is corrected by NTP mid-session stops mis-ageing its
+        // detections without the page needing a reload.
+        setNodeClock(s.now);
         renderFeeders(s.feeders);
         renderLocation(s);
         setHeaderStatus(undefined, s.uplink_ok !== false);
@@ -2168,7 +2792,7 @@
       if (!entry) return "<div class='da-popup-inner'>—</div>";
       const evt = entry.event;
       const id = displayId(evt, mac);
-      const ageSec = (Date.now() / 1000) - entry.last_seen;
+      const ageSec = nodeNow() - entry.last_seen;
 
       // Make/model only shown when server-side enrichment has populated
       // these fields (item #9 in v1.4.0 punch list — not yet implemented).
@@ -2213,9 +2837,7 @@
               <div class="da-popup-mac">${escapeHtml(mac)}</div>
             </div>
             <div class="da-popup-thumb" title="Drone image — requires server enrichment">
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="currentColor">
-                <path d="M498.1 5.6c10.1 7 15.4 19.1 13.5 31.2l-64 416c-1.5 9.7-7.4 18.2-16 23s-18.9 5.4-28 1.6L284 427.7l-68.5 74.1c-8.9 9.7-22.9 12.9-35.2 8.1S160 493.2 160 480V396.4c0-4 1.5-7.8 4.2-10.7L331.8 202.8c5.8-6.3 5.6-16-.4-22s-15.7-6.4-22-.7L106 360.8 17.7 316.6C7.1 311.3 .3 300.7 0 288.9s5.9-22.8 16.1-28.7l448-256c10.7-6.1 23.9-5.5 34 1.4z"/>
-              </svg>
+              ${BRAND_DRONE_SVG}
             </div>
           </div>
           ${makeModelHTML}
@@ -2226,6 +2848,8 @@
             <div class="da-popup-value">${altTxt || "—"}</div>
             <div class="da-popup-label">Speed</div>
             <div class="da-popup-value">${speedTxt || "—"}</div>
+            <div class="da-popup-label">Heading</div>
+            <div class="da-popup-value">${escapeHtml(headingTxt)}</div>
           </div>
           <div class="da-popup-divider"></div>
           <div class="da-popup-noderow">
@@ -2240,12 +2864,11 @@
               <span class="k">Channel</span><span class="v">${evt.channel ?? "—"}</span>
 ${multiSerialHTML}
               <span class="k">Msg type</span><span class="v">${escapeHtml(evt.type || "—")}</span>
-              <span class="k">Heading</span><span class="v">${escapeHtml(headingTxt)}</span>
               <span class="k">Lat</span><span class="v">${(typeof evt.lat === "number") ? evt.lat.toFixed(6) : "—"}</span>
               <span class="k">Lon</span><span class="v">${(typeof evt.lon === "number") ? evt.lon.toFixed(6) : "—"}</span>
               <span class="k">Op lat</span><span class="v">${(typeof evt.operator_lat === "number") ? evt.operator_lat.toFixed(6) : "—"}</span>
               <span class="k">Op lon</span><span class="v">${(typeof evt.operator_lon === "number") ? evt.operator_lon.toFixed(6) : "—"}</span>
-              <span class="k">First seen</span><span class="v">${relTime((Date.now()/1000) - entry.first_seen)}</span>
+              <span class="k">First seen</span><span class="v">${relTime(nodeNow() - entry.first_seen)}</span>
               <span class="k">Last seen</span><span class="v">${relTime(ageSec)}</span>
               <span class="k">Trail pts</span><span class="v">${entry.trail ? entry.trail.length : 0}</span>
             </div>
@@ -2272,22 +2895,88 @@ ${multiSerialHTML}
     // marker color; the trail's job is to be visually distinct against
     // any basemap so the operator can trace the full flight at a glance.
     // Ignores the `color` argument passed by callers (kept for compat).
-    const TRAIL_COLOR = "#FFD400";
+    // The flight-path colour on droneaware.io/live.html. Kept identical so an
+    // operator reads the same picture on the node and on the website.
+    const TRAIL_COLOR = "#00E5FF";
+    // Hue-code a waypoint by its height within the track's own range: cyan at
+    // the bottom through to red at the top. Copied from live.html so a flight
+    // path reads the same on both surfaces.
+    function altColor(alt, min, max) {
+      if (alt == null || min == null || max == null || min === max) return "#FFD700";
+      const t = Math.max(0, Math.min(1, (alt - min) / (max - min)));
+      return `hsl(${(180 - 150 * t).toFixed(0)}, 70%, 55%)`;
+    }
+
+    // Which points get a dot. Always the first, last and highest; then one per
+    // ~10 s of flight, capped so a long sortie does not bury the line it is
+    // annotating. Mirrors sampleAltitudeWaypoints() in live.html.
+    function sampleAltitudeWaypoints(trail) {
+      const pts = [];
+      for (let i = 0; i < trail.length; i++) {
+        if (typeof trail[i][2] === "number") pts.push({ i, alt: trail[i][2] });
+      }
+      if (!pts.length) return [];
+      let peak = 0;
+      for (let k = 1; k < pts.length; k++) if (pts[k].alt > pts[peak].alt) peak = k;
+      const MAX_DOTS = 60;
+      const step = Math.max(1, Math.ceil(pts.length / MAX_DOTS));
+      const keep = new Set([0, pts.length - 1, peak]);
+      for (let k = 0; k < pts.length; k += step) keep.add(k);
+      return [...keep].sort((a, b) => a - b).map(k => ({
+        lat: trail[pts[k].i][0], lon: trail[pts[k].i][1],
+        alt: pts[k].alt, isPeak: k === peak,
+      }));
+    }
+
     function renderTrailPolyline(entry, _color) {
       if (!entry.trail || entry.trail.length < 2) return;
       if (!entry.polyline) {
+        // Same line as droneaware.io/live.html: thin, cyan, slightly
+        // translucent so it reads as a path over the map rather than a
+        // drawing on top of it.
         entry.polyline = L.polyline(entry.trail, {
-          color: TRAIL_COLOR, weight: 4, opacity: 1.0, interactive: false,
+          color: TRAIL_COLOR, weight: 2, opacity: 0.75, interactive: false,
         }).addTo(state.map);
       } else {
         entry.polyline.setLatLngs(entry.trail);
       }
+      renderTrailWaypoints(entry);
+    }
+
+    // Altitude dots along the path, hue-coded and hoverable. Rebuilt rather
+    // than diffed: a trail grows by a point at a time and the whole track's
+    // min/max can shift with any of them, which recolours every dot.
+    function renderTrailWaypoints(entry) {
+      if (entry.waypoints) {
+        state.map.removeLayer(entry.waypoints);
+        entry.waypoints = null;
+      }
+      const wps = sampleAltitudeWaypoints(entry.trail || []);
+      if (!wps.length) return;
+      const alts = wps.map(w => w.alt);
+      const minA = Math.min(...alts), maxA = Math.max(...alts);
+      const group = L.layerGroup();
+      for (const wp of wps) {
+        const label = formatAltitude({ height_agl: wp.alt }) || `${Math.round(wp.alt)} m`;
+        L.circleMarker([wp.lat, wp.lon], {
+          radius: (wp.isPeak && wps.length > 1) ? 5 : 4,
+          color: "#fff", weight: 1,
+          fillColor: altColor(wp.alt, minA, maxA), fillOpacity: 0.95,
+        }).bindTooltip((wp.isPeak && wps.length > 1) ? `${label} · peak` : label,
+                       { direction: "top", offset: [0, -4] }).addTo(group);
+      }
+      group.addTo(state.map);
+      entry.waypoints = group;
     }
 
     function removeTrailPolyline(entry) {
       if (entry.polyline) {
         state.map.removeLayer(entry.polyline);
         entry.polyline = null;
+      }
+      if (entry.waypoints) {
+        state.map.removeLayer(entry.waypoints);
+        entry.waypoints = null;
       }
     }
 
@@ -2302,7 +2991,7 @@ ${multiSerialHTML}
       if (!entry) return;
       entry.showTrail = !entry.showTrail;
       if (entry.showTrail) {
-        const age = (Date.now() / 1000) - entry.last_seen;
+        const age = nodeNow() - entry.last_seen;
         const f = freshnessFor(age);
         renderTrailPolyline(entry, f.color);
         zoomToTrail(mac);
@@ -2407,6 +3096,55 @@ ${multiSerialHTML}
       // being online says nothing about whether the NODE can reach it.
       window.addEventListener("online",  refreshStatus);
       window.addEventListener("offline", refreshStatus);
+
+      initReplay();
+
+      // Shut down, behind a confirm. The page it is pressed from will stop
+      // answering, so there is no undo from here — hence the dialog.
+      (function initShutdown() {
+        const back = document.getElementById("confirm-backdrop");
+        const body = document.getElementById("confirm-body");
+        const ok = document.getElementById("confirm-ok");
+        const close = () => { back.hidden = true; };
+        document.getElementById("cfg-shutdown").addEventListener("click", () => {
+          back.hidden = false;
+          ok.disabled = false;
+          ok.textContent = "Shut down";
+        });
+        document.getElementById("confirm-cancel").addEventListener("click", close);
+        back.addEventListener("click", (e) => { if (e.target === back) close(); });
+        document.addEventListener("keydown", (e) => {
+          if (e.key === "Escape" && !back.hidden) close();
+        });
+        ok.addEventListener("click", async () => {
+          ok.disabled = true;
+          ok.textContent = "Shutting down…";
+          try {
+            const r = await fetch("/api/action", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ action: "poweroff" }),
+            });
+            const d = await r.json().catch(() => ({}));
+            if (d.error) {
+              ok.disabled = false;
+              ok.textContent = "Shut down";
+              body.textContent = d.detail
+                || "The node refused the request. Check that the installer's "
+                 + "permission rule is in place.";
+              return;
+            }
+          } catch (e) {
+            // The connection dropping mid-request is the SUCCESS case here —
+            // the node went down before it could answer. Do not report it as
+            // a failure.
+          }
+          body.textContent = "Powering down. Wait for the lights to stop, "
+            + "then it is safe to unplug.";
+          document.querySelector(".confirm-actions").hidden = true;
+          setHeaderStatus && setHeaderStatus("OFFLINE", false);
+        });
+      })();
 
       // Initial snapshot
       try {
@@ -2586,9 +3324,13 @@ ${multiSerialHTML}
           host.appendChild(h);
           for (const f of group.fields) {
             cfg.specs[f.key] = f;
+            // A hidden group's keys are owned by its widget, which renders
+            // its own controls and writes the values into hidden inputs.
+            if (group.hidden) continue;
             host.appendChild(cfg.field(f, d.values[f.key] ?? ""));
           }
           if (group.widget === "adapters") await cfg.adapterWidget(host);
+          if (group.widget === "channels") await cfg.channelWidget(host, group.fields);
           if (group.widget === "defaults") {
             const bar = document.createElement("div");
             bar.className = "action-row";
@@ -2745,6 +3487,239 @@ ${multiSerialHTML}
           wrap.appendChild(p);
         }
         return wrap;
+      },
+      // Which channels the radios visit. These four keys have always worked
+      // in config.env; this is a front end for them, not a new mechanism.
+      //
+      // Presets first, grid behind a disclosure. The honest default answer to
+      // "which channels should I scan" is "all of them" — every time we have
+      // narrowed the plan on reasoning rather than evidence it has cost us
+      // aircraft — so choosing a subset should feel like leaving the default
+      // behind rather than like filling in a form.
+      async channelWidget(host, fields) {
+        // Hidden inputs carry the actual values. cfg.save() collects from
+        // [data-key], so the widget writes into these and the ordinary save
+        // path applies them with no special case.
+        const held = {};
+        for (const f of fields) {
+          const i = document.createElement("input");
+          i.type = "hidden";
+          i.id = `cfg-${f.key}`;
+          i.dataset.key = f.key;
+          i.value = cfg.loaded[f.key] ?? "";
+          host.appendChild(i);
+          held[f.key] = i;
+        }
+
+        const box = document.createElement("div");
+        box.className = "estimate-box";
+        host.appendChild(box);
+
+        let d;
+        try {
+          d = await (await fetch("/api/channels")).json();
+        } catch (e) {
+          box.textContent = "Could not read the radios' channel support.";
+          return;
+        }
+
+        const isTwo = c => c <= 14;
+        const def = d.defaults;
+        // A channel this node's radios cannot tune to must never show as
+        // selected. The feeder filters the plan against the PHY regardless,
+        // so leaving ch13 ticked on a US card would claim coverage the node
+        // does not have — and because the box is disabled, the operator
+        // cannot untick it either. Empty `supported` means the probe failed,
+        // in which case everything is offered, matching the feeder's own
+        // fallback to the unfiltered list.
+        const usable = c => !d.supported.length || d.supported.includes(c);
+        // Empty means "use the built-in list", so resolve to what the feeder
+        // will actually visit. Showing a blank grid for the default setting
+        // would be a lie about what the node is doing.
+        const parse = (raw, fallback) => {
+          const v = String(raw ?? "").trim().toLowerCase();
+          if (!v) return fallback.slice();
+          if (v === "none" || v === "off") return [];
+          return v.split(",").map(x => parseInt(x, 10)).filter(n => !isNaN(n));
+        };
+        const only = list => list.filter(usable);
+        const state = {
+          two: only(parse(cfg.loaded.WIFI_EXPLORE_2G, def.explore_2g)),
+          five: only(parse(cfg.loaded.WIFI_EXPLORE_5G, def.explore_5g)),
+          hold2: String(cfg.loaded.WIFI_SOCIAL_2G_CHANNEL ?? def.social_2g) !== "0",
+          hold5: String(cfg.loaded.WIFI_SOCIAL_5G_CHANNEL ?? def.social_5g) !== "0",
+        };
+
+        const PRESETS = [
+          { id: "both", label: "Both bands",
+            note: "Sweeps 2.4 and 5 GHz, resting longer on ch6 and ch149. "
+                + "This is what the node ships with.",
+            apply: () => ({ two: only(def.explore_2g), five: only(def.explore_5g),
+                            hold2: true, hold5: usable(149) }) },
+          { id: "5g", label: "5 GHz priority, hold ch6",
+            note: "Sweeps all of 5 GHz. On 2.4 the radio stays on ch6 instead "
+                + "of sweeping, so nothing on ch1-13 is heard.",
+            apply: () => ({ two: [], five: only(def.explore_5g),
+                            hold2: true, hold5: usable(149) }) },
+          { id: "2g", label: "2.4 GHz only",
+            note: "Sweeps 2.4 GHz and ignores 5 GHz entirely.",
+            apply: () => ({ two: only(def.explore_2g), five: [],
+                            hold2: true, hold5: false }) },
+        ];
+
+        const same = (a, b) => a.length === b.length
+          && a.slice().sort((x, y) => x - y).join() === b.slice().sort((x, y) => x - y).join();
+        const match = () => {
+          for (const p of PRESETS) {
+            const w = p.apply();
+            if (same(state.two, w.two) && same(state.five, w.five)
+                && state.hold2 === w.hold2 && state.hold5 === w.hold5) return p.id;
+          }
+          return "custom";
+        };
+
+        // --- presets -------------------------------------------------------
+        const radios = {};
+        for (const p of PRESETS.concat([{ id: "custom", label: "Custom",
+              note: "Whatever is ticked below." }])) {
+          const row = document.createElement("label");
+          row.className = "chan-preset";
+          const r = document.createElement("input");
+          r.type = "radio";
+          r.name = "chan-preset";
+          r.value = p.id;
+          radios[p.id] = r;
+          r.addEventListener("change", () => {
+            if (p.id === "custom") { adv.open = true; return; }
+            Object.assign(state, p.apply());
+            render();
+          });
+          row.appendChild(r);
+          const t = document.createElement("span");
+          const strong = document.createElement("strong");
+          strong.textContent = p.label;
+          t.appendChild(strong);
+          const n = document.createElement("span");
+          n.className = "chan-note";
+          n.textContent = p.note;
+          t.appendChild(n);
+          row.appendChild(t);
+          box.appendChild(row);
+        }
+
+        // --- advanced grid --------------------------------------------------
+        const adv = document.createElement("details");
+        adv.className = "chan-advanced";
+        const sum = document.createElement("summary");
+        sum.textContent = "Advanced — choose channels individually";
+        adv.appendChild(sum);
+
+        const warn = document.createElement("p");
+        warn.className = "chan-warning";
+        warn.textContent =
+          "Narrowing the scan loses aircraft, and not always the ones you "
+          + "expect. Remote ID beacons move between channels mid-flight — we "
+          + "have recorded 165 to 153 and 56 to 165 on separate flights — so a "
+          + "channel that is quiet now is not one you can rule out. Radar "
+          + "(DFS) channels turned out to carry real traffic after two "
+          + "releases of leaving them out, and the 2.4 sweep past ch6 exists "
+          + "because a Parrot ANAFI was found on ch5. Unless you are chasing a "
+          + "known aircraft, scan everything.";
+        adv.appendChild(warn);
+
+        const grids = [];
+        for (const band of d.bands) {
+          const g = document.createElement("div");
+          g.className = "chan-band";
+          const h = document.createElement("div");
+          h.className = "chan-band-name";
+          h.textContent = band.band;
+          g.appendChild(h);
+          const row = document.createElement("div");
+          row.className = "chan-grid";
+          for (const ch of band.channels) {
+            // Empty `supported` means the probe failed, not that the radio
+            // supports nothing — the feeder scans the full list unfiltered in
+            // that same case, so the grid must not grey everything out.
+            const ok = !d.supported.length || d.supported.includes(ch);
+            const cell = document.createElement("label");
+            cell.className = "chan-cell" + (ok ? "" : " chan-unsupported");
+            if (!ok) cell.title = "No radio on this node can tune to this channel";
+            const cb = document.createElement("input");
+            cb.type = "checkbox";
+            cb.dataset.ch = String(ch);
+            cb.disabled = !ok;
+            cb.addEventListener("change", () => {
+              const list = isTwo(ch) ? state.two : state.five;
+              const at = list.indexOf(ch);
+              if (cb.checked && at < 0) list.push(ch);
+              if (!cb.checked && at >= 0) list.splice(at, 1);
+              if (ch === band.social) {
+                if (isTwo(ch)) state.hold2 = cb.checked;
+                else state.hold5 = cb.checked;
+              }
+              render();
+            });
+            cell.appendChild(cb);
+            const t = document.createElement("span");
+            t.textContent = String(ch);
+            cell.appendChild(t);
+            if (ch === band.social) {
+              const b = document.createElement("em");
+              b.className = "chan-held";
+              b.textContent = "held";
+              b.title = "Aircraft on this channel beacon only once a second, "
+                + "so the radio rests here longer than on the others";
+              cell.appendChild(b);
+            }
+            row.appendChild(cell);
+            grids.push(cb);
+          }
+          g.appendChild(row);
+          adv.appendChild(g);
+        }
+        box.appendChild(adv);
+
+        const count = document.createElement("p");
+        count.className = "chan-count";
+        box.appendChild(count);
+
+        // --- reflect state into the DOM and the hidden inputs ---------------
+        function render() {
+          const id = match();
+          for (const k in radios) radios[k].checked = (k === id);
+          for (const cb of grids) {
+            const ch = parseInt(cb.dataset.ch, 10);
+            cb.checked = (isTwo(ch) ? state.two : state.five).includes(ch);
+          }
+          // An explicit list, always — "" would mean "use the built-in list"
+          // and would silently re-add channels the operator just unticked.
+          held.WIFI_EXPLORE_2G.value = state.two.length
+            ? state.two.slice().sort((a, b) => a - b).join(",") : "none";
+          held.WIFI_EXPLORE_5G.value = state.five.length
+            ? state.five.slice().sort((a, b) => a - b).join(",") : "none";
+          held.WIFI_SOCIAL_2G_CHANNEL.value = state.hold2 ? "6" : "0";
+          held.WIFI_SOCIAL_5G_CHANNEL.value = state.hold5 ? "149" : "0";
+
+          const n = state.two.length + state.five.length;
+          if (!n) {
+            // The feeder recovers from this by falling back to the built-in
+            // plan, so it cannot go deaf — but silently doing the opposite of
+            // what was asked is worse than refusing here.
+            count.textContent = "No channels selected. The node cannot scan "
+              + "nothing — pick at least one, or stop the WiFi service if you "
+              + "want scanning off.";
+            count.classList.add("chan-empty");
+          } else {
+            count.textContent = `${n} channel${n === 1 ? "" : "s"} selected`
+              + (id === "custom" ? " (custom)" : "");
+            count.classList.remove("chan-empty");
+          }
+          const save = document.getElementById("cfg-save");
+          if (save) save.disabled = !n;
+        }
+        if (match() === "custom") adv.open = true;
+        render();
       },
       // Live hardware instead of two MAC text boxes. The roles are owned by
       // the node's orchestration, so the only honest controls here are the
