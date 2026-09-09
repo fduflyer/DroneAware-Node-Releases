@@ -1237,8 +1237,17 @@ def api_offline_map_estimate():
         radius = 20.0
     radius = max(OFFLINE_MAP_MIN_RADIUS_KM, min(radius, OFFLINE_MAP_MAX_RADIUS_KM))
 
+    # 🚨 Measure the filesystem the pack will actually be WRITTEN to, not the
+    # one this code is running from. _static_root() is sys._MEIPASS in the
+    # shipped PyInstaller binary — a temp directory under /tmp, which on a Pi
+    # is a tmpfs sized at half of RAM. On a 1 GB node that is ~400 MB, below
+    # the reserve, so the estimator reported zero usable space and refused
+    # every download while the SD card sat 93% empty.
+    #
+    # Invisible when running from source, where _static_root() is the repo on
+    # the real disk. It only appears in the binary operators actually run.
     try:
-        st = os.statvfs(_static_root())
+        st = os.statvfs(os.path.dirname(REGION_PACK_PATH))
         free = st.f_bavail * st.f_frsize
     except OSError:
         free = 0
