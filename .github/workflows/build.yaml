@@ -21,6 +21,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      # This build takes five packages, all of them from Ubuntu's own mirror:
+      # binfmt-support, parted, wget, dosfstools, zip. It takes nothing from
+      # Google or Microsoft — their apt sources are on the runner image only
+      # because it ships Chrome and Microsoft tooling for other people's
+      # workflows.
+      #
+      # apt-get update refreshes every registered source before installing
+      # anything, and arm-runner-action opens with
+      #     sudo apt-get update && sudo apt-get install -y ...
+      # under `bash -e`. So a bad index on a repo we never install from fails
+      # the whole build ~20s in, before any of our code runs. Google published
+      # a Release file on 2026-09-09 at 17:16Z pointing at a Packages.gz they
+      # had not published, and it took this build down three times.
+      #
+      # Dropping the sources we do not use leaves the build depending on
+      # Ubuntu alone. Ignore failures: a missing file is the desired state.
+      - name: Remove apt sources this build does not use
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list || true
+          echo "Remaining apt sources:"
+          grep -rhoE "https?://[^ ]+" /etc/apt/sources.list.d/ /etc/apt/sources.list \
+               2>/dev/null | sort -u || true
       - uses: pguyot/arm-runner-action@29ff97a269fc6ef3e98f17583af01253896c5601
         with:
           # Pin to Debian Bookworm (glibc 2.36) — must match the OS DroneAware
