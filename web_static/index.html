@@ -384,7 +384,11 @@
        underneath stays usable, and the panel drops to a bar at the bottom. */
     .pick-bar { display: none; }
     .settings-backdrop.picking {
-      background: transparent; pointer-events: none; align-items: flex-end;
+      /* Clearing the background is not enough — backdrop-filter keeps
+         blurring whatever is behind it. While picking a point, the thing
+         behind it is the map the operator is trying to aim at. */
+      background: transparent; backdrop-filter: none;
+      pointer-events: none; align-items: flex-end;
     }
     .settings-backdrop.picking .settings-panel {
       pointer-events: auto; max-width: 560px; width: calc(100% - 32px);

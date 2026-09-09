@@ -850,24 +850,54 @@ CONFIG_ENV_PATH = "/opt/droneaware/config.env"
 GPS_STATE_PATH  = "/run/droneaware/gps_state.json"
 
 
+# config.env parsed on demand, re-read whenever the file changes on disk.
+_cfg_cache = {"mtime": None, "values": {}}
+
+
+def _config_file_values() -> dict:
+    """Every key currently in config.env. Re-parsed only when it changes."""
+    try:
+        mtime = os.path.getmtime(CONFIG_ENV_PATH)
+    except OSError:
+        return _cfg_cache["values"]
+    if mtime != _cfg_cache["mtime"]:
+        values = {}
+        try:
+            with open(CONFIG_ENV_PATH) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    values[k.strip()] = v.strip()
+        except Exception:
+            return _cfg_cache["values"]
+        _cfg_cache.update(mtime=mtime, values=values)
+    return _cfg_cache["values"]
+
+
 def _read_config_env(key: str) -> str | None:
-    """Get a config value, preferring env (set by systemd EnvironmentFile)
-    and falling back to parsing /opt/droneaware/config.env directly. The
-    fallback supports manual `sudo python3 web_ui.py` testing where the
-    process isn't launched via systemd. Soft-fails silently if the file
-    is unreadable (e.g., running as non-root)."""
+    """Get a config value.
+
+    🚨 For anything the settings panel can edit, the FILE is the source of
+    truth, not the process environment. systemd starts this service with
+    EnvironmentFile=config.env, so os.environ is frozen at service start —
+    reading it back meant every setting saved from the panel appeared to do
+    nothing until the service was restarted. The operator changed the node's
+    location, pressed Save, and the map stayed where it was.
+
+    Everything else still prefers the environment, which keeps env overrides
+    working for a manual `python3 web_ui.py` run.
+    """
+    if key in CONFIG_EDITABLE:
+        val = _config_file_values().get(key)
+        if val is not None:
+            return val.strip() or None
+
     val = os.environ.get(key)
     if val is not None:
         return val.strip() or None
-    try:
-        with open(CONFIG_ENV_PATH) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith(f"{key}="):
-                    return line.split("=", 1)[1].strip() or None
-    except Exception:
-        pass
-    return None
+    return (_config_file_values().get(key) or "").strip() or None
 
 
 # Whether this node can reach DroneAware. Distinct from whether the BROWSER
