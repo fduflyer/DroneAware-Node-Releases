@@ -29,6 +29,7 @@ import logging
 import logging.handlers
 import argparse
 import socket
+import signal
 import glob
 import os
 import re
@@ -37,6 +38,8 @@ import collections
 import uuid
 import serial
 import requests
+
+import spool
 
 # -- Logging -------------------------------------------------------------------
 # Hard ceiling on SD card usage. A plain FileHandler appends forever and
@@ -1586,6 +1589,9 @@ class ScanPlanHopper(threading.Thread):
         self._release_i = 0
         self._social    = None
         self.retune_s   = 0.0
+        # One-shot, so the recovery in _build_plan cannot recurse if even the
+        # built-in plan filters down to nothing on this PHY.
+        self._fell_back = False
 
     @staticmethod
     def _parse_num(var: str, default: float) -> float:
@@ -1733,6 +1739,30 @@ class ScanPlanHopper(threading.Thread):
             log.warning("Scan plan: no explore channels available — social channels only")
         if not self._social:
             log.warning("Scan plan: no social channels available — explore only")
+
+        if not self._explore and not self._social and not self._fell_back:
+            # Reached two ways: every channel switched off in config.env, or a
+            # channel list that this adapter's PHY cannot tune a single entry
+            # of (5 GHz-only list on a 2.4-only card). Either way the radio
+            # would sit deaf, which is indistinguishable from a dead feeder in
+            # every log and every heartbeat.
+            #
+            # There is no legitimate "scan nothing" configuration — stopping
+            # WiFi scanning is what disabling the service is for — so treat it
+            # as a mistake and recover to the shipping plan rather than
+            # honouring it silently.
+            log.error(
+                "Scan plan: this configuration leaves the radio with NO channels. "
+                "Falling back to the built-in plan. Check WIFI_EXPLORE_2G, "
+                "WIFI_EXPLORE_5G, WIFI_SOCIAL_2G_CHANNEL and WIFI_SOCIAL_5G_CHANNEL, "
+                "or stop the feeder service if the intent was to stop scanning."
+            )
+            self._fell_back = True
+            self.social_2g  = self.SOCIAL_2G
+            self.social_5g  = self.SOCIAL_5G
+            self.explore_5g = list(self.EXPLORE_5G_CANDIDATES)
+            self.explore_2g = list(self.EXPLORE_2G_CANDIDATES)
+            self._build_plan()
 
     def _planned_social_legs(self) -> list:
         """Social legs before the PHY filter. A channel of 0 is switched off."""
@@ -1907,6 +1937,15 @@ class ScanPlanHopper(threading.Thread):
     def _sweep_cycle(self) -> bool:
         """One pass over the plan. Returns True if the thread should stop."""
         legs = list(self._social_legs)
+
+        if not legs and not self._explore:
+            # Nothing to scan. This loop has no sleep of its own — every wait
+            # comes from a leg's dwell — so an empty plan would spin a core at
+            # 100% forever while the node still looked alive and healthy.
+            # Unreachable while config.env is hand-edited; one click away as
+            # soon as the settings UI offers channel checkboxes.
+            log.warning("Scan plan: no channels to scan — idling, check the channel settings")
+            return self._sleep_s(5.0)
 
         if self._explore:
             if self.plan in ("a", "c"):
@@ -2125,6 +2164,10 @@ def get_wifi_health(adapter: str | None) -> tuple[bool | None, str | None]:
 # at startup (config.env). 50 MB is safe on every supported Pi tier
 # including Pi Zero 2 W (512 MB total) and well under the per-process OOM
 # threshold on default Pi OS.
+# Upper bound on one upload. The forwarder used to POST its entire buffer,
+# which is fine at a few events per flush and becomes an unbounded request
+# after an outage.
+DEFAULT_DRAIN_BATCH      = 200
 DEFAULT_BUFFER_MAX_BYTES = 50_000_000
 DEFAULT_BUFFER_WARN_PCT  = 75
 
@@ -2136,31 +2179,52 @@ def _event_size(event: dict) -> int:
     return len(json.dumps(event, separators=(',', ':')))
 
 
-class Forwarder:
-    """Buffers raw WiFi events and POSTs batches to the DroneAware server.
+def _spool_summary(fwd) -> dict:
+    """Compact spool state for the heartbeat and the local state file."""
+    try:
+        st = fwd.spool.stats()
+        return {
+            "bytes":            st["bytes"],
+            "segments":         st["segments"],
+            "backlog_events":   st["backlog_events"],
+            "oldest_epoch":     st["oldest_epoch"],
+            "degraded":         st["degraded"],
+            "dropped_segments": st["dropped_undelivered_segments"],
+        }
+    except Exception:
+        return {}
 
-    Uses a byte-bounded ring buffer so that if the uplink is down for an
-    extended period, oldest events are dropped rather than consuming
-    unbounded memory. Failed batches are re-queued at the front of the
-    buffer (drop-oldest on overflow preserves recency for forensics).
+
+class Forwarder:
+    """Spools raw WiFi events to disk, then drains that spool to the server.
+
+    The spool IS the queue. add() stages an event in RAM for at most one write
+    interval; everything after that reads from disk. That is deliberate — it
+    makes replay-from-disk the ordinary path, executed constantly, rather than
+    recovery code that only runs after the crash it is meant to survive.
+
+    It also changes what the buffer IS. Undelivered detections used to live in
+    a bare deque and were lost to power loss, reboot, update, refresh, a crash
+    loop, and even a clean systemctl stop. They are now the node's history:
+    kept until they are BOTH past the retention window AND delivered, so a
+    successful upload no longer destroys the record. See spool.py.
 
     Tunable via env vars:
-        DRONEAWARE_BUFFER_MAX_BYTES  — hard cap on buffer size (default 50 MB)
-        DRONEAWARE_BUFFER_WARN_PCT   — log a warning at this fill % (default 75)
+        DRONEAWARE_BUFFER_MAX_BYTES  — cap on the RAM staging buffer
+        DRONEAWARE_BUFFER_WARN_PCT   — log a warning at this fill %
+        DRONEAWARE_SPOOL_*           — see spool.py
     """
 
     def __init__(self, server_url: str, node_id: str,
                  batch_size: int = 10, flush_interval: float = 2.0,
-                 token: str = ""):
+                 token: str = "", feeder: str = "wifi"):
         self.url               = server_url.rstrip("/") + "/ingest"
         self.node_id           = node_id
         self.batch_size        = batch_size
         self.flush_interval    = flush_interval
         self.token             = token
-        # buffer holds (event_dict, size_bytes) tuples so we can pop without
-        # re-serializing. buffer_bytes is the running sum of all sizes.
-        self.buffer            = collections.deque()
-        self.buffer_bytes      = 0
+        self.spool             = spool.SpoolQueue(feeder)
+        self.limiter           = spool.NodeRateLimiter()
         self.max_buffer_bytes  = int(os.environ.get("DRONEAWARE_BUFFER_MAX_BYTES",
                                                     str(DEFAULT_BUFFER_MAX_BYTES)))
         self.warn_pct          = int(os.environ.get("DRONEAWARE_BUFFER_WARN_PCT",
@@ -2169,91 +2233,106 @@ class Forwarder:
         self.sent_total        = 0
         self.failed_total      = 0
         self.dropped_total     = 0
-        self._warned_high      = False  # one-shot, resets when buffer drains
+        self._warned_high      = False  # one-shot, resets when the spool drains
         # v1.5.0.10: the batch currently being delivered, held across retries
-        # as (idempotency_key, batch) so every attempt sends byte-identical
-        # data under the same key. None when nothing is in flight.
+        # as (idempotency_key, events, mark) so every attempt sends
+        # byte-identical data under the same key. None when nothing is in
+        # flight. `mark` is the spool position to commit once it lands.
         self._inflight         = None
-        self._inflight_bytes   = 0
+        # Advisory pacing from the server's last reply. Not a 429 — deliberately
+        # so, since a node must not re-send its buffer under load.
+        self._pace_until       = 0.0
+        # The shipping forwarder used batch_size purely as a flush TRIGGER and
+        # then posted `list(self.buffer)` — the entire buffer, however large.
+        # Under normal load that is a handful of events and this reads the
+        # same; after an outage it was an unbounded POST, and one permanent
+        # 4xx discarded every event in it. Reading a bounded batch keeps the
+        # ordinary case byte-identical while capping both the request size and
+        # the blast radius of a rejection.
+        self._drain_batch      = max(batch_size, DEFAULT_DRAIN_BATCH)
         self._lock             = threading.Lock()
 
     def add(self, event: dict):
-        size = _event_size(event)
-        with self._lock:
-            self.buffer.append((event, size))
-            self.buffer_bytes += size
-            self._evict_to_cap_locked()
-            # v1.4.8: no more sync _flush_locked here. Previously this held
-            # self._lock across a 5s requests.post — under sustained WiFi
-            # RID traffic the packet-capture main thread would sit blocked
-            # in add() while the kernel socket buffer overflowed and
-            # dropped packets silently. Mirrors the phillyrox failure
-            # mode we observed on the BLE side 2026-07-16. Flushing is
-            # now handled entirely by the background _flush_loop thread
-            # via should_flush() + flush().
+        self.spool.add(event)
+        if self.spool.staged_bytes > self.max_buffer_bytes:
+            # The staging window is 15 seconds, so reaching a 50 MB cap here
+            # means the disk is gone and the spool is running RAM-only. Shed
+            # rather than grow without bound; the loud part already happened
+            # when the spool degraded.
+            self.spool.commit_staged()
+        # v1.4.8: no synchronous flush here. Previously this held a lock across
+        # a 5s requests.post — under sustained WiFi RID traffic the
+        # packet-capture main thread would sit blocked in add() while the
+        # kernel socket buffer overflowed and dropped packets silently.
+        # Flushing is handled entirely by the background _flush_loop thread.
 
     @property
     def held_events(self) -> int:
-        """Events the forwarder still owns — buffered plus any in flight.
-
-        A batch being retried has left the deque but has not been delivered,
-        so reporting len(buffer) alone would understate what the node is
-        actually holding for exactly as long as delivery is failing.
-        """
+        """Events the node still owns — staged, spooled but undelivered, and
+        any batch in flight."""
+        st = self.spool.stats()
+        n = st["staged"] + st["backlog_events"]
         with self._lock:
-            n = len(self.buffer)
             if self._inflight is not None:
                 n += len(self._inflight[1])
-            return n
+        return n
 
     @property
     def held_bytes(self) -> int:
-        with self._lock:
-            return self.buffer_bytes + self._inflight_bytes
+        st = self.spool.stats()
+        return st["staged"] * int(self.spool.avg_event_bytes) + st["backlog_bytes"]
 
     def should_flush(self) -> bool:
         """Advisory: True if a flush is due. Called from background thread."""
+        if time.time() < self._pace_until:
+            return False
         with self._lock:
             if self._inflight is not None:
                 # A batch is waiting to be retried. It must be offered again
-                # even when the buffer behind it is empty, or a failed upload
-                # would sit in flight forever with nothing to trigger it. The
-                # interval governs the pace so a persistent failure does not
-                # spin.
+                # even when nothing is behind it, or a failed upload would sit
+                # in flight forever with nothing to trigger it. The interval
+                # governs the pace so a persistent failure does not spin.
                 return time.time() - self.last_flush >= self.flush_interval
-            if not self.buffer:
-                return False
-            if len(self.buffer) >= self.batch_size:
-                return True
-            return time.time() - self.last_flush >= self.flush_interval
+        if self.spool.due() or self.spool.staged_events >= self.batch_size:
+            return True
+        return time.time() - self.last_flush >= self.flush_interval
 
     def tick(self):
         """v1.4.8: kept for API compatibility, delegates to flush() which
-        takes the lock only for the batch-swap, NOT for the network POST."""
+        never holds a lock across the network POST."""
         if self.should_flush():
             self.flush()
 
     def flush(self):
-        """Take a batch under lock, release lock during network POST, then
-        reacquire briefly to re-queue on failure. Critical: never hold
-        self._lock across the requests.post — that's what caused the
-        BLE-side analog of the phillyrox saturation and would do the
-        same here under a fixed WiFi RID source."""
+        """Persist staged events, then offer one batch from the spool.
+
+        Critical: never hold self._lock across the requests.post — that is what
+        caused the BLE-side analog of the phillyrox saturation and would do the
+        same here under a fixed WiFi RID source.
+        """
+        self.spool.commit_staged()
+        self.spool.prune()
+
         with self._lock:
             if self._inflight is None:
-                if not self.buffer:
+                events, mark = self.spool.read_batch(self._drain_batch)
+                if not events:
+                    self.last_flush = time.time()
+                    self._maybe_warn()
                     return
-                batch = list(self.buffer)
-                self.buffer.clear()
-                self.buffer_bytes = 0
-                self._inflight = (uuid.uuid4().hex, batch)
-                self._inflight_bytes = sum(size for _, size in batch)
-            key, batch = self._inflight
+                self._inflight = (uuid.uuid4().hex, events, mark)
+            key, events, mark = self._inflight
             self.last_flush = time.time()
 
-        # Network POST OUTSIDE the lock — main thread's add() can keep
-        # accepting new events during the (potentially 5s) request.
-        events = [e for e, _ in batch]
+        # 🚨 One node, one server budget, three feeder processes. Pacing per
+        # process would send three times the intended rate on a dual-adapter
+        # node with every process believing it complies. The limiter is shared
+        # through a lock file — see spool.NodeRateLimiter.
+        wait = self.limiter.take(len(events))
+        if wait > 0:
+            self._pace_until = time.time() + wait
+            return
+
         payload = {"node_id": self.node_id, "events": events}
         try:
             headers = {"X-Node-Token": self.token} if self.token else {}
@@ -2263,10 +2342,15 @@ class Forwarder:
             headers["Idempotency-Key"] = key
             r = requests.post(self.url, json=payload, headers=headers, timeout=5)
             r.raise_for_status()
+            # 🚨 Advance the watermark. Do NOT delete the segment: a 200 says
+            # the events were accepted, not that the operator is done with
+            # them. Removal is governed by retention and the size ceiling
+            # alone, which is what makes this a history rather than a queue.
+            self.spool.commit(mark)
             with self._lock:
                 self._inflight = None
-                self._inflight_bytes = 0
             self.sent_total += len(events)
+            self._read_pacing_hint(r)
             log.debug(f"Forwarded {len(events)} events ({self.sent_total} total)")
         except requests.RequestException as e:
             # A 4xx will never be accepted however many times it is offered,
@@ -2282,63 +2366,61 @@ class Forwarder:
             with self._lock:
                 self.failed_total += len(events)
                 if permanent:
-                    self.dropped_total += len(batch)
+                    # Step over it so the drain continues. The events stay on
+                    # disk for the operator either way.
+                    self.dropped_total += len(events)
+                    self.spool.commit(mark)
                     self._inflight = None
-                    self._inflight_bytes = 0
-                self._evict_to_cap_locked()
             log.warning(
                 f"Forward failed: {e}  "
-                f"({'dropped — not retryable' if permanent else 'held for retry'}, "
-                f"buffered={len(self.buffer)}, "
-                f"buffer_bytes={self.buffer_bytes}, "
-                f"inflight={len(batch) if not permanent else 0}, "
+                f"({'skipped — not retryable' if permanent else 'held for retry'}, "
+                f"spooled={self.held_events}, "
+                f"spool_bytes={self.spool.stats()['bytes']}, "
+                f"inflight={len(events) if not permanent else 0}, "
                 f"failed_total={self.failed_total}, "
                 f"dropped_total={self.dropped_total})"
             )
 
-    def _evict_to_cap_locked(self):
-        """Drop oldest events until held bytes <= max_buffer_bytes. Logs
-        threshold crossings (one warning per fill, one info on drain).
+    def _read_pacing_hint(self, r):
+        """Honour next_batch_after_ms if the server sent one.
 
-        The in-flight batch counts toward the cap and sheds first. It is the
-        oldest data the forwarder holds, so dropping it first preserves the
-        drop-oldest-on-overflow behavior that the deque eviction below has
-        always had — and without counting it at all, a batch stuck in flight
-        through a long outage would sit outside the memory bound entirely
-        while the buffer behind it kept filling.
+        Advisory and optional: an older server, a proxy that rewrites bodies,
+        or a non-JSON reply all mean 'no hint', never an error. The node has
+        never parsed this response body before, so the parse itself is a new
+        failure mode — it fails silently and changes nothing.
         """
-        if (self._inflight is not None
-                and self.buffer_bytes + self._inflight_bytes > self.max_buffer_bytes):
-            stuck = len(self._inflight[1])
-            self.dropped_total += stuck
-            self._inflight = None
-            self._inflight_bytes = 0
-            log.warning(
-                f"Forwarder: dropped in-flight batch of {stuck} events — "
-                "buffer cap reached while it was being retried"
-            )
-        while self.buffer_bytes > self.max_buffer_bytes and len(self.buffer) > 1:
-            _, size = self.buffer.popleft()
-            self.buffer_bytes -= size
-            self.dropped_total += 1
-        held = self.buffer_bytes + self._inflight_bytes
-        pct = (held * 100) // self.max_buffer_bytes if self.max_buffer_bytes else 0
+        try:
+            hint = float(r.json().get("next_batch_after_ms") or 0) / 1000.0
+        except Exception:
+            return
+        if 0 < hint <= 3600:
+            self._pace_until = time.time() + hint
+
+    def _maybe_warn(self):
+        """One warning per fill, one info on drain."""
+        st = self.spool.stats()
+        cap = spool.max_bytes()
+        pct = (st["bytes"] * 100) // cap if cap else 0
         if pct >= self.warn_pct and not self._warned_high:
             log.warning(
-                f"Forwarder buffer at {pct}% of {self.max_buffer_bytes // 1_000_000} MB cap "
-                f"({len(self.buffer)} events, dropped_total={self.dropped_total})"
+                f"Spool at {pct}% of {cap // (1024*1024)} MB ceiling "
+                f"({st['segments']} segments, backlog={st['backlog_events']} events, "
+                f"dropped_total={self.dropped_total})"
             )
             self._warned_high = True
         elif pct < 10 and self._warned_high:
-            log.info(f"Forwarder buffer drained to {pct}% — caught up")
+            log.info(f"Spool drained to {pct}% — caught up")
             self._warned_high = False
 
-    # v1.4.8: _flush_locked removed. Its logic was inlined into flush()
-    # above with a critical fix: the network POST now runs OUTSIDE the
-    # buffer lock. The old pattern held self._lock across a 5s request
-    # timeout, blocking the packet-capture main thread's add() calls and
-    # causing kernel socket buffer overflow under sustained WiFi RID
-    # traffic — the same failure mode we observed on BLE at phillyrox.
+    def shutdown(self):
+        """Flush staged events to disk and fsync. Called from the SIGTERM
+        handler, which is what makes reboot, poweroff, `systemctl stop`,
+        `update` and `refresh` lossless. Before this there was no handler at
+        all, so a clean stop lost the buffer exactly like a power cut."""
+        n = self.spool.commit_staged(fsync=True)
+        if n:
+            log.info(f"Shutdown: flushed {n} staged events to the spool")
+        return n
 
 
 # -- GPS Reader ----------------------------------------------------------------
@@ -2881,7 +2963,12 @@ class WiFiFeeder:
         self.token       = token
         self.band        = band  # "auto" | "2g" | "5g" — v1.5.0 dual-adapter mode
         self.start_time  = time.time()
-        self.forwarder   = Forwarder(server_url, node_id, batch_size, flush_interval, token)
+        # Each feeder process gets its own spool directory. wifi-2g and
+        # wifi-5g run as separate processes against one node_id; sharing a
+        # segment directory would have them appending to the same file and
+        # advancing each other's cursor.
+        self.forwarder   = Forwarder(server_url, node_id, batch_size, flush_interval,
+                                     token, feeder=f"wifi-{band}")
         self.publisher   = LocalPublisher()
 
         # v1.5.0 dual-adapter mode overrides hopper choice explicitly.
@@ -3468,6 +3555,12 @@ class WiFiFeeder:
             self.forwarder.tick()
             if time.time() - last_heartbeat >= 60:
                 last_heartbeat = time.time()
+                # Mark this bucket as "the node was up and recording". Set here
+                # rather than on the spool write because the spool only writes
+                # when events exist — keying liveness off it would make a quiet
+                # sky indistinguishable from a node that was switched off,
+                # which is the whole ambiguity the replay track has to resolve.
+                self.forwarder.spool.tick_liveness()
                 cpu_pct = get_cpu_percent()
                 load_1m, load_5m, load_15m = get_cpu_load()
                 load_str    = f"{load_1m:.2f}" if load_1m is not None else "n/a"
@@ -3512,6 +3605,10 @@ class WiFiFeeder:
                             "dropped_total":       self.forwarder.dropped_total,
                             "sent_total":          self.forwarder.sent_total,
                             "restarts_since_boot": self.restart_count,
+                            # A spool that quietly fails to replay looks
+                            # exactly like a quiet week of airspace, so its
+                            # state has to leave the node.
+                            "spool":               _spool_summary(self.forwarder),
                             # WiFi feeder is threading-based — no
                             # equivalent event_loop_max_lag_ms metric.
                         }
@@ -3644,6 +3741,22 @@ def main():
         token=token,
         band=args.band,
     )
+
+    # Persist the staging buffer before exiting. systemd already sends SIGTERM,
+    # so this alone makes reboot, poweroff, `systemctl stop`, `update` and
+    # `refresh` lossless — until now there was no handler at all, and a clean
+    # stop discarded undelivered detections exactly like a power cut.
+    def _on_term(signum, _frame):
+        log.info(f"Received signal {signum} — flushing detections to the spool")
+        try:
+            feeder.forwarder.shutdown()
+        except Exception as e:
+            log.warning(f"Shutdown flush failed: {e}")
+        sys.exit(0)
+
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(_sig, _on_term)
+
     feeder.run()
 
 

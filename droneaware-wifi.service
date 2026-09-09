@@ -12,6 +12,14 @@ ExecStart=/opt/droneaware/wifi_feeder \
     --server ${SERVER_URL} \
     --batch-size ${BATCH_SIZE} \
     --flush-interval ${FLUSH_INTERVAL}
+# The feeder flushes undelivered detections to the on-disk spool on SIGTERM.
+# The default stop timeout is generous, but naming it makes the dependency
+# explicit: shortening it below the flush would reintroduce the data loss the
+# handler exists to prevent.
+TimeoutStopSec=30
+# Creates /var/lib/droneaware (0755, root) before the feeder starts, so the
+# spool never has to race three feeder processes to mkdir it.
+StateDirectory=droneaware
 Restart=always
 RestartSec=10
 StandardOutput=journal

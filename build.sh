@@ -65,6 +65,8 @@ echo "      Building ble_feeder..."
     --workpath "$SCRIPT_DIR/.build_work/ble" \
     --specpath "$SCRIPT_DIR/.build_specs" \
     --name ble_feeder \
+    --paths "$SCRIPT_DIR" \
+    --hidden-import spool \
     --collect-all bleak \
     --hidden-import bleak.backends.bluezdbus \
     --hidden-import bleak.backends.bluezdbus.scanner \
@@ -80,6 +82,8 @@ echo "      Building wifi_feeder..."
     --workpath "$SCRIPT_DIR/.build_work/wifi" \
     --specpath "$SCRIPT_DIR/.build_specs" \
     --name wifi_feeder \
+    --paths "$SCRIPT_DIR" \
+    --hidden-import spool \
     --hidden-import serial \
     "$SCRIPT_DIR/wifi_feeder.py" \
     > /dev/null 2>&1
@@ -107,6 +111,8 @@ echo "      Building web_ui..."
     --workpath "$SCRIPT_DIR/.build_work/web" \
     --specpath "$SCRIPT_DIR/.build_specs" \
     --name web_ui \
+    --paths "$SCRIPT_DIR" \
+    --hidden-import spool \
     --add-data "$SCRIPT_DIR/web_static:web_static" \
     --hidden-import flask \
     --hidden-import requests \

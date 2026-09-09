@@ -25,11 +25,15 @@ import time
 import socket
 import struct
 import collections
+import signal
+import threading
 import uuid
 import os
 import subprocess
 import sys
 import requests
+
+import spool
 from datetime import datetime, timezone
 from bleak import BleakScanner
 from bleak.backends.device import BLEDevice
@@ -228,6 +232,10 @@ REMOTE_ID_SERVICE_UUID = "0000fffa-0000-1000-8000-00805f9b34fb"
 # Tunable via env vars at startup (config.env):
 #   DRONEAWARE_BUFFER_MAX_BYTES  — hard cap on buffer size
 #   DRONEAWARE_BUFFER_WARN_PCT   — log a warning at this fill %
+# Upper bound on one upload. The forwarder used to POST its entire buffer,
+# which is fine at a few events per flush and becomes an unbounded request
+# after an outage.
+DEFAULT_DRAIN_BATCH      = 200
 DEFAULT_BUFFER_MAX_BYTES = 50_000_000
 DEFAULT_BUFFER_WARN_PCT  = 75
 
@@ -843,32 +851,54 @@ def _event_size(event: dict) -> int:
     return len(json.dumps(event, separators=(',', ':')))
 
 
+def _spool_summary(fwd) -> dict:
+    """Compact spool state for the heartbeat and the local state file."""
+    try:
+        st = fwd.spool.stats()
+        return {
+            "bytes":            st["bytes"],
+            "segments":         st["segments"],
+            "backlog_events":   st["backlog_events"],
+            "oldest_epoch":     st["oldest_epoch"],
+            "degraded":         st["degraded"],
+            "dropped_segments": st["dropped_undelivered_segments"],
+        }
+    except Exception:
+        return {}
+
+
 class Forwarder:
     """
-    Buffers raw BLE events and POSTs 5-second batches to the DroneAware server.
+    Spools raw BLE events to disk, then drains that spool to the DroneAware
+    server in 5-second batches.
 
-    Uses a byte-bounded ring buffer so that if the uplink is down for an
-    extended period, oldest events are dropped rather than consuming
-    unbounded memory. Failed batches are re-queued at the front of the
-    buffer (drop-oldest on overflow preserves recency for forensics).
+    The spool IS the queue. add() stages an event in RAM for at most one write
+    interval; everything after that reads from disk. That makes
+    replay-from-disk the ordinary path, executed constantly, rather than
+    recovery code that only runs after the crash it is meant to survive.
+
+    It also changes what the buffer IS. Undelivered detections used to live in
+    a bare deque and were lost to power loss, reboot, update, refresh, a crash
+    loop, and even a clean systemctl stop. They are now the node's history:
+    kept until they are BOTH past the retention window AND delivered, so a
+    successful upload no longer destroys the record. See spool.py.
 
     Tunable via env vars at startup:
-        DRONEAWARE_BUFFER_MAX_BYTES — hard cap on buffer size (default 50 MB)
-        DRONEAWARE_BUFFER_WARN_PCT  — log a warning at this fill % (default 75)
+        DRONEAWARE_BUFFER_MAX_BYTES — cap on the RAM staging buffer
+        DRONEAWARE_BUFFER_WARN_PCT  — log a warning at this fill %
+        DRONEAWARE_SPOOL_*          — see spool.py
     """
 
     def __init__(self, server_url: str, node_id: str,
                  batch_size: int = 200, flush_interval: float = 5.0,
-                 token: str = ""):
+                 token: str = "", feeder: str = "ble"):
         self.url               = server_url.rstrip("/") + "/ingest"
         self.node_id           = node_id
         self.batch_size        = batch_size
         self.flush_interval    = flush_interval
         self.token             = token
-        # buffer holds (event_dict, size_bytes) tuples — single json.dumps
-        # per event, reused on eviction without re-serializing.
-        self.buffer            = collections.deque()
-        self.buffer_bytes      = 0
+        self.spool             = spool.SpoolQueue(feeder)
+        self.limiter           = spool.NodeRateLimiter()
         self.max_buffer_bytes  = int(os.environ.get("DRONEAWARE_BUFFER_MAX_BYTES",
                                                     str(DEFAULT_BUFFER_MAX_BYTES)))
         self.warn_pct          = int(os.environ.get("DRONEAWARE_BUFFER_WARN_PCT",
@@ -876,53 +906,66 @@ class Forwarder:
         self.last_flush        = time.monotonic()
         self.sent_total        = 0
         self.dropped_total     = 0
-        self._warned_high      = False  # one-shot, resets when buffer drains
+        self._warned_high      = False  # one-shot, resets when the spool drains
         # v1.5.1: the batch currently being delivered, held across retries as
-        # (idempotency_key, batch). Mirrors wifi_feeder — see _flush().
+        # (idempotency_key, events, mark). Mirrors wifi_feeder — see _flush().
         self._inflight         = None
-        self._inflight_bytes   = 0
+        # Advisory pacing from the server's last reply. Not a 429 — deliberately
+        # so, since a node must not re-send its buffer under load.
+        self._pace_until       = 0.0
+        # The shipping forwarder used batch_size purely as a flush TRIGGER and
+        # then posted `list(self.buffer)` — the entire buffer, however large.
+        # Under normal load that is the same handful of events; after an outage
+        # it was an unbounded POST, and one permanent 4xx discarded every event
+        # in it. A bounded read caps both the request and the blast radius.
+        self._drain_batch      = max(batch_size, DEFAULT_DRAIN_BATCH)
+        # add() runs on the asyncio event-loop thread while _flush() runs on a
+        # worker via asyncio.to_thread, so the in-flight handoff is genuinely
+        # cross-thread. Held only for the swap, never across the POST.
+        self._lock             = threading.Lock()
 
     def add(self, event: dict):
-        size = _event_size(event)
-        self.buffer.append((event, size))
-        self.buffer_bytes += size
-        self._evict_to_cap()
-        # v1.4.8: batch-size trigger no longer flushes here. Under the async
-        # BLE architecture, on_advertisement runs on the event loop thread —
-        # a sync requests.post from here would block advertisement dispatch,
-        # heartbeat, and every other coroutine until the POST returns. The
-        # main scanner loop calls should_flush() and awaits an
-        # asyncio.to_thread(_flush) instead. See BLEFeeder.run() and
+        self.spool.add(event)
+        if self.spool.staged_bytes > self.max_buffer_bytes:
+            # The staging window is 15 seconds, so reaching a 50 MB cap here
+            # means the disk is gone and the spool is running RAM-only. The
+            # loud part already happened when the spool degraded.
+            self.spool.commit_staged()
+        # v1.4.8: no flush from here. on_advertisement runs on the event loop
+        # thread — a sync requests.post would block advertisement dispatch,
+        # the heartbeat, and every other coroutine until the POST returned.
+        # The main scanner loop calls should_flush() and awaits an
+        # asyncio.to_thread(_flush) instead. See BLEFeeder.run() and the
         # phillyrox forensics (2026-07-16) for the full story.
 
     @property
     def held_events(self) -> int:
-        """Events still owned — buffered plus any in flight.
-
-        A batch being retried has left the deque but has not been delivered,
-        so len(buffer) alone understates what the node is holding for exactly
-        as long as delivery is failing.
-        """
-        n = len(self.buffer)
-        if self._inflight is not None:
-            n += len(self._inflight[1])
+        """Events still owned — staged, spooled but undelivered, and any batch
+        in flight."""
+        st = self.spool.stats()
+        n = st["staged"] + st["backlog_events"]
+        with self._lock:
+            if self._inflight is not None:
+                n += len(self._inflight[1])
         return n
 
     @property
     def held_bytes(self) -> int:
-        return self.buffer_bytes + self._inflight_bytes
+        st = self.spool.stats()
+        return st["staged"] * int(self.spool.avg_event_bytes) + st["backlog_bytes"]
 
     def should_flush(self) -> bool:
-        """Advisory: True if buffer has reached batch_size OR flush_interval
-        elapsed since last flush. Cheap; safe to call every tick."""
-        if self._inflight is not None:
-            # A batch is waiting to be retried and must be offered again even
-            # when the buffer behind it is empty, or a failed upload would sit
-            # in flight forever with nothing to trigger another attempt.
-            return time.monotonic() - self.last_flush >= self.flush_interval
-        if not self.buffer:
+        """Advisory: True if a batch is ready OR flush_interval elapsed since
+        the last flush. Cheap; safe to call every tick."""
+        if time.monotonic() < self._pace_until:
             return False
-        if len(self.buffer) >= self.batch_size:
+        with self._lock:
+            if self._inflight is not None:
+                # A batch is waiting to be retried and must be offered again
+                # even when nothing is behind it, or a failed upload would sit
+                # in flight forever with nothing to trigger another attempt.
+                return time.monotonic() - self.last_flush >= self.flush_interval
+        if self.spool.due() or self.spool.staged_events >= self.batch_size:
             return True
         return time.monotonic() - self.last_flush >= self.flush_interval
 
@@ -933,63 +976,43 @@ class Forwarder:
             self._flush()
             self.last_flush = time.monotonic()
 
-    def _evict_to_cap(self):
-        """Drop oldest events until buffer_bytes <= max_buffer_bytes. Logs
-        threshold crossings (one warning per fill, one info on drain)."""
-        if (self._inflight is not None
-                and self.buffer_bytes + self._inflight_bytes > self.max_buffer_bytes):
-            stuck = len(self._inflight[1])
-            self.dropped_total += stuck
-            self._inflight = None
-            self._inflight_bytes = 0
-            log.warning(
-                f"Forwarder: dropped in-flight batch of {stuck} events — "
-                "buffer cap reached while it was being retried"
-            )
-        while self.buffer_bytes > self.max_buffer_bytes and len(self.buffer) > 1:
-            _, size = self.buffer.popleft()
-            self.buffer_bytes -= size
-            self.dropped_total += 1
-        held = self.buffer_bytes + self._inflight_bytes
-        pct = (held * 100) // self.max_buffer_bytes if self.max_buffer_bytes else 0
-        if pct >= self.warn_pct and not self._warned_high:
-            log.warning(
-                f"Forwarder buffer at {pct}% of {self.max_buffer_bytes // 1_000_000} MB cap "
-                f"({len(self.buffer)} events, dropped_total={self.dropped_total})"
-            )
-            self._warned_high = True
-        elif pct < 10 and self._warned_high:
-            log.info(f"Forwarder buffer drained to {pct}% — caught up")
-            self._warned_high = False
-
     def _flush(self):
         # v1.4.8: always update last_flush at entry so should_flush() paces
-        # correctly even when the buffer is empty (previously would starve
-        # the timer if buffer was momentarily drained). Also runs from
-        # asyncio.to_thread() now, so this executes on a worker thread and
-        # never blocks the async event loop.
+        # correctly even when nothing is queued (previously would starve the
+        # timer if the buffer was momentarily drained). Runs from
+        # asyncio.to_thread(), so this executes on a worker thread and never
+        # blocks the async event loop.
         self.last_flush = time.monotonic()
+        self.spool.commit_staged()
+        self.spool.prune()
 
         # v1.5.1: a batch is assembled ONCE, stamped with an idempotency key,
         # and retried byte-identical until it is delivered or abandoned.
-        # Previously a failed batch was pushed back onto the front of the
-        # deque and the next flush swept it up together with everything that
-        # had arrived since, so the retry was a different, larger batch every
-        # time. The POST times out after five seconds, but a response arriving
-        # late is still a response — the server has already stored the rows.
-        # The node cannot tell that from a real failure, so it re-sent, and
-        # under load the re-send is what made the server slower. Same fix and
-        # same semantics as wifi_feeder.
-        if self._inflight is None:
-            if not self.buffer:
-                return
-            batch = list(self.buffer)
-            self.buffer.clear()
-            self.buffer_bytes = 0
-            self._inflight = (uuid.uuid4().hex, batch)
-            self._inflight_bytes = sum(size for _, size in batch)
-        key, batch = self._inflight
-        events = [e for e, _ in batch]
+        # Previously a failed batch was pushed back onto the front of the deque
+        # and the next flush swept it up together with everything that had
+        # arrived since, so the retry was a different, larger batch every time.
+        # The POST times out after five seconds, but a response arriving late
+        # is still a response — the server has already stored the rows. The
+        # node cannot tell that from a real failure, so it re-sent, and under
+        # load the re-send is what made the server slower. Same fix and same
+        # semantics as wifi_feeder.
+        with self._lock:
+            if self._inflight is None:
+                events, mark = self.spool.read_batch(self._drain_batch)
+                if not events:
+                    self._maybe_warn()
+                    return
+                self._inflight = (uuid.uuid4().hex, events, mark)
+            key, events, mark = self._inflight
+
+        # 🚨 One node, one server budget, three feeder processes. Pacing per
+        # process would send three times the intended rate on a dual-adapter
+        # node with every process believing it complies. The limiter is shared
+        # through a lock file — see spool.NodeRateLimiter.
+        wait = self.limiter.take(len(events))
+        if wait > 0:
+            self._pace_until = time.monotonic() + wait
+            return
 
         payload = {
             "node_id":     self.node_id,
@@ -1006,9 +1029,15 @@ class Forwarder:
             headers["Idempotency-Key"] = key
             r = requests.post(self.url, json=payload, headers=headers, timeout=5)
             r.raise_for_status()
-            self._inflight = None
-            self._inflight_bytes = 0
+            # 🚨 Advance the watermark. Do NOT delete the segment: a 200 says
+            # the events were accepted, not that the operator is done with
+            # them. Removal is governed by retention and the size ceiling
+            # alone, which is what makes this a history rather than a queue.
+            self.spool.commit(mark)
+            with self._lock:
+                self._inflight = None
             self.sent_total += len(events)
+            self._read_pacing_hint(r)
             log.debug(f"Sent {len(events)} events ({self.sent_total} total)")
         except requests.RequestException as e:
             # A 4xx will never be accepted however many times it is offered,
@@ -1020,19 +1049,62 @@ class Forwarder:
             permanent = (status is not None
                          and 400 <= status < 500
                          and status not in (408, 429))
-            if permanent:
-                self.dropped_total += len(batch)
-                self._inflight = None
-                self._inflight_bytes = 0
-            self._evict_to_cap()
+            with self._lock:
+                if permanent:
+                    # Step over it so the drain continues. The events stay on
+                    # disk for the operator either way.
+                    self.dropped_total += len(events)
+                    self.spool.commit(mark)
+                    self._inflight = None
             log.warning(
                 f"Flush failed: {e}  "
-                f"({'dropped — not retryable' if permanent else 'held for retry'}, "
-                f"buffered={len(self.buffer)}, "
-                f"buffer_bytes={self.buffer_bytes}, "
-                f"inflight={0 if permanent else len(batch)}, "
+                f"({'skipped — not retryable' if permanent else 'held for retry'}, "
+                f"spooled={self.held_events}, "
+                f"spool_bytes={self.spool.stats()['bytes']}, "
+                f"inflight={0 if permanent else len(events)}, "
                 f"dropped_total={self.dropped_total})"
             )
+
+    def _read_pacing_hint(self, r):
+        """Honour next_batch_after_ms if the server sent one.
+
+        Advisory and optional: an older server, a proxy that rewrites bodies,
+        or a non-JSON reply all mean 'no hint', never an error. The node has
+        never parsed this response body before, so the parse itself is a new
+        failure mode — it fails silently and changes nothing.
+        """
+        try:
+            hint = float(r.json().get("next_batch_after_ms") or 0) / 1000.0
+        except Exception:
+            return
+        if 0 < hint <= 3600:
+            self._pace_until = time.monotonic() + hint
+
+    def _maybe_warn(self):
+        """One warning per fill, one info on drain."""
+        st = self.spool.stats()
+        cap = spool.max_bytes()
+        pct = (st["bytes"] * 100) // cap if cap else 0
+        if pct >= self.warn_pct and not self._warned_high:
+            log.warning(
+                f"Spool at {pct}% of {cap // (1024*1024)} MB ceiling "
+                f"({st['segments']} segments, backlog={st['backlog_events']} events, "
+                f"dropped_total={self.dropped_total})"
+            )
+            self._warned_high = True
+        elif pct < 10 and self._warned_high:
+            log.info(f"Spool drained to {pct}% — caught up")
+            self._warned_high = False
+
+    def shutdown(self):
+        """Flush staged events to disk and fsync. Called from the SIGTERM
+        handler, which is what makes reboot, poweroff, `systemctl stop`,
+        `update` and `refresh` lossless. Before this there was no handler at
+        all, so a clean stop lost the buffer exactly like a power cut."""
+        n = self.spool.commit_staged(fsync=True)
+        if n:
+            log.info(f"Shutdown: flushed {n} staged events to the spool")
+        return n
 
 
 # -- BLE Feeder ----------------------------------------------------------------
@@ -1048,7 +1120,8 @@ class BLEFeeder:
         self.verbose      = verbose
         self.token        = token
         self.start_time   = time.monotonic()
-        self.forwarder    = Forwarder(server_url, node_id, batch_size, flush_interval, token)
+        self.forwarder    = Forwarder(server_url, node_id, batch_size, flush_interval,
+                                      token, feeder="ble")
         self.publisher    = LocalPublisher()
         self.count        = 0
         # v1.4.8 telemetry: restart count (see phillyrox incident) + event
@@ -1424,6 +1497,12 @@ class BLEFeeder:
                 return
 
             try:
+                # Mark this bucket as "the node was up and recording". Set here
+                # rather than on the spool write because the spool only writes
+                # when events exist — keying liveness off it would make a quiet
+                # sky indistinguishable from a node that was switched off,
+                # which is the whole ambiguity the replay track has to resolve.
+                self.forwarder.spool.tick_liveness()
                 cpu_temp        = get_cpu_temp()
                 cpu_pct         = get_cpu_percent()
                 load_1m, load_5m, load_15m = get_cpu_load()
@@ -1490,6 +1569,10 @@ class BLEFeeder:
                                 "buffered_bytes":             self.forwarder.held_bytes,
                                 "dropped_total":              self.forwarder.dropped_total,
                                 "sent_total":                 self.forwarder.sent_total,
+                                # A spool that quietly fails to replay looks
+                                # exactly like a quiet week of airspace, so
+                                # its state has to leave the node.
+                                "spool":                      _spool_summary(self.forwarder),
                                 "restarts_since_boot":        self.restart_count,
                                 "event_loop_max_lag_ms":      lag_ms,
                             },
@@ -1588,10 +1671,25 @@ def main():
         wifi_adapter=wifi_adapter,
     )
 
+    # Persist the staging buffer before exiting. systemd already sends SIGTERM,
+    # so this alone makes reboot, poweroff, `systemctl stop`, `update` and
+    # `refresh` lossless — until now there was no handler at all, and a clean
+    # stop discarded undelivered detections exactly like a power cut.
+    def _on_term(signum, _frame):
+        log.info(f"Received signal {signum} — flushing detections to the spool")
+        try:
+            feeder.forwarder.shutdown()
+        except Exception as e:
+            log.warning(f"Shutdown flush failed: {e}")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _on_term)
+
     try:
         asyncio.run(feeder.run())
     except KeyboardInterrupt:
         log.info("Feeder stopped by user.")
+        feeder.forwarder.shutdown()
 
 
 if __name__ == "__main__":
