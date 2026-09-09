@@ -1305,6 +1305,30 @@ enroll_node() {
 # systemd unit get installed; failures here log a warning and continue
 # (the base install must always succeed). Inserted after enroll_node so
 # the web_ui binary download is gated on successful enrollment.
+# The Web UI runs as the unprivileged `droneaware` user, but everything it
+# needs lives in a root-owned install directory. Without this it cannot read
+# config.env (the Node settings tab shows "Cannot read config.env"), cannot
+# write it back when settings are saved, and cannot write the downloaded map
+# pack — os.replace needs write permission on the DIRECTORY, not just the file.
+#
+# Group access rather than handing the directory over: root still owns
+# everything, the Web UI's group gets read/write on the two things it must
+# touch. setgid on the directory so files created later inherit the group.
+#
+# Only applied when the Web UI is actually installed — a node without it keeps
+# the tighter permissions. Note this does put config.env, which holds the node
+# token, within reach of the droneaware user; that is inherent to the Web UI
+# being able to edit settings at all.
+_grant_webui_access() {
+    getent group droneaware >/dev/null 2>&1 || return 0
+    chgrp droneaware "${INSTALL_DIR}" 2>/dev/null || true
+    chmod 2775 "${INSTALL_DIR}" 2>/dev/null || true
+    if [[ -f "${INSTALL_DIR}/config.env" ]]; then
+        chgrp droneaware "${INSTALL_DIR}/config.env" 2>/dev/null || true
+        chmod 660 "${INSTALL_DIR}/config.env" 2>/dev/null || true
+    fi
+}
+
 install_webui() {
     heading "Optional: Local Web UI"
     echo "  DroneAware can run a local detection viewer on this Pi, available"
@@ -1388,6 +1412,7 @@ install_webui() {
     fi
     chmod +x "${INSTALL_DIR}/web_ui"
     ln -sf "${INSTALL_DIR}/web_ui" /usr/local/bin/web_ui 2>/dev/null || true
+    _grant_webui_access
     info "web_ui binary → ${INSTALL_DIR}/web_ui"
 
     # pmtiles — used by the Web UI to build an offline map of the node's own
