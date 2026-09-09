@@ -1465,8 +1465,25 @@ if candidates:
     # these files, and the refresh path (_ensure_dual_adapter_unit_files_
     # installed) can recover later. Log a warning so we notice release-
     # asset gaps but don't block the update.
+    # v1.6.0: the single-adapter and BLE units are re-downloaded too. They
+    # existed on every node from install, so they were never re-fetched — but
+    # their CONTENTS now change between releases (TimeoutStopSec, so a stop
+    # cannot cut short the flush that writes detections to disk, and
+    # StateDirectory for that directory). Without this, a dual-adapter node
+    # would pick the change up on the 2g/5g units while the same node's BLE
+    # unit silently kept the old file.
+    wifi_svc_ok=1
+    ble_svc_ok=1
     wifi_2g_svc_ok=1
     wifi_5g_svc_ok=1
+    if ! curl -fsSL --retry 3 "${BASE}/droneaware-wifi.service" -o /tmp/da_wifi_svc; then
+        warn "droneaware-wifi.service download failed — keeping the installed unit."
+        wifi_svc_ok=0
+    fi
+    if ! curl -fsSL --retry 3 "${BASE}/droneaware-ble.service" -o /tmp/da_ble_svc; then
+        warn "droneaware-ble.service download failed — keeping the installed unit."
+        ble_svc_ok=0
+    fi
     if ! curl -fsSL --retry 3 "${BASE}/droneaware-wifi-2g.service" -o /tmp/da_wifi_2g_svc; then
         warn "droneaware-wifi-2g.service download failed — dual-adapter mode will need 'sudo droneaware refresh' after update."
         wifi_2g_svc_ok=0
@@ -1592,6 +1609,8 @@ SUDOERS
     # sees the new units before _start_wifi_services_for_current_mode runs.
     # Skip cleanly if the download failed — refresh's self-heal will retry
     # later, and single-adapter operators don't need these files.
+    [[ "$wifi_svc_ok"    == "1" ]] && install -m 644 /tmp/da_wifi_svc /etc/systemd/system/droneaware-wifi.service
+    [[ "$ble_svc_ok"     == "1" ]] && install -m 644 /tmp/da_ble_svc  /etc/systemd/system/droneaware-ble.service
     [[ "$wifi_2g_svc_ok" == "1" ]] && install -m 644 /tmp/da_wifi_2g_svc /etc/systemd/system/droneaware-wifi-2g.service
     [[ "$wifi_5g_svc_ok" == "1" ]] && install -m 644 /tmp/da_wifi_5g_svc /etc/systemd/system/droneaware-wifi-5g.service
     if [[ "$update_webui" == "1" ]]; then
@@ -1620,7 +1639,8 @@ SUDOERS
             rm -f /usr/local/bin/droneaware.new 2>/dev/null || true
         fi
     fi
-    rm -f /tmp/da_ble_feeder /tmp/da_wifi_feeder /tmp/da_web_ui /tmp/da_cli /tmp/da_wifi_2g_svc /tmp/da_wifi_5g_svc
+    rm -f /tmp/da_ble_feeder /tmp/da_wifi_feeder /tmp/da_web_ui /tmp/da_cli \
+          /tmp/da_wifi_svc /tmp/da_ble_svc /tmp/da_wifi_2g_svc /tmp/da_wifi_5g_svc
     echo "$LATEST" > "$VERSION_FILE"
 
     # Nodes installed before v1.0.19 have service files pointing to /usr/local/bin/.
