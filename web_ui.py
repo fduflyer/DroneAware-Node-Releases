@@ -64,6 +64,8 @@ import socket
 import subprocess
 import sys
 import tempfile
+
+import spool
 import threading
 import urllib.request
 
@@ -345,16 +347,46 @@ CONFIG_SCHEMA = [
                  "aircraft would hold the radio indefinitely and everything "
                  "else in the air would go unseen."},
     ]},
+    # Rendered as presets plus an advanced grid, not as four text fields.
+    # These keys already worked in config.env before v1.6 — the picker is a
+    # front end for them, not a new mechanism.
+    {"group": "Channels", "widget": "channels", "hidden": True, "fields": [
+        {"key": "WIFI_SOCIAL_2G_CHANNEL", "default": "6", "type": "text"},
+        {"key": "WIFI_SOCIAL_5G_CHANNEL", "default": "149", "type": "text"},
+        {"key": "WIFI_EXPLORE_2G", "default": "", "type": "text"},
+        {"key": "WIFI_EXPLORE_5G", "default": "", "type": "text"},
+    ]},
+    {"group": "History", "fields": [
+        {"key": "DRONEAWARE_SPOOL_RETENTION_DAYS", "default": "90",
+         "label": "Keep detections for", "type": "text", "unit": "days",
+         "placeholder": "90",
+         "info": "How long the node keeps its own record of what it saw, "
+                 "after those detections have been uploaded. Enter a number of "
+                 "days, or \"never\" to keep them until the size limit below "
+                 "is reached. Detections that have NOT been uploaded yet are "
+                 "kept no matter what this says — nothing is discarded just "
+                 "because time has passed."},
+        {"key": "DRONEAWARE_SPOOL_MAX_GB", "default": "4",
+         "label": "History size limit", "type": "number", "unit": "GB",
+         "placeholder": "4",
+         "info": "A hard ceiling on the flight history, whichever setting is "
+                 "smaller. It exists for the case where a node is fed "
+                 "detections far faster than it would ever see legitimately, "
+                 "which would otherwise fill the card in the name of keeping "
+                 "history. Already-uploaded records are discarded first, and "
+                 "the node never stops recording to stay under it."},
+    ]},
     {"group": "Uploads", "fields": [
         # BATCH_SIZE and FLUSH_INTERVAL are deliberately absent: they are
         # coordinated with the server's ingest, and a node that disagrees
         # does not fail loudly, it just uploads badly.
         {"key": "DRONEAWARE_BUFFER_MAX_BYTES", "label": "Upload buffer",
          "type": "megabytes", "unit": "MB",
-         "info": "How much backlog is held in memory when the node cannot "
-                 "reach the server. Once full, the oldest detections are "
-                 "dropped first. This buffer lives in RAM, so a restart "
-                 "during an outage discards it."},
+         "info": "How much of the upload backlog is held in memory before "
+                 "being written to disk. Detections are saved to the node's "
+                 "flight history either way, so a restart during an outage no "
+                 "longer loses them — see History below for how long they are "
+                 "kept."},
         {"key": "DRONEAWARE_BUFFER_WARN_PCT", "label": "Buffer warning",
          "type": "number", "unit": "%",
          "info": "How full the upload buffer gets before the node starts "
@@ -623,8 +655,13 @@ class DetectionStore:
                     lat = event.get("lat")
                     lon = event.get("lon")
                     if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
-                        pt = [lat, lon]
-                        if not trail or trail[-1] != pt:
+                        # Third element is altitude. Leaflet accepts
+                        # [lat, lng, alt] triples wherever it takes a LatLng,
+                        # so the flight path can be hue-coded by height
+                        # without carrying a second parallel array.
+                        alt = event.get("alt")
+                        pt = [lat, lon, alt if isinstance(alt, (int, float)) else None]
+                        if not trail or trail[-1][:2] != pt[:2]:
                             trail.append(pt)
                 # Always include the MAC explicitly (the dict key is
                 # authoritative — overwrite whatever was in events)
@@ -1129,6 +1166,17 @@ def api_status():
         # The SERVER_URL itself never leaves the node — only whether
         # the node can currently reach it.
         "uplink_ok":   _server_reachable(),
+        # The browser MUST NOT use its own clock to age these detections. A Pi
+        # has no RTC, and an offline node — the case this UI exists for — has
+        # no NTP either, so its clock resumes from whatever was last written to
+        # disk and can sit hours behind the phone looking at it. Ageing
+        # node-stamped timestamps against a browser clock made live, moving
+        # aircraft render as ">1 hour old" in both the text and the colour.
+        "now":     time.time(),
+        # Whether that clock can be shown to a human as a real date. When
+        # false the UI must label history relatively ("3h ago") and never
+        # print a wall-clock time the node cannot stand behind.
+        "clock_synced": _clock_synced(),
         "node_id":     _read_config_env("NODE_ID") or "this-node",
         # Whether a Protomaps region pack has been downloaded. When true the
         # frontend renders vector tiles from /map.pmtiles and needs neither
@@ -1293,6 +1341,16 @@ ACTIONS = {
     "refresh": ["sudo", "-n", "/usr/local/bin/droneaware", "refresh"],
     "swap":    ["sudo", "-n", "/usr/local/bin/droneaware", "swap"],
     "update":  ["sudo", "-n", "/usr/local/bin/droneaware", "update"],
+    # Powering down cleanly is what makes the detection database survive being
+    # moved: systemd sends SIGTERM, the feeders flush what they are holding to
+    # disk, and nothing is lost. Pulling the plug instead costs the last few
+    # seconds. Exists for the operator carrying a node in a vehicle who has no
+    # keyboard on it.
+    # ⚠️ This page is unauthenticated on the LAN, so anyone who can reach it
+    # can switch the node off. That is the same exposure the Refresh, Swap and
+    # Install buttons already carry — see project_webui_privilege — but this
+    # one is the most obviously disruptive, hence the confirm step in the UI.
+    "poweroff": ["sudo", "-n", "/usr/bin/systemctl", "poweroff"],
 }
 
 # The CLI writes for a terminal, so its output carries SGR color escapes.
@@ -1483,12 +1541,241 @@ def api_adapters():
     return jsonify({"adapters": _enumerate_adapters()})
 
 
+# Mirrors ScanPlanHopper.EXPLORE_*_CANDIDATES in wifi_feeder.py. Duplicated
+# across a process boundary because the feeder is a separate binary; if those
+# lists change, these must change with them.
+# What the feeder scans when the explore keys are left empty. Shown in the
+# advanced grid so "Both bands" renders as the channels actually visited —
+# 2.4 goes past 1/6/11 because Parrot beacons on 5 MHz steps, which is how an
+# ANAFI turned up on ch5.
+DEFAULT_EXPLORE_2G = [1, 5, 6, 9, 11, 13]
+DEFAULT_EXPLORE_5G = [149, 153, 157, 161, 165, 52, 56, 60, 64,
+                      100, 104, 108, 112, 116, 120, 124, 128,
+                      132, 136, 140, 144]
+
+CHANNEL_BANDS = [
+    {"band": "2.4 GHz", "social": 6,
+     "channels": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]},
+    {"band": "5 GHz U-NII-1", "channels": [36, 40, 44, 48]},
+    {"band": "5 GHz U-NII-2 (DFS)", "channels": [52, 56, 60, 64]},
+    {"band": "5 GHz U-NII-2C (DFS)",
+     "channels": [100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144]},
+    {"band": "5 GHz U-NII-3", "social": 149,
+     "channels": [149, 153, 157, 161, 165]},
+]
+
+
+def _phy_channels(iface: str) -> set:
+    """Channel numbers this iface's PHY can tune to.
+
+    Same parse as wifi_feeder._supported_channels: `iw phy phyN info` prints
+    lines like "* 5745 MHz [149] (10.0 dBm)", and newer iw prints "5745.0 MHz"
+    — the bracketed channel number is the part that is stable across versions.
+    Regulatory domain and hardware both show up here, which is why the picker
+    asks the radio instead of assuming a channel list.
+    """
+    try:
+        info = subprocess.run(["iw", "dev", iface, "info"],
+                              capture_output=True, text=True, timeout=2, check=False)
+        phy = None
+        for line in info.stdout.splitlines():
+            if line.strip().startswith("wiphy "):
+                phy = line.strip().split()[-1]
+                break
+        if phy is None:
+            return set()
+        out = subprocess.run(["iw", "phy", f"phy{phy}", "info"],
+                             capture_output=True, text=True, timeout=2, check=False)
+        chans = set()
+        for line in out.stdout.splitlines():
+            if "MHz" not in line or "[" not in line or "disabled" in line:
+                continue
+            a, b = line.find("["), line.find("]", line.find("["))
+            if a != -1 and b != -1:
+                try:
+                    chans.add(int(line[a + 1:b]))
+                except ValueError:
+                    pass
+        return chans
+    except Exception:
+        return set()
+
+
+# ── Is the node's clock trustworthy in ABSOLUTE terms? ───────────────────────
+# A Pi has no RTC, and a node used offline has no NTP either, so its clock
+# resumes from whatever was last written to disk. Relative ages ("3h ago") stay
+# correct on such a node because both ends of the subtraction come from the
+# same clock. Absolute times ("14:32 on the 9th") do not, and printing one the
+# node cannot stand behind is worse than not printing it.
+_clock_cache = {"at": 0.0, "synced": False}
+
+
+def _clock_synced() -> bool:
+    """True when the kernel says its clock is disciplined by a time source.
+
+    Asks the kernel via ntp_adjtime() rather than a specific daemon, so it
+    reads the same whether systemd-timesyncd, chrony or ntpd is running — or
+    whether the operator set the time by hand with no daemon at all. A zeroed
+    buffer means modes=0, which makes the call a read-only query. The return
+    code is the whole answer: TIME_ERROR (5) is what the kernel reports while
+    STA_UNSYNC is set. Deliberately not parsing the timex struct, whose field
+    offsets vary by architecture.
+    """
+    now = time.time()
+    if now - _clock_cache["at"] < 30:
+        return _clock_cache["synced"]
+    synced = False
+    try:
+        import ctypes, ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        buf = (ctypes.c_byte * 512)()
+        synced = libc.ntp_adjtime(ctypes.byref(buf)) != 5   # 5 == TIME_ERROR
+    except Exception:
+        # No libc binding available — fall back to systemd-timesyncd's stamp
+        # file, which only exists once it has actually synchronised.
+        synced = os.path.exists("/run/systemd/timesync/synchronized")
+    _clock_cache.update(at=now, synced=bool(synced))
+    return _clock_cache["synced"]
+
+
+@app.route("/api/channels")
+def api_channels():
+    """What this node's radios can tune to, and what they are set to scan.
+
+    `supported` is the union across every monitor adapter, so on a
+    dual-adapter node the grid shows the pair's combined reach. Empty means
+    the query failed rather than "nothing is supported" — the UI has to show
+    every channel as selectable in that case, because the feeder falls back to
+    scanning the full list unfiltered for exactly the same reason.
+    """
+    supported = set()
+    probed = 0
+    for a in _enumerate_adapters():
+        iface = a.get("iface")
+        if not iface:
+            continue
+        found = _phy_channels(iface)
+        if found:
+            probed += 1
+            supported |= found
+    return jsonify({
+        "bands": CHANNEL_BANDS,
+        "supported": sorted(supported),
+        "probed": probed,
+        "defaults": {
+            "explore_2g": DEFAULT_EXPLORE_2G,
+            "explore_5g": DEFAULT_EXPLORE_5G,
+            "social_2g": 6,
+            "social_5g": 149,
+        },
+    })
+
+
 def _adapter_names_by_mac() -> dict:
     """MAC -> product name, for labelling the feeder rows."""
     try:
         return {a["mac"]: a["name"] for a in _enumerate_adapters() if a["mac"]}
     except Exception:
         return {}
+
+
+# ── Flight history (the on-disk spool) ───────────────────────────────────────
+# Read-only views over what the feeders wrote. web_ui runs as the login user
+# and the spool is root-owned 0755/0644, so it can read but never modify —
+# which is the right direction for a page that answers to anyone on the LAN.
+
+@app.route("/api/history/bounds")
+def api_history_bounds():
+    """The extent of the node's own history, and whether it can be dated.
+
+    `clock_synced` is load-bearing for the caller, not decoration. On a node
+    whose clock has never been disciplined these timestamps are internally
+    consistent but not real wall-clock times, so the UI must render the extent
+    relatively ("3h ago" to "now") and withhold calendar dates.
+    """
+    try:
+        b = spool.bounds()
+    except Exception as e:
+        return jsonify({"error": "unavailable", "detail": str(e)}), 500
+    b["now"] = time.time()
+    b["clock_synced"] = _clock_synced()
+    return jsonify(b)
+
+
+@app.route("/api/history/track")
+def api_history_track():
+    """Per-column tones for the replay slider: 0 gap, 1 listening, 2 detections.
+
+    Three tones because an empty bucket is ambiguous. "Recording, heard
+    nothing" and "the node was switched off" are both zero detections, and
+    drawing them alike is wrong in exactly the case this release exists for —
+    drive out, fly, drive home.
+    """
+    try:
+        t0 = float(request.args.get("from", 0))
+        t1 = float(request.args.get("to", 0))
+        cols = int(request.args.get("columns", 600))
+    except (TypeError, ValueError):
+        return jsonify({"error": "bad_request"}), 400
+    if not (t1 > t0):
+        return jsonify({"error": "bad_range"}), 400
+    return jsonify({"from": t0, "to": t1,
+                    "tones": spool.track(t0, t1, cols)})
+
+
+# The spool stores what the SERVER ingests: the raw feeder event, with the
+# decoded ODID message nested under "decoded". The map renders what the
+# LocalPublisher writes to the tmpfs ring: a flat record with lat/lon/id at the
+# top level. Replay reads the first and has to hand back the second, so the
+# translation lives here — mirroring LocalPublisher.publish() in wifi_feeder.py
+# and ble_feeder.py. If those change, this must change with them.
+_ALIASED = {"message_type", "raw_hex", "latitude", "longitude",
+            "altitude_geo", "ground_speed", "heading", "uas_id"}
+
+
+def _flatten_event(ev: dict) -> dict:
+    decoded = ev.get("decoded") or {}
+    if not decoded:
+        # NAN frames and anything else the feeder could not decode carry no
+        # position, so there is nothing for the map to draw. The ring drops
+        # these too; replay matches it rather than inventing empty markers.
+        return {}
+    rec = {
+        "t":       ev.get("timestamp") or ev.get("observed_at"),
+        "mac":     ev.get("source_mac") or ev.get("mac"),
+        "radio":   ev.get("radio"),
+        "rssi":    ev.get("rssi"),
+        "channel": ev.get("channel"),
+        "type":    decoded.get("message_type"),
+        "lat":     decoded.get("latitude"),
+        "lon":     decoded.get("longitude"),
+        "alt":     decoded.get("altitude_geo"),
+        "speed":   decoded.get("ground_speed"),
+        "hdg":     decoded.get("heading"),
+        "id":      decoded.get("uas_id"),
+    }
+    for k, v in decoded.items():
+        if k not in _ALIASED:
+            rec[k] = v
+    return rec
+
+
+@app.route("/api/history/range")
+def api_history_range():
+    """Detections inside a window, oldest first, for playback."""
+    try:
+        t0 = float(request.args.get("from", 0))
+        t1 = float(request.args.get("to", 0))
+        limit = min(int(request.args.get("limit", 20000)), 50000)
+    except (TypeError, ValueError):
+        return jsonify({"error": "bad_request"}), 400
+    if not (t1 > t0):
+        return jsonify({"error": "bad_range"}), 400
+    raw = spool.read_range(t0, t1, limit)
+    events = [r for r in (_flatten_event(e) for e in raw) if r]
+    return jsonify({"from": t0, "to": t1,
+                    "count": len(events), "truncated": len(raw) >= limit,
+                    "events": events})
 
 
 @app.route("/api/config")
