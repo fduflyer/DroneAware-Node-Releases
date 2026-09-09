@@ -347,8 +347,9 @@
     /* Destructive actions read as destructive. Amber rather than red: this
        is disruptive, not dangerous — nothing is lost by shutting down. */
     .danger-row {
-      margin-top: 22px; padding-top: 16px;
-      border-top: 1px solid var(--border);
+      display: flex; justify-content: center;
+      margin: 0 0 18px; padding-bottom: 16px;
+      border-bottom: 1px solid var(--border);
     }
     .btn-danger {
       min-height: 44px; padding: 0 18px; border-radius: 8px;
@@ -358,7 +359,11 @@
     }
     .btn-danger:hover { background: rgba(245,158,11,0.12); }
     .confirm-backdrop {
-      position: fixed; inset: 0; z-index: 3000;
+      /* Above the settings overlay (99998), which is the only place this can
+         be opened from. At a lower z-index the dialog still sets hidden=false
+         and still takes the click — it just renders BEHIND the panel, so a
+         test that asserts on .hidden passes while a human sees nothing. */
+      position: fixed; inset: 0; z-index: 99999;
       display: flex; align-items: center; justify-content: center;
       background: rgba(4,10,20,0.72); padding: 20px;
     }
@@ -1328,9 +1333,9 @@
          aria-labelledby="confirm-title">
       <h3 id="confirm-title">Shut down this node?</h3>
       <p id="confirm-body">
-        Detection stops and the node powers off. Everything it has recorded is
-        saved first. To start it again you will need to unplug it and plug it
-        back in.
+        The feeders stop cleanly and the node powers off. Everything it has
+        recorded is saved to disk first, so nothing is lost. To start it again
+        you will need to unplug it and plug it back in.
       </p>
       <div class="confirm-actions">
         <button class="btn-inline" id="confirm-cancel" type="button">Cancel</button>
@@ -1376,6 +1381,15 @@
       </div>
 
       <section class="settings-page" id="page-map" role="tabpanel" aria-labelledby="tab-map">
+      <!-- First thing on the first page, deliberately. Settings get configured
+           once; shutting down happens every time the node is packed away, and
+           it is the one action you want in reach rather than at the end of a
+           scroll. The explanation lives in the confirmation, where it is read
+           at the moment it matters instead of sitting under a button. -->
+      <div class="danger-row">
+        <button class="btn-danger" id="cfg-shutdown" type="button">Shut down node</button>
+      </div>
+
       <p class="lede">
         This node ships a world overview that is deliberately coarse. Download
         detail for your own area so the map still works with no internet.
@@ -1431,14 +1445,6 @@
              survive being moved: systemd sends SIGTERM, the feeders flush
              what they are holding to disk, and nothing is lost. For the
              operator carrying a node in a vehicle with no keyboard on it. -->
-        <div class="danger-row">
-          <button class="btn-danger" id="cfg-shutdown" type="button">Shut down node</button>
-          <p class="cfg-help">
-            Stops the feeders cleanly and powers the node off, so nothing it
-            has recorded is lost. You will need to unplug and replug it to
-            start it again.
-          </p>
-        </div>
       </section>
 
       <!-- Shown INSTEAD of the pages while picking a location on the map.
