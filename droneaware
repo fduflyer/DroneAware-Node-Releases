@@ -428,6 +428,40 @@ EOF
     #       info "Added vX.Y.Z options to config.env"
     #   fi
 
+    # v1.6.0 — the flight history. Undelivered detections used to live only
+    # in RAM, so a power cut, a reboot or a clean stop threw them away. They
+    # now go to disk first, and a successful upload no longer deletes them.
+    if ! grep -q '^DRONEAWARE_SPOOL_DIR=' "$cfg"; then
+        [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+        cat >> "$cfg" <<'EOF'
+# ─── Local Detection Database (this node's own flight history) ───
+# Detections are written to disk before they are uploaded, so nothing is lost
+# to a power cut, a reboot, an update, or carrying the node home in a vehicle.
+# The spool is also the node's own record: uploading a detection does NOT
+# delete it.
+#
+# RETENTION_DAYS   how long to keep detections locally after they have been
+#                  uploaded. Set to "never" to keep them indefinitely. A
+#                  detection that has NOT been uploaded is kept regardless of
+#                  this setting.
+# MAX_GB           hard ceiling on the history, whatever RETENTION_DAYS says.
+#                  This is the backstop for a spoof flood, where a node can be
+#                  fed detections far faster than it will ever see legitimately
+#                  and would otherwise fill the card in the name of retention.
+#                  Uploaded history is discarded first; the node never stops
+#                  recording to stay under it.
+# WRITE_INTERVAL   how often staged detections are written to disk. This is the
+#                  worst-case loss window on a power cut, and nothing else —
+#                  the same number of bytes reaches the card at any interval,
+#                  because each detection is written exactly once.
+DRONEAWARE_SPOOL_DIR=/var/lib/droneaware/spool
+DRONEAWARE_SPOOL_RETENTION_DAYS=90
+DRONEAWARE_SPOOL_MAX_GB=4
+DRONEAWARE_SPOOL_WRITE_INTERVAL_SEC=15.0
+EOF
+        info "Detections are now kept on disk for 90 days. Set DRONEAWARE_SPOOL_RETENTION_DAYS=never to keep them indefinitely."
+    fi
+
     # v1.6.0 — the camp trigger dropped from two frames to one. Existing
     # nodes have 2 written into config.env, and a migrate block that only
     # adds missing keys would leave every one of them on the old rule
@@ -1854,6 +1888,92 @@ if (s.get("adapter_mac") or "").lower()==(sys.argv[2] or "").lower():
         done
         echo ""
     fi
+
+    # Local detection database. Deliberately NOT called "the spool" here:
+    # that is the name of the mechanism, and the operator cares about the
+    # thing — how much of their own history the node is holding, and what
+    # will eventually remove it.
+    local _spool_dir
+    _spool_dir=$(_cfg_get "$cfg" DRONEAWARE_SPOOL_DIR)
+    [[ -z "$_spool_dir" ]] && _spool_dir="/var/lib/droneaware/spool"
+    python3 - "$_spool_dir" "$(_cfg_get "$cfg" DRONEAWARE_SPOOL_RETENTION_DAYS)" \
+                            "$(_cfg_get "$cfg" DRONEAWARE_SPOOL_MAX_GB)" <<'PYEOF'
+import json, os, sys, time
+
+root, days_raw, gb_raw = sys.argv[1], sys.argv[2].strip(), sys.argv[3].strip()
+days = days_raw or "90"
+gb = gb_raw or "4"
+never = days.lower() in ("never", "none", "0", "-1", "forever")
+
+
+def human(n):
+    if n < 1024:
+        return "%d B" % n
+    for unit in ("KB", "MB", "GB"):
+        n /= 1024.0
+        if n < 1024 or unit == "GB":
+            return "%.1f %s" % (n, unit)
+
+
+def ago(sec):
+    sec = int(max(0, sec))
+    if sec < 90:
+        return "%ds ago" % sec
+    if sec < 5400:
+        return "%dm ago" % (sec // 60)
+    if sec < 172800:
+        return "%dh %dm ago" % (sec // 3600, (sec % 3600) // 60)
+    return "%dd ago" % (sec // 86400)
+
+
+total = files = pending = 0
+oldest = None
+feeders = sorted(os.listdir(root)) if os.path.isdir(root) else []
+for feeder in feeders:
+    d = os.path.join(root, feeder)
+    if feeder == "index" or not os.path.isdir(d):
+        continue
+    segs = sorted(n for n in os.listdir(d)
+                  if n.startswith("seg-") and n.endswith(".jsonl"))
+    # The cursor marks how far uploading has got; everything after it is
+    # still waiting to reach the server.
+    cur_seg, cur_off = "", 0
+    try:
+        c = json.load(open(os.path.join(d, "cursor")))
+        cur_seg, cur_off = str(c.get("segment") or ""), int(c.get("offset") or 0)
+    except Exception:
+        pass
+    past_cursor = cur_seg not in segs
+    for n in segs:
+        p = os.path.join(d, n)
+        try:
+            sz = os.path.getsize(p)
+            mt = os.path.getmtime(p)
+        except OSError:
+            continue
+        total += sz
+        files += 1
+        if oldest is None or mt < oldest:
+            oldest = mt
+        if past_cursor:
+            pending += sz
+        elif n == cur_seg:
+            past_cursor = True
+            pending += max(0, sz - cur_off)
+
+limit = "never deleted" if never else ("%s days" % days)
+if not files:
+    print("  Local Detection Database: empty - nothing recorded yet"
+          "  (max: %s, %s GB)" % (limit, gb))
+else:
+    print("  Local Detection Database: %s in %d file%s  (max: %s, %s GB)"
+          % (human(total), files, "" if files == 1 else "s", limit, gb))
+    if oldest:
+        print("    Oldest record    %s" % ago(time.time() - oldest))
+    if pending:
+        print("    Not yet uploaded %s - kept until it is" % human(pending))
+PYEOF
+    echo ""
 
     # Web UI URL — shown when service is active and bound, so operators
     # know how to reach it from another device on the LAN.

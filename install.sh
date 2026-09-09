@@ -1070,6 +1070,31 @@ FLUSH_INTERVAL=5.0
 DRONEAWARE_BUFFER_MAX_BYTES=50000000
 DRONEAWARE_BUFFER_WARN_PCT=75
 
+# ─── Local Detection Database (this node's own flight history) ───
+# Detections are written to disk before they are uploaded, so nothing is lost
+# to a power cut, a reboot, an update, or carrying the node home in a vehicle.
+# The spool is also the node's own record: uploading a detection does NOT
+# delete it.
+#
+# RETENTION_DAYS   how long to keep detections locally after they have been
+#                  uploaded. Set to "never" to keep them indefinitely. A
+#                  detection that has NOT been uploaded is kept regardless of
+#                  this setting.
+# MAX_GB           hard ceiling on the history, whatever RETENTION_DAYS says.
+#                  This is the backstop for a spoof flood, where a node can be
+#                  fed detections far faster than it will ever see legitimately
+#                  and would otherwise fill the card in the name of retention.
+#                  Uploaded history is discarded first; the node never stops
+#                  recording to stay under it.
+# WRITE_INTERVAL   how often staged detections are written to disk. This is the
+#                  worst-case loss window on a power cut, and nothing else —
+#                  the same number of bytes reaches the card at any interval,
+#                  because each detection is written exactly once.
+DRONEAWARE_SPOOL_DIR=/var/lib/droneaware/spool
+DRONEAWARE_SPOOL_RETENTION_DAYS=90
+DRONEAWARE_SPOOL_MAX_GB=4
+DRONEAWARE_SPOOL_WRITE_INTERVAL_SEC=15.0
+
 # LocalPublisher buffer cap. Bytes-based cap for the tmpfs ring buffer
 # that surfaces detections to LAN consumers (operators tailing
 # 'nc -luk 9999', droneaware test, future local web UI). Distinct from
@@ -1411,14 +1436,15 @@ install_webui() {
 droneaware ALL=(root) NOPASSWD: /usr/local/bin/droneaware refresh
 droneaware ALL=(root) NOPASSWD: /usr/local/bin/droneaware swap
 droneaware ALL=(root) NOPASSWD: /usr/local/bin/droneaware update
+droneaware ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff
 SUDOERS
     if visudo -c -f "$_sudoers_tmp" >/dev/null 2>&1; then
         install -m 0440 -o root -g root "$_sudoers_tmp" \
             /etc/sudoers.d/droneaware-webui
-        info "Web UI may run refresh / swap / update."
+        info "Web UI may run refresh / swap / update / shut down."
     else
-        warn "sudoers rule failed validation — Refresh, Swap and Install"
-        warn "buttons in the Web UI will not work. Nothing was changed."
+        warn "sudoers rule failed validation — Refresh, Swap, Install and"
+        warn "Shut Down buttons in the Web UI will not work. Nothing was changed."
     fi
     rm -f "$_sudoers_tmp"
 
