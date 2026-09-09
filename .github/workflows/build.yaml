@@ -33,7 +33,10 @@ jobs:
           copy_artifact_path: dist/
           commands: |
             apt-get update
-            apt-get install -y python3 python3-pip python3-venv
+            # curl and ca-certificates are NOT in the base image. build.sh
+            # fetches the pinned pmtiles binary, so without them the build
+            # fails six minutes in with "curl: command not found".
+            apt-get install -y python3 python3-pip python3-venv curl ca-certificates
             export VERSION="${{ inputs.version }}"
             bash ./build.sh
       - uses: actions/upload-artifact@v7

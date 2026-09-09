@@ -134,6 +134,11 @@ echo "      Done."
 # ---------------------------------------------------------------------------
 PMTILES_VERSION="1.31.2"
 echo "[2b/3] Fetching pmtiles ${PMTILES_VERSION} (arm64)..."
+if ! command -v curl >/dev/null 2>&1; then
+    echo "      ERROR: curl is not installed, so pmtiles cannot be fetched."
+    echo "             apt-get install -y curl ca-certificates"
+    exit 1
+fi
 _pm_url="https://github.com/protomaps/go-pmtiles/releases/download/v${PMTILES_VERSION}/go-pmtiles_${PMTILES_VERSION}_Linux_arm64.tar.gz"
 if curl -fsSL --retry 3 "$_pm_url" -o "$SCRIPT_DIR/.build_work/pmtiles.tgz"; then
     # BSD-3-Clause clause 2 requires the copyright notice and license text to
