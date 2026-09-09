@@ -1352,6 +1352,9 @@ cmd_refresh() {
     echo "  (WiFi adapters, GPS protocol, gpsd conflict, NM config, service topology)"
     echo ""
     migrate_config_env
+    # Fetch anything this version ships that the node has not got yet. Safe to
+    # call every time: each item is skipped when already present.
+    _ensure_webui_current
     echo ""
     info "Refresh complete."
     echo ""
@@ -1403,6 +1406,28 @@ _grant_webui_access() {
         chmod 660 "${INSTALL_DIR}/config.env" 2>/dev/null || true
     fi
 }
+
+# Ensure the Web UI has everything the INSTALLED version ships with.
+#
+# 🚨 This is what makes a CLI change take effect on the update that delivers
+# it, rather than the one after. cmd_update runs the OLD CLI start to finish —
+# the new CLI only lands at the end — so anything the new CLI knows how to
+# fetch would otherwise wait for the next release. The re-exec of `refresh`
+# already exists to close that gap for config migration and service topology
+# (v1.5.0.2); assets were simply never wired into it.
+#
+# Keyed on the installed version, not "latest": the assets a node needs are
+# the ones belonging to the release it is running.
+_ensure_webui_current() {
+    [[ -f /etc/systemd/system/droneaware-web.service ]] || return 0
+    local ver
+    ver=$(cat "$VERSION_FILE" 2>/dev/null | tr -d '[:space:]')
+    [[ -n "$ver" ]] || return 0
+    [[ "$ver" =~ ^v ]] || ver="v${ver}"
+    _grant_webui_access
+    _ensure_webui_assets "https://github.com/${GITHUB_REPO}/releases/download/${ver}"
+}
+
 
 _ensure_webui_assets() {
     local base="$1"
@@ -1519,10 +1544,12 @@ if candidates:
 
     if [[ "$CURRENT" == "$LATEST" ]]; then
         info "Already up to date."
-        # Still repair anything missing — see _ensure_webui_assets.
+        # Nothing to install, but still repair anything missing. The
+        # re-exec of `refresh` that normally does this is skipped on the
+        # up-to-date path, because we return before reaching it.
         if [[ -f /etc/systemd/system/droneaware-web.service ]]; then
             _grant_webui_access
-        _ensure_webui_assets "$BASE"
+            _ensure_webui_assets "$BASE"
         fi
         echo ""
         return
