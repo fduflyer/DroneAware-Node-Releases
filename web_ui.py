@@ -877,27 +877,31 @@ def _config_file_values() -> dict:
 
 
 def _read_config_env(key: str) -> str | None:
-    """Get a config value.
+    """Get a config value. If config.env defines it, the FILE wins.
 
-    🚨 For anything the settings panel can edit, the FILE is the source of
-    truth, not the process environment. systemd starts this service with
-    EnvironmentFile=config.env, so os.environ is frozen at service start —
-    reading it back meant every setting saved from the panel appeared to do
-    nothing until the service was restarted. The operator changed the node's
-    location, pressed Save, and the map stayed where it was.
+    🚨 systemd starts this service with EnvironmentFile=config.env, so
+    os.environ is a snapshot taken when the service started. Anything that
+    rewrites config.env afterwards — the settings panel, `droneaware swap`,
+    `droneaware refresh` — changes the file while this process keeps serving
+    the boot-time value.
 
-    Everything else still prefers the environment, which keeps env overrides
-    working for a manual `python3 web_ui.py` run.
+    An earlier version gated this on CONFIG_EDITABLE, which covered the
+    settings panel but not the adapter roles: `swap` rewrote them, restarted
+    the feeders, and left the Web UI showing the old assignment, so `status`
+    and the Radios panel disagreed about which dongle was on which band.
+
+    The rule that actually holds: a key present in config.env is owned by
+    config.env, because the environment copy of it can only be stale. The
+    environment is the fallback for keys the file does not define, which
+    keeps genuine overrides working for a manual `python3 web_ui.py` run.
     """
-    if key in CONFIG_EDITABLE:
-        val = _config_file_values().get(key)
-        if val is not None:
-            return val.strip() or None
-
+    val = _config_file_values().get(key)
+    if val is not None:
+        return val.strip() or None
     val = os.environ.get(key)
     if val is not None:
         return val.strip() or None
-    return (_config_file_values().get(key) or "").strip() or None
+    return None
 
 
 # Whether this node can reach DroneAware. Distinct from whether the BROWSER
