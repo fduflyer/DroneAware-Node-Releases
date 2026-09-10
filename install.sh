@@ -1320,7 +1320,10 @@ enroll_node() {
 # token, within reach of the droneaware user; that is inherent to the Web UI
 # being able to edit settings at all.
 _grant_webui_access() {
-    getent group droneaware >/dev/null 2>&1 || return 0
+    if ! getent group droneaware >/dev/null 2>&1; then
+        warn "droneaware group missing — Web UI will not be able to read config.env."
+        return 0
+    fi
     chgrp droneaware "${INSTALL_DIR}" 2>/dev/null || true
     chmod 2775 "${INSTALL_DIR}" 2>/dev/null || true
     if [[ -f "${INSTALL_DIR}/config.env" ]]; then
@@ -1412,7 +1415,6 @@ install_webui() {
     fi
     chmod +x "${INSTALL_DIR}/web_ui"
     ln -sf "${INSTALL_DIR}/web_ui" /usr/local/bin/web_ui 2>/dev/null || true
-    _grant_webui_access
     info "web_ui binary → ${INSTALL_DIR}/web_ui"
 
     # pmtiles — used by the Web UI to build an offline map of the node's own
@@ -1478,10 +1480,23 @@ SUDOERS
     # setup, but operators who picked a different username need it created
     # as a system user for the unprivileged web_ui process.
     if ! getent passwd droneaware >/dev/null; then
-        useradd --system --shell /bin/false --no-create-home droneaware 2>/dev/null || true
+        # --user-group is explicit rather than relying on USERGROUPS_ENAB in
+        # /etc/login.defs. The Web UI's file access is granted through this
+        # group, so it has to exist; inheriting that from a distro default is
+        # not something to leave to chance.
+        useradd --system --user-group --shell /bin/false \
+                --no-create-home droneaware 2>/dev/null || true
         info "Created droneaware system user for Web UI."
     fi
     chown droneaware:droneaware "${INSTALL_DIR}/web_ui" 2>/dev/null || true
+
+    # 🚨 Must run AFTER the account above exists, not before. On a node whose
+    # operator login IS "droneaware" the group is already there and calling
+    # this earlier appears to work; on a node with any other username the
+    # group does not exist yet, the guard returns early, and the Web UI ends
+    # up unable to read config.env — "Cannot read config.env" on a brand new
+    # install, with nothing in the log to say why.
+    _grant_webui_access
 
     # Offline basemap. 15 MB, zoom 0-5, global — what the map can still draw
     # with no internet at all. Non-fatal: the UI works without it, drawing
