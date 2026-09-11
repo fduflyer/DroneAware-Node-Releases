@@ -2050,6 +2050,26 @@ def api_pack_download():
     return jsonify({"ok": True, "bytes": est["bytes"], "tiles": est.get("tiles")})
 
 
+@app.route("/world.pmtiles")
+def world_pack():
+    """The coarse global overview, served on its own URL.
+
+    /map.pmtiles serves the BEST archive available — a region pack when one
+    exists. That made a downloaded pack replace the world overview instead of
+    adding to it: zoom out past the downloaded box and there was nothing to
+    draw, because a region archive contains only its own bbox.
+
+    Serving the world pack separately lets the client stack them, coarse
+    underneath and detailed on top, which is what "download detail for your
+    own area" was always meant to mean.
+    """
+    path = _world_pack_path()
+    if path is None:
+        return jsonify({"error": "no_world_pack"}), 404
+    return send_file(path, mimetype="application/octet-stream",
+                     conditional=True, max_age=86400)
+
+
 @app.route("/map.pmtiles")
 def region_pack():
     """Serve the downloaded Protomaps region pack.

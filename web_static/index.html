@@ -1531,6 +1531,7 @@
       // "world" or "none". The node decides; the client renders whatever
       // /map.pmtiles gives it.
       mapPackAvailable: false,
+      worldLayer: null,          // coarse global pack, drawn under a region pack
       // Display units: "imperial" (ft AGL / mph / mi rings) or "metric"
       // (m AGL / km/h / km rings). Persisted per-browser in localStorage.
       // Default imperial — matches US operator majority; international
@@ -1602,7 +1603,22 @@
 
     function applyMapTheme() {
       const theme = document.documentElement.dataset.theme || "dark";
+      const flavor = theme === "day" ? "light" : "dark";
       if (state.tileLayer) state.map.removeLayer(state.tileLayer);
+      if (state.worldLayer) { state.map.removeLayer(state.worldLayer); state.worldLayer = null; }
+
+      // A region pack contains ONLY its own bounding box, so on its own it
+      // leaves the rest of the world blank the moment you zoom out past the
+      // area you downloaded. Put the coarse global pack underneath it: the
+      // world gives context everywhere, the region gives detail where the
+      // operator asked for it. Above zoom 5 the world archive has no geometry
+      // and the region layer is all that draws, so there is no double cost
+      // where it matters.
+      if (state.mapSource === "region") {
+        state.worldLayer = protomapsL.leafletLayer({
+          url: "/world.pmtiles", flavor, lang: "en",
+        }).addTo(state.map);
+      }
 
       // Vector wins whenever it is available. One archive covers every zoom
       // and both themes — the flavor is a render option, not a second
@@ -1611,9 +1627,7 @@
       // requires; do not hand-roll it here.
       if (state.mapPackAvailable) {
         state.tileLayer = protomapsL.leafletLayer({
-          url: "/map.pmtiles",
-          flavor: theme === "day" ? "light" : "dark",
-          lang: "en",
+          url: "/map.pmtiles", flavor, lang: "en",
         }).addTo(state.map);
         if (state.home) drawHomeView(state.home);
         return;
@@ -2689,9 +2703,11 @@
         // The vector basemap can appear OR disappear: a downloaded pack is
         // permanent, but the proxied one depends on the node reaching the
         // tile host. Re-apply on either transition.
-        if (!!s.map_pack !== state.mapPackAvailable || !state.tileLayer) {
+        const src = s.map_source || "none";
+        if (!!s.map_pack !== state.mapPackAvailable || src !== state.mapSource
+            || !state.tileLayer) {
           state.mapPackAvailable = !!s.map_pack;
-          state.mapSource = s.map_source || "none";
+          state.mapSource = src;
           clearTimeout(state.basemapTimer);
           applyMapTheme();
         }
@@ -3229,6 +3245,24 @@ ${multiSerialHTML}
         document.querySelectorAll(".settings-page").forEach(p => {
           p.hidden = (p.id !== `page-${name}`);
         });
+        // Re-price on every return to the Map page. The centre and the size
+        // come from the node's saved location, so if the operator just changed
+        // it on the Node page this panel is otherwise still showing — and
+        // still costing — the location they came here to replace.
+        if (name === "map") om.refresh();
+      },
+
+      // The estimate is priced server-side from the SAVED location, so an
+      // edit sitting unsaved in the Node form would silently download a
+      // region for somewhere the node no longer thinks it is. Say so rather
+      // than quietly pricing the wrong place.
+      unsavedLocation() {
+        if (!cfg.loaded) return false;
+        for (const k of ["NODE_LAT", "NODE_LON"]) {
+          const el = document.getElementById(`cfg-${k}`);
+          if (el && el.value.trim() !== String(cfg.loaded[k] ?? "").trim()) return true;
+        }
+        return false;
       },
       async fillNode() { return cfg.load(); },
       async refresh() {
@@ -3249,6 +3283,8 @@ ${multiSerialHTML}
 
         document.getElementById("om-center").textContent =
           `${d.center.lat.toFixed(5)}, ${d.center.lon.toFixed(5)}`;
+        document.getElementById("om-center-src").textContent =
+          om.unsavedLocation() ? "unsaved edit — not applied" : "node location";
 
         om.render();
       },
