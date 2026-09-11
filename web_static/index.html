@@ -2644,11 +2644,30 @@
           : (live ? "Awaiting fix\u2026" : "Location not set");
     }
 
+    // 🚨 Every repeating fetch on this page needs a deadline.
+    //
+    // The browser allows about six connections per host and the SSE stream
+    // holds one of them permanently. Status polls every 2s, the action poll
+    // every 1s, and none of them could be abandoned — so when the node got
+    // slow (during a refresh the WiFi interfaces are torn down and recreated,
+    // and `iw` calls against them sit until they time out) requests arrived
+    // faster than they drained, the pool filled, and the page could no longer
+    // fetch anything at all. Including a navigation, which is why it looked
+    // frozen and why reloading fixed it.
+    async function fetchJSON(url, { timeout = 8000, ...opts } = {}) {
+      const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(timeout) });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    }
+
+    // A slow reply must not let the next tick start a second one.
+    let _statusInFlight = false;
+
     async function refreshStatus() {
+      if (_statusInFlight) return;
+      _statusInFlight = true;
       try {
-        const r = await fetch("/api/status");
-        if (!r.ok) return;
-        const s = await r.json();
+        const s = await fetchJSON("/api/status");
         // Re-measure the node/browser clock offset every poll, so a node whose
         // clock is corrected by NTP mid-session stops mis-ageing its
         // detections without the page needing a reload.
@@ -2695,7 +2714,12 @@
             state.lastHome = { lat: s.home.lat, lon: s.home.lon };
           }
         }
-      } catch (e) {}
+      } catch (e) {
+        // A timed-out or failed poll is normal on a busy node. The next tick
+        // tries again; what matters is that this one released its slot.
+      } finally {
+        _statusInFlight = false;
+      }
     }
 
     /* ----- SSE ----- */
@@ -3820,7 +3844,7 @@ ${multiSerialHTML}
           // The CLI restarts feeders, so poll rather than guess a duration.
           for (let i = 0; i < 180; i++) {
             await new Promise(res => setTimeout(res, 1000));
-            const s = await (await fetch("/api/action")).json();
+            const s = await fetchJSON("/api/action");
             if (!s.running && s.last) {
               ok = s.last.ok;
               message = ok ? `${action} completed.` : s.last.detail;

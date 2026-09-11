@@ -1608,6 +1608,26 @@ CHANNEL_BANDS = [
 ]
 
 
+# What a radio can tune to changes only when the hardware does, but probing it
+# costs two `iw` calls per adapter and the settings panel re-reads it on every
+# rebuild. During a refresh those calls run against interfaces being torn down
+# and recreated, where each can sit until its timeout.
+_phy_cache = {}
+
+
+def _phy_channels_cached(iface: str) -> set:
+    hit = _phy_cache.get(iface)
+    if hit and time.time() - hit[0] < 300:
+        return hit[1]
+    chans = _phy_channels(iface)
+    # Only cache a real answer. An empty set means the probe failed — often
+    # because the interface is mid-reconfiguration — and caching that would
+    # keep the picker empty for five minutes after it recovered.
+    if chans:
+        _phy_cache[iface] = (time.time(), chans)
+    return chans
+
+
 def _phy_channels(iface: str) -> set:
     """Channel numbers this iface's PHY can tune to.
 
@@ -1697,7 +1717,7 @@ def api_channels():
         iface = a.get("iface")
         if not iface:
             continue
-        found = _phy_channels(iface)
+        found = _phy_channels_cached(iface)
         if found:
             probed += 1
             supported |= found
