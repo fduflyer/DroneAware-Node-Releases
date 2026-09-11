@@ -1532,6 +1532,7 @@
       // /map.pmtiles gives it.
       mapPackAvailable: false,
       worldLayer: null,          // coarse global pack, drawn under a region pack
+      mapPackVersion: 0,         // bumps when the region pack is replaced
       // Display units: "imperial" (ft AGL / mph / mi rings) or "metric"
       // (m AGL / km/h / km rings). Persisted per-browser in localStorage.
       // Default imperial — matches US operator majority; international
@@ -1626,8 +1627,15 @@
       // "Protomaps © OpenStreetMap" attribution, which is what ODbL
       // requires; do not hand-roll it here.
       if (state.mapPackAvailable) {
+        // The version makes a replaced pack a different URL. On the same URL
+        // the browser serves its cached copy — the archive is sent with a
+        // day's max-age because it is immutable for its lifetime — and
+        // protomaps-leaflet keeps using the directory it parsed from the
+        // previous file. So a second area downloaded correctly and then did
+        // not appear.
+        const v = state.mapPackVersion || 0;
         state.tileLayer = protomapsL.leafletLayer({
-          url: "/map.pmtiles", flavor, lang: "en",
+          url: `/map.pmtiles?v=${v}`, flavor, lang: "en",
         }).addTo(state.map);
         if (state.home) drawHomeView(state.home);
         return;
@@ -2704,10 +2712,12 @@
         // permanent, but the proxied one depends on the node reaching the
         // tile host. Re-apply on either transition.
         const src = s.map_source || "none";
+        const ver = s.map_pack_version || 0;
         if (!!s.map_pack !== state.mapPackAvailable || src !== state.mapSource
-            || !state.tileLayer) {
+            || ver !== state.mapPackVersion || !state.tileLayer) {
           state.mapPackAvailable = !!s.map_pack;
           state.mapSource = src;
+          state.mapPackVersion = ver;
           clearTimeout(state.basemapTimer);
           applyMapTheme();
         }

@@ -1220,6 +1220,14 @@ def api_status():
                      or _world_pack_path() is not None),
         "map_pack_bytes": (os.path.getsize(_region_pack_path())
                            if _region_pack_path() else None),
+        # Changes whenever the pack on disk does. The client puts it in the
+        # basemap URL, so downloading a new area busts both the browser cache
+        # and the reader's in-memory copy of the previous archive's directory.
+        # Without it a second download is invisible: same URL, a response the
+        # browser has cached for a day, and a PMTiles reader that has already
+        # parsed the file that used to be there.
+        "map_pack_version": (int(os.path.getmtime(_region_pack_path()))
+                             if _region_pack_path() else 0),
         # local  — a downloaded pack, works with no uplink
         # proxy  — streaming from the tile host through this node
         # none   — neither; the client keeps its raster fallback
