@@ -538,6 +538,9 @@
     .ic-ble  { color: #3b82f6; }
     .ic-wifi { color: #6366f1; }
     .ic-loc  { color: #64748b; }
+    /* Amber, not red: a wrong clock makes the times on screen wrong, but the
+       node is still detecting and still recording. It is a caveat, not a fault. */
+    .ic-warn { color: #f59e0b; }
     .ic-gps  { color: #10b981; }
     .feeder-label { width: 64px; flex: 0 0 64px; color: var(--text-dim); }
     .feeder-status {
@@ -1242,6 +1245,15 @@
           <svg class="health-icon ic-loc" id="loc-icon"><use href="#ic-pin"/></svg>
           <span class="feeder-label" id="loc-label">Location</span>
           <span class="feeder-status mono" id="loc-value">—</span>
+        </div>
+        <!-- Shown only when aircraft disagree with this node's clock. A Pi has
+             no RTC, so one that booted with no network can be hours out and
+             nothing on screen would otherwise say so — the times all look
+             plausible because they are consistently wrong. -->
+        <div class="feeder-row" data-feeder="clock" id="row-clock" hidden>
+          <svg class="health-icon ic-warn" id="clock-icon"><use href="#ic-pin"/></svg>
+          <span class="feeder-label">Clock</span>
+          <span class="feeder-status mono" id="clock-value">—</span>
         </div>
       </div>
       <div class="sidebar-filters">
@@ -2644,6 +2656,49 @@
       }
     }
 
+    /* Say when this node's clock disagrees with the aircraft.
+     *
+     * The aircraft carry GPS time in their ASTM System message — the only
+     * absolute time in the whole broadcast, and the only reference an offline
+     * node has. A Pi has no RTC, so one that boots with no network restores a
+     * stale time and stamps everything it hears with it. Every age on this
+     * page then reads correctly, because detection times and "now" share the
+     * same wrong clock; the error is invisible precisely because it is
+     * consistent. This row is the only thing that would tell an operator
+     * standing in a field that today's flight is about to be filed as
+     * yesterday's.
+     *
+     * Below a minute this stays hidden: sub-minute skew is normal, not
+     * actionable, and a warning that is always on is a warning nobody reads.
+     */
+    const CLOCK_SKEW_WARN_SEC = 60;
+
+    function renderClockSkew(skewSec) {
+      const row = document.getElementById("row-clock");
+      if (skewSec == null || Math.abs(skewSec) < CLOCK_SKEW_WARN_SEC) {
+        row.hidden = true;
+        return;
+      }
+      const behind = skewSec > 0;          // node clock is SLOW
+      const mag = Math.abs(skewSec);
+      let amount;
+      if (mag >= 3600) {
+        const h = Math.floor(mag / 3600);
+        const m = Math.round((mag % 3600) / 60);
+        amount = m ? `${h}h ${m}m` : `${h}h`;
+      } else {
+        amount = `${Math.round(mag / 60)}m`;
+      }
+      document.getElementById("clock-value").textContent =
+        `out of sync by ${amount}`;
+      row.hidden = false;
+      row.title =
+        `This node's clock is ${amount} ${behind ? "behind" : "ahead of"} the `
+        + "GPS time broadcast by nearby aircraft. Times shown on this page are "
+        + "wrong by about that much. It will correct itself once the node "
+        + "reaches the internet.";
+    }
+
     function renderLocation(status) {
       const row = document.getElementById("row-location");
       if (!row) return;
@@ -2696,6 +2751,7 @@
         setNodeClock(s.now);
         renderFeeders(s.feeders);
         renderLocation(s);
+        renderClockSkew(s.clock_skew_sec);
         setHeaderStatus(undefined, s.uplink_ok !== false);
         document.getElementById("stat-buffer").textContent =
           `${s.buffer_pct}% (${(s.buffer_bytes / 1e6).toFixed(1)} MB)`;

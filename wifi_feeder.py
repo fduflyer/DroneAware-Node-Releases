@@ -376,6 +376,118 @@ def parse_location(data: bytes) -> dict:
     }
 
 
+# ASTM F3411 absolute timestamps count seconds from 2019-01-01T00:00:00Z.
+F3411_EPOCH = 1546300800
+
+
+def _decode_drone_time(data: bytes) -> float | None:
+    """Absolute UTC from a System message, or None when absent or unset.
+
+    Zero is the unset sentinel: a transmitter without a GPS time lock sends it,
+    and reporting that as 2019-01-01 would be far worse than saying nothing —
+    a confidently wrong date is harder to notice than a missing one.
+
+    Deliberately does NOT sanity-check against the local clock. The whole point
+    of this field is that it is trustworthy when the local clock is not, so
+    rejecting it for disagreeing would discard the good value and keep the bad.
+    """
+    if len(data) < 24:
+        return None
+    raw = struct.unpack_from('<I', data, 20)[0]
+    if raw == 0:
+        return None
+    return float(raw + F3411_EPOCH)
+
+
+class _ClockSkew:
+    """How far this node's clock is from the GPS time aircraft broadcast.
+
+    A Pi has no RTC. One that boots with no network restores a stale time and
+    stamps everything it hears with it — a node did exactly that on 2026-09-12
+    and backdated a flight by 9h48m, with timestamps that were internally
+    consistent, plausible, and wrong. Nothing on the node noticed, because
+    nothing had anything to compare against.
+
+    This does NOT set the clock. A System message is an unauthenticated
+    broadcast; anything able to transmit RID could otherwise walk a node's
+    clock wherever it liked, and the node would then mis-stamp its own spool
+    and rate-limiter windows too. Measuring and reporting is the safe half.
+
+    The median resists a single bad or hostile broadcast: one aircraft lying
+    cannot move an estimate drawn from several.
+    """
+
+    MIN_SAMPLES = 3
+
+    def __init__(self, keep: int = 32):
+        self._samples = collections.deque(maxlen=keep)
+        self._lock = threading.Lock()
+
+    def observe(self, drone_time: float, local_time: float) -> None:
+        with self._lock:
+            self._samples.append(drone_time - local_time)
+
+    @property
+    def seconds(self) -> float | None:
+        """Median skew in seconds, positive when the node clock is SLOW.
+
+        None until several aircraft agree — reporting a clock error from a
+        single sample would be its own false alarm.
+        """
+        with self._lock:
+            if len(self._samples) < self.MIN_SAMPLES:
+                return None
+            s = sorted(self._samples)
+            n = len(s)
+            return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+
+CLOCK_SKEW = _ClockSkew()
+
+
+# Keys the node keeps for itself. They are written to the spool — the node's own
+# flight history, which feeds the offline replay — and removed before the batch
+# is posted. The server decodes the same value from the raw hex it already
+# receives, so the field buys it nothing, and adding an unrecognised key to a
+# working ingest path is not a free action.
+LOCAL_ONLY_KEYS = frozenset({"drone_time"})
+
+
+def _carries_local_only(ev: dict) -> bool:
+    if LOCAL_ONLY_KEYS & ev.keys():
+        return True
+    msgs = ev.get("messages")
+    return isinstance(msgs, list) and any(
+        isinstance(m, dict) and (LOCAL_ONLY_KEYS & m.keys()) for m in msgs)
+
+
+def _for_the_wire(events: list) -> list:
+    """The batch as the server should see it, with local-only keys removed.
+
+    Message packs carry their sub-messages under "messages", and a System
+    message inside a pack is where most of these timestamps actually arrive —
+    so a flat filter over the top-level keys would miss the common case.
+
+    Deterministic: every retry of a held batch serialises identically under the
+    same idempotency key. Allocates nothing when there is nothing to strip,
+    which is the majority of batches.
+    """
+    if not any(_carries_local_only(e) for e in events):
+        return events
+    out = []
+    for ev in events:
+        clean = {k: v for k, v in ev.items() if k not in LOCAL_ONLY_KEYS}
+        msgs = clean.get("messages")
+        if isinstance(msgs, list):
+            clean["messages"] = [
+                {k: v for k, v in m.items() if k not in LOCAL_ONLY_KEYS}
+                if isinstance(m, dict) else m
+                for m in msgs
+            ]
+        out.append(clean)
+    return out
+
+
 def parse_system_msg(data: bytes) -> dict:
     """
     Decode ASTM F3411-22a System Message (16+ bytes).
@@ -386,6 +498,18 @@ def parse_system_msg(data: bytes) -> dict:
       10-11            area_count          (uint16 LE)
       12               area_radius_m       (raw * 10)
       13-14            alt_takeoff_geo     (uint16 LE, * 0.5 - 1000.0)
+      20-23            drone_time          (uint32 LE, + F3411_EPOCH)
+
+    🚨 drone_time is the only ABSOLUTE time anywhere in the broadcast, and it
+    is GPS-derived — so it is right even when this node's clock is not. A Pi
+    has no RTC; one that boots with no network restores a stale time and
+    stamps everything it hears with it. A node did exactly that on 2026-09-12
+    and backdated a flight by 9h48m.
+
+    Location/Vector carries only seconds-past-the-hour, which is ambiguous
+    modulo an hour and so cannot date anything — a ten-hour error shows up
+    there as a twelve-minute discrepancy. No amount of node-side arithmetic
+    recovers the missing hours. Only this field does.
     """
     if len(data) < 16:
         return {}
@@ -401,7 +525,7 @@ def parse_system_msg(data: bytes) -> dict:
     area_radius_m = data[12] * 10
     alt_takeoff   = struct.unpack_from('<H', data, 13)[0] * 0.5 - 1000.0
 
-    return {
+    out = {
         "op_location_type": op_location_type,
         "operator_lat":     round(op_lat, 7) if op_lat is not None else None,
         "operator_lon":     round(op_lon, 7) if op_lon is not None else None,
@@ -409,6 +533,15 @@ def parse_system_msg(data: bytes) -> dict:
         "area_radius_m":    area_radius_m,
         "alt_takeoff_geo":  round(alt_takeoff, 1),
     }
+    # 🚨 Kept for the SPOOL and the offline UI, stripped before the POST.
+    # The node's own history should carry the aircraft's absolute time so a
+    # replay reads correctly even when this node's clock was wrong; the server
+    # decodes the same value from the raw hex itself and is not expecting the
+    # field. See LOCAL_ONLY_KEYS in Forwarder.
+    dt = _decode_drone_time(data)
+    if dt is not None:
+        out["drone_time"] = dt
+    return out
 
 
 def parse_operator_id(data: bytes) -> dict:
@@ -465,6 +598,12 @@ def decode_rid_message(raw_bytes: bytes, radio: str | None = None) -> dict | Non
         result.update(parse_location(decode_bytes))
     elif msg_type == 0x4:
         result.update(parse_system_msg(decode_bytes))
+        # Observed locally, never forwarded. This is the only absolute time in
+        # the whole broadcast and it is GPS-derived, so it is right even when
+        # this node's clock is not.
+        _dt = _decode_drone_time(decode_bytes)
+        if _dt is not None:
+            CLOCK_SKEW.observe(_dt, time.time())
     elif msg_type == 0x5:
         result.update(parse_operator_id(decode_bytes))
     elif msg_type == 0xF:
@@ -2333,7 +2472,7 @@ class Forwarder:
             self._pace_until = time.time() + wait
             return
 
-        payload = {"node_id": self.node_id, "events": events}
+        payload = {"node_id": self.node_id, "events": _for_the_wire(events)}
         try:
             headers = {"X-Node-Token": self.token} if self.token else {}
             # Stamped once when the batch was assembled and carried through
@@ -3419,6 +3558,12 @@ class WiFiFeeder:
                               and getattr(self.hopper, "retune_s", 0) else None),
                 "wifi_ok":      wifi_ok,
                 "wifi_fault":   wifi_fault,
+                # Seconds this node's clock is behind the GPS time aircraft
+                # broadcast; positive means SLOW. None until several aircraft
+                # agree. The offline UI has no server to check against, so this
+                # is the only way an operator in the field learns the times on
+                # screen are wrong. See _ClockSkew.
+                "clock_skew_sec": CLOCK_SKEW.seconds,
                 "sent_total":   self.forwarder.sent_total if hasattr(self, "forwarder") else 0,
                 "updated_at":   time.time(),
             }

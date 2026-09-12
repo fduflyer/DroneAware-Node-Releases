@@ -607,10 +607,95 @@ def parse_location(data: bytes) -> dict:
     }
 
 
+# ASTM F3411 absolute timestamps count seconds from 2019-01-01T00:00:00Z.
+F3411_EPOCH = 1546300800
+
+
+def _decode_drone_time(data: bytes) -> float | None:
+    """Absolute UTC from a System message, or None when absent or unset.
+
+    Byte-for-byte the same contract as wifi_feeder._decode_drone_time; the two
+    are asserted identical by test. See that file for why zero is rejected and
+    why this is deliberately not checked against the local clock.
+    """
+    if len(data) < 24:
+        return None
+    raw = struct.unpack_from('<I', data, 20)[0]
+    if raw == 0:
+        return None
+    return float(raw + F3411_EPOCH)
+
+
+class _ClockSkew:
+    """How far this node's clock is from the GPS time aircraft broadcast.
+
+    Mirrors wifi_feeder._ClockSkew — see there for why this measures rather
+    than sets the clock, and why the estimate is a median.
+    """
+
+    MIN_SAMPLES = 3
+
+    def __init__(self, keep: int = 32):
+        self._samples = collections.deque(maxlen=keep)
+        self._lock = threading.Lock()
+
+    def observe(self, drone_time: float, local_time: float) -> None:
+        with self._lock:
+            self._samples.append(drone_time - local_time)
+
+    @property
+    def seconds(self) -> float | None:
+        with self._lock:
+            if len(self._samples) < self.MIN_SAMPLES:
+                return None
+            s = sorted(self._samples)
+            n = len(s)
+            return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+
+CLOCK_SKEW = _ClockSkew()
+
+# See wifi_feeder.LOCAL_ONLY_KEYS — kept for the spool, stripped before the POST.
+LOCAL_ONLY_KEYS = frozenset({"drone_time"})
+
+
+def _carries_local_only(ev: dict) -> bool:
+    if LOCAL_ONLY_KEYS & ev.keys():
+        return True
+    msgs = ev.get("messages")
+    return isinstance(msgs, list) and any(
+        isinstance(m, dict) and (LOCAL_ONLY_KEYS & m.keys()) for m in msgs)
+
+
+def _for_the_wire(events: list) -> list:
+    """The batch as the server should see it, with local-only keys removed.
+    Identical contract to wifi_feeder._for_the_wire; asserted so by test."""
+    if not any(_carries_local_only(e) for e in events):
+        return events
+    out = []
+    for ev in events:
+        clean = {k: v for k, v in ev.items() if k not in LOCAL_ONLY_KEYS}
+        msgs = clean.get("messages")
+        if isinstance(msgs, list):
+            clean["messages"] = [
+                {k: v for k, v in m.items() if k not in LOCAL_ONLY_KEYS}
+                if isinstance(m, dict) else m
+                for m in msgs
+            ]
+        out.append(clean)
+    return out
+
+
 def parse_system_msg(data: bytes) -> dict:
     """
     Decode ASTM F3411-22a System Message (16+ bytes).
     See wifi_feeder.py for full byte layout — kept in sync with that file.
+
+    🚨 "Kept in sync" is exactly what hid the gap this field closes: three
+    decoders (here, wifi_feeder, and the server) were written to agree, all
+    stopped at byte 14, and the cross-check that would have caught it was
+    comparing against a copy of the same blind spot. A test now asserts this
+    function and wifi_feeder's produce identical output for identical bytes.
     """
     if len(data) < 16:
         return {}
@@ -625,7 +710,7 @@ def parse_system_msg(data: bytes) -> dict:
     area_radius_m = data[12] * 10
     alt_takeoff   = struct.unpack_from('<H', data, 13)[0] * 0.5 - 1000.0
 
-    return {
+    out = {
         "op_location_type": op_location_type,
         "operator_lat":     round(op_lat, 7) if op_lat is not None else None,
         "operator_lon":     round(op_lon, 7) if op_lon is not None else None,
@@ -633,6 +718,10 @@ def parse_system_msg(data: bytes) -> dict:
         "area_radius_m":    area_radius_m,
         "alt_takeoff_geo":  round(alt_takeoff, 1),
     }
+    dt = _decode_drone_time(data)
+    if dt is not None:
+        out["drone_time"] = dt
+    return out
 
 
 def parse_operator_id(data: bytes) -> dict:
@@ -670,6 +759,11 @@ def decode_rid_message(raw_bytes: bytes) -> dict | None:
         result.update(parse_location(raw_bytes))
     elif msg_type == 0x4:
         result.update(parse_system_msg(raw_bytes))
+        # Observed locally, never forwarded — the only absolute, GPS-derived
+        # time in the broadcast, and so right even when this node's clock is not.
+        _dt = _decode_drone_time(raw_bytes)
+        if _dt is not None:
+            CLOCK_SKEW.observe(_dt, time.time())
     elif msg_type == 0x5:
         result.update(parse_operator_id(raw_bytes))
     elif msg_type == 0xF:
@@ -1018,7 +1112,7 @@ class Forwarder:
             "node_id":     self.node_id,
             "received_at": datetime.now(timezone.utc).isoformat(),
             "count":       len(events),
-            "events":      events,
+            "events":      _for_the_wire(events),
         }
 
         try:

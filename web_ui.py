@@ -1255,6 +1255,16 @@ def api_status():
         # false the UI must label history relatively ("3h ago") and never
         # print a wall-clock time the node cannot stand behind.
         "clock_synced": _clock_synced(),
+        # Seconds this node's clock is behind the GPS time aircraft broadcast
+        # in their System messages; positive means the node is SLOW. None when
+        # no aircraft has been heard, or too few to be sure.
+        #
+        # 🚨 This is the only check available to an offline node. `clock_synced`
+        # answers "did NTP ever reach us", which on a node that booted with no
+        # network is false in a way the operator cannot act on. This answers
+        # "by how much, and in which direction" — and it works with no server,
+        # no internet and no RTC, because the aircraft carry GPS time.
+        "clock_skew_sec": _clock_skew_sec(),
         "node_id":     _read_config_env("NODE_ID") or "this-node",
         # Whether a Protomaps region pack has been downloaded. When true the
         # frontend renders vector tiles from /map.pmtiles and needs neither
@@ -1723,6 +1733,36 @@ def _phy_channels(iface: str) -> set:
 # same clock. Absolute times ("14:32 on the 9th") do not, and printing one the
 # node cannot stand behind is worse than not printing it.
 _clock_cache = {"at": 0.0, "synced": False}
+
+
+def _clock_skew_sec() -> float | None:
+    """How far this node's clock is from GPS time, per the feeders.
+
+    Each feeder measures independently against the aircraft it hears, and
+    writes its estimate to its own tmpfs state file. They should agree; when
+    they do not, report the LARGEST magnitude — understating a clock error is
+    the failure that costs an operator a flight, and overstating it only costs
+    a warning that is slightly too loud.
+
+    Stale files are ignored: a feeder that died holding a skew estimate must
+    not keep asserting it.
+    """
+    worst = None
+    for name in ("wifi_state_2g.json", "wifi_state_5g.json",
+                 "wifi_state.json", "ble_state.json"):
+        try:
+            with open(f"/run/droneaware/{name}") as f:
+                st = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if time.time() - (st.get("updated_at") or 0) > 300:
+            continue
+        skew = st.get("clock_skew_sec")
+        if skew is None:
+            continue
+        if worst is None or abs(skew) > abs(worst):
+            worst = float(skew)
+    return worst
 
 
 def _clock_synced() -> bool:
