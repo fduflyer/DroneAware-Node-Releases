@@ -852,13 +852,55 @@ GPS_STATE_PATH  = "/run/droneaware/gps_state.json"
 
 # config.env parsed on demand, re-read whenever the file changes on disk.
 _cfg_cache = {"mtime": None, "values": {}}
+# One-shot latch so an unreadable config.env is reported once rather than on
+# every status poll, and reported AGAIN if it recovers. See _cfg_unreadable().
+_cfg_fault = {"reported": None}
+
+
+def _cfg_unreadable(exc: Exception) -> None:
+    """Say — loudly and exactly once — that config.env could not be read.
+
+    🚨 A fresh install once reached first boot with this file unreadable and
+    put NOTHING in the journal. The operator saw a settings panel that would
+    not load and we had no way to tell why; by the time anyone looked, a
+    `droneaware refresh` had silently repaired it and the evidence was gone.
+
+    Silent failure is this codebase's dominant defect. Whatever is wrong here,
+    the next person gets the uid, the mode and the owner without needing to
+    reproduce it.
+    """
+    key = repr(exc)
+    if _cfg_fault["reported"] == key:
+        return
+    _cfg_fault["reported"] = key
+    try:
+        st = os.stat(CONFIG_ENV_PATH)
+        found = (f"mode={st.st_mode & 0o7777:04o} "
+                 f"owner={st.st_uid}:{st.st_gid}")
+    except OSError as e:
+        found = f"cannot stat ({e.__class__.__name__})"
+    log.error(
+        "Cannot read %s — the settings panel will not load. "
+        "Running as uid=%d gid=%d groups=%s; file %s. Cause: %s. "
+        "Repair with: sudo droneaware refresh",
+        CONFIG_ENV_PATH, os.getuid(), os.getgid(),
+        ",".join(str(g) for g in os.getgroups()), found, exc,
+    )
+
+
+def _cfg_readable_again() -> None:
+    """Clear the latch, and say so if we had previously complained."""
+    if _cfg_fault["reported"] is not None:
+        _cfg_fault["reported"] = None
+        log.info("%s is readable again.", CONFIG_ENV_PATH)
 
 
 def _config_file_values() -> dict:
     """Every key currently in config.env. Re-parsed only when it changes."""
     try:
         mtime = os.path.getmtime(CONFIG_ENV_PATH)
-    except OSError:
+    except OSError as e:
+        _cfg_unreadable(e)
         return _cfg_cache["values"]
     if mtime != _cfg_cache["mtime"]:
         values = {}
@@ -870,9 +912,11 @@ def _config_file_values() -> dict:
                         continue
                     k, v = line.split("=", 1)
                     values[k.strip()] = v.strip()
-        except Exception:
+        except Exception as e:
+            _cfg_unreadable(e)
             return _cfg_cache["values"]
         _cfg_cache.update(mtime=mtime, values=values)
+    _cfg_readable_again()
     return _cfg_cache["values"]
 
 

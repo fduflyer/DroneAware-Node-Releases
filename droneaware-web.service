@@ -7,6 +7,21 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/opt/droneaware/config.env
+
+# 🚨 Enforce the access this unit needs, every start, rather than trusting
+# whatever the installer left behind. A fresh install reached first boot with
+# config.env not readable by this service and nothing in the log to say why;
+# the repair only happened later because `droneaware refresh` re-applies the
+# same grant as a side effect. The cause was never established — the evidence
+# was in a volatile journal — so this closes the class instead of the instance.
+#
+# The leading "+" runs as root before the unit drops to User=droneaware.
+# Idempotent, and deliberately ends in `true`: a node without the group yet
+# must still start and say so, not fail to boot its own diagnostics.
+ExecStartPre=+/bin/sh -c 'chgrp droneaware /opt/droneaware /opt/droneaware/config.env 2>/dev/null; \
+                          chmod 2775 /opt/droneaware 2>/dev/null; \
+                          chmod 660 /opt/droneaware/config.env 2>/dev/null; true'
+
 ExecStart=/opt/droneaware/web_ui
 Restart=on-failure
 RestartSec=5
@@ -17,7 +32,8 @@ Group=droneaware
 # (/run/droneaware/detections.jsonl, /run/droneaware/gps_state.json) and
 # serves HTTP on an unprivileged port. Runs as the unprivileged droneaware
 # user — config.env env vars are loaded via EnvironmentFile regardless of
-# the file's chmod 600 permissions.
+# the file's own permissions, which is why a broken chmod shows up as an
+# unwritable settings panel rather than a service that fails to start.
 
 [Install]
 WantedBy=multi-user.target

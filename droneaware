@@ -2655,8 +2655,14 @@ cmd_install_webui() {
     fi
 
     # Ensure droneaware user exists for User=droneaware in the unit.
+    # --user-group is explicit rather than relying on USERGROUPS_ENAB in
+    # /etc/login.defs, matching install.sh. The Web UI's file access is granted
+    # through this group and _grant_webui_access returns quietly when it is
+    # absent, so a node that inherited USERGROUPS_ENAB=no would reach first
+    # boot with an unreadable config.env and no explanation.
     if ! getent passwd droneaware >/dev/null; then
-        useradd --system --shell /bin/false --no-create-home droneaware 2>/dev/null || true
+        useradd --system --user-group --shell /bin/false \
+                --no-create-home droneaware 2>/dev/null || true
         info "Created droneaware system user for Web UI."
     fi
     chown droneaware:droneaware "${INSTALL_DIR}/web_ui" 2>/dev/null || true
