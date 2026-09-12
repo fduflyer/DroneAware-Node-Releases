@@ -60,6 +60,13 @@ DEFAULT_WRITE_INTERVAL_SEC = 15.0
 DEFAULT_RETENTION_DAYS = 90          # "never" is permitted
 DEFAULT_MAX_GB = 4.0                 # ceiling regardless of retention
 
+# Last-resort event size, used only when nothing has been written this process
+# AND no segment exists to sample. Any real spool measures itself instead.
+DEFAULT_AVG_EVENT_BYTES = 320.0
+# How much of the newest segment to read when seeding that measurement. Enough
+# lines to be representative, small enough to stay inside one page-cache read.
+AVG_SAMPLE_BYTES = 65536
+
 # Occupancy/liveness bucket. 5 minutes over 90 days is 25,920 buckets — fine
 # enough that a single short flight still registers, and far finer than any
 # slider can draw.
@@ -452,6 +459,7 @@ class SpoolQueue:
         self.dropped_events = 0      # lost to the size ceiling
         self.dropped_undelivered = 0 # of those, never delivered — real loss
         self.corrupt_lines = 0
+        self._avg_seed = None        # measured from disk; see avg_event_bytes
 
         try:
             os.makedirs(self.dir, exist_ok=True)
@@ -532,10 +540,46 @@ class SpoolQueue:
     @property
     def avg_event_bytes(self) -> float:
         """Measured, with a first-boot fallback. Used only to turn a backlog in
-        bytes into an approximate event count for the heartbeat."""
+        bytes into an approximate event count for the heartbeat.
+
+        🚨 written_* are PER-PROCESS counters starting at zero, so a feeder that
+        has just started has nothing to measure — which is precisely the moment
+        a backlog is largest and the number matters most. A node that rebooted
+        holding 2589 undelivered events reported 2953 of them, because a
+        hardcoded 280 stood in for a real average of ~319 bytes.
+
+        Seed from the segments already on disk instead of guessing. One bounded
+        read of the newest segment measures what THIS node's events actually
+        cost. The live measurement takes over as soon as anything is written.
+        """
         if self.written_events:
             return self.written_bytes / self.written_events
-        return 280.0
+        if self._avg_seed is None:
+            self._avg_seed = self._measure_avg_from_disk()
+        return self._avg_seed or DEFAULT_AVG_EVENT_BYTES
+
+    def _measure_avg_from_disk(self) -> float | None:
+        """Bytes per event, sampled from the newest segment. None if unknowable.
+
+        Deliberately returns None rather than the fallback on failure, so a
+        transient error is retried instead of cached for the life of the
+        process — the same reason the PHY probe does not cache failures.
+        """
+        try:
+            names = _list_segments(self.dir)
+            if not names:
+                return None
+            with open(os.path.join(self.dir, names[-1]), "rb") as f:
+                chunk = f.read(AVG_SAMPLE_BYTES)
+        except OSError:
+            return None
+        cut = chunk.rfind(b"\n")
+        if cut < 0:
+            return None                      # no complete line to measure
+        lines = chunk.count(b"\n", 0, cut + 1)
+        if lines < 1:
+            return None
+        return (cut + 1) / lines
 
     def tick_liveness(self) -> None:
         """Record that this feeder was up and recording right now.
