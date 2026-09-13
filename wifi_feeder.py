@@ -453,39 +453,60 @@ CLOCK_SKEW = _ClockSkew()
 LOCAL_ONLY_KEYS = frozenset({"drone_time"})
 
 
-def _carries_local_only(ev: dict) -> bool:
-    if LOCAL_ONLY_KEYS & ev.keys():
-        return True
-    msgs = ev.get("messages")
-    return isinstance(msgs, list) and any(
-        isinstance(m, dict) and (LOCAL_ONLY_KEYS & m.keys()) for m in msgs)
+# Where a local-only key can sit inside an event.
+#
+# 🚨 NOT the top level. Every event this feeder forwards is built as
+#     {"timestamp": ..., "mac": ..., "payload": ..., "decoded": msg}
+# so a System message's drone_time lives at ev["decoded"]["drone_time"]. The
+# first version of this strip looked only at ev.keys() and ev["messages"] —
+# two places the field never is, because this feeder also unpacks message packs
+# BEFORE building events — and so stripped nothing. v1.6.0.7 shipped sending
+# drone_time to /api/ingest, where decoded is stored as JSONB. Its tests passed
+# because they used flat hand-built fixtures matching the same wrong assumption.
+# Test this against events built by the real decode path, never a fixture.
+#
+# "messages" is kept for a pack forwarded without being unpacked.
+_NESTED_KEYS = ("decoded", "messages")
+
+
+def _carries_local_only(obj) -> bool:
+    if isinstance(obj, dict):
+        if LOCAL_ONLY_KEYS & obj.keys():
+            return True
+        return any(_carries_local_only(obj.get(k)) for k in _NESTED_KEYS)
+    if isinstance(obj, list):
+        return any(_carries_local_only(x) for x in obj)
+    return False
+
+
+def _scrub(obj):
+    """A copy with local-only keys removed along the nesting that can hold them.
+
+    Copies only the dicts on that path and never mutates the input: the same
+    event object is also staged in the spool and published to the local ring,
+    both of which are supposed to keep the key.
+    """
+    if isinstance(obj, dict):
+        clean = {k: v for k, v in obj.items() if k not in LOCAL_ONLY_KEYS}
+        for k in _NESTED_KEYS:
+            if k in clean:
+                clean[k] = _scrub(clean[k])
+        return clean
+    if isinstance(obj, list):
+        return [_scrub(x) for x in obj]
+    return obj
 
 
 def _for_the_wire(events: list) -> list:
     """The batch as the server should see it, with local-only keys removed.
 
-    Message packs carry their sub-messages under "messages", and a System
-    message inside a pack is where most of these timestamps actually arrive —
-    so a flat filter over the top-level keys would miss the common case.
-
     Deterministic: every retry of a held batch serialises identically under the
     same idempotency key. Allocates nothing when there is nothing to strip,
-    which is the majority of batches.
+    which is most batches — only System messages carry drone_time.
     """
     if not any(_carries_local_only(e) for e in events):
         return events
-    out = []
-    for ev in events:
-        clean = {k: v for k, v in ev.items() if k not in LOCAL_ONLY_KEYS}
-        msgs = clean.get("messages")
-        if isinstance(msgs, list):
-            clean["messages"] = [
-                {k: v for k, v in m.items() if k not in LOCAL_ONLY_KEYS}
-                if isinstance(m, dict) else m
-                for m in msgs
-            ]
-        out.append(clean)
-    return out
+    return [_scrub(e) for e in events]
 
 
 def parse_system_msg(data: bytes) -> dict:
