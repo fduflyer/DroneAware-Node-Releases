@@ -1888,8 +1888,9 @@ _ALIASED = {"message_type", "raw_hex", "latitude", "longitude",
             "altitude_geo", "ground_speed", "heading", "uas_id"}
 
 
-def _flatten_event(ev: dict) -> dict:
-    decoded = ev.get("decoded") or {}
+def _flatten_event(ev: dict, decoded: dict | None = None) -> dict:
+    if decoded is None:
+        decoded = ev.get("decoded") or {}
     if not decoded:
         # NAN frames and anything else the feeder could not decode carry no
         # position, so there is nothing for the map to draw. The ring drops
@@ -1915,6 +1916,29 @@ def _flatten_event(ev: dict) -> dict:
     return rec
 
 
+def _flatten_events(ev: dict) -> list:
+    """One replay record per decoded ODID message in a spooled event.
+
+    WiFi unpacks message packs before spooling, so each of its records already
+    holds one message. BLE spools one record per advertisement and keeps the
+    whole decode, so a BLE record can be a Message Pack. Flattened as a single
+    record, a pack gave the replay an aircraft card with no position — the
+    Location lives inside "messages", and the map only draws what has lat/lon.
+    Expanding here gives both radios the shape the live ring already publishes.
+    """
+    decoded = ev.get("decoded") or {}
+    if decoded.get("message_type") == "Message Pack":
+        out = []
+        for msg in decoded.get("messages") or []:
+            if isinstance(msg, dict):
+                rec = _flatten_event(ev, msg)
+                if rec:
+                    out.append(rec)
+        return out
+    rec = _flatten_event(ev)
+    return [rec] if rec else []
+
+
 @app.route("/api/history/range")
 def api_history_range():
     """Detections inside a window, oldest first, for playback."""
@@ -1927,7 +1951,7 @@ def api_history_range():
     if not (t1 > t0):
         return jsonify({"error": "bad_range"}), 400
     raw = spool.read_range(t0, t1, limit)
-    events = [r for r in (_flatten_event(e) for e in raw) if r]
+    events = [r for e in raw for r in _flatten_events(e)]
     return jsonify({"from": t0, "to": t1,
                     "count": len(events), "truncated": len(raw) >= limit,
                     "events": events})
