@@ -655,35 +655,60 @@ class _ClockSkew:
 
 CLOCK_SKEW = _ClockSkew()
 
-# See wifi_feeder.LOCAL_ONLY_KEYS — kept for the spool, stripped before the POST.
-LOCAL_ONLY_KEYS = frozenset({"drone_time"})
+# Keys this feeder keeps for itself: written to the spool, stripped before POST.
+#
+# 🚨 Deliberately DIFFERENT from wifi_feeder.LOCAL_ONLY_KEYS, which is only
+# {"drone_time"}. The feeders speak different ingest contracts. WiFi posts
+# decoded sub-message events, and "decoded" is part of what the server stores.
+# BLE posts the raw advertisement — rid_payload_hex and service data — and the
+# server decodes it itself, as it has since the first release.
+#
+# BLE records now carry the same local decode WiFi records do, so the node's own
+# history holds the aircraft's GPS time for both radios and the replay can place
+# a BLE flight as well as a WiFi one. Listing "decoded" here keeps that decode
+# off the wire: a BLE POST stays byte-identical to what it was before BLE records
+# carried it. Tests assert exactly that, instead of asserting both feeders strip
+# the same keys — which is no longer true, on purpose.
+LOCAL_ONLY_KEYS = frozenset({"drone_time", "decoded"})
 
 
-def _carries_local_only(ev: dict) -> bool:
-    if LOCAL_ONLY_KEYS & ev.keys():
-        return True
-    msgs = ev.get("messages")
-    return isinstance(msgs, list) and any(
-        isinstance(m, dict) and (LOCAL_ONLY_KEYS & m.keys()) for m in msgs)
+# See wifi_feeder._NESTED_KEYS for why this walks "decoded" — the first version
+# did not, and shipped drone_time to the server. For BLE, "decoded" is itself
+# local-only (above), so it is removed whole before the walk would reach inside
+# it; the walk is kept identical to wifi_feeder's so the two cannot drift apart.
+_NESTED_KEYS = ("decoded", "messages")
+
+
+def _carries_local_only(obj) -> bool:
+    if isinstance(obj, dict):
+        if LOCAL_ONLY_KEYS & obj.keys():
+            return True
+        return any(_carries_local_only(obj.get(k)) for k in _NESTED_KEYS)
+    if isinstance(obj, list):
+        return any(_carries_local_only(x) for x in obj)
+    return False
+
+
+def _scrub(obj):
+    """A copy with local-only keys removed. Never mutates the input."""
+    if isinstance(obj, dict):
+        clean = {k: v for k, v in obj.items() if k not in LOCAL_ONLY_KEYS}
+        for k in _NESTED_KEYS:
+            if k in clean:
+                clean[k] = _scrub(clean[k])
+        return clean
+    if isinstance(obj, list):
+        return [_scrub(x) for x in obj]
+    return obj
 
 
 def _for_the_wire(events: list) -> list:
     """The batch as the server should see it, with local-only keys removed.
-    Identical contract to wifi_feeder._for_the_wire; asserted so by test."""
+    Same function as wifi_feeder._for_the_wire; the KEYS it removes differ, on
+    purpose — see LOCAL_ONLY_KEYS above."""
     if not any(_carries_local_only(e) for e in events):
         return events
-    out = []
-    for ev in events:
-        clean = {k: v for k, v in ev.items() if k not in LOCAL_ONLY_KEYS}
-        msgs = clean.get("messages")
-        if isinstance(msgs, list):
-            clean["messages"] = [
-                {k: v for k, v in m.items() if k not in LOCAL_ONLY_KEYS}
-                if isinstance(m, dict) else m
-                for m in msgs
-            ]
-        out.append(clean)
-    return out
+    return [_scrub(e) for e in events]
 
 
 def parse_system_msg(data: bytes) -> dict:
@@ -1318,10 +1343,27 @@ class BLEFeeder:
                 f"payload={rid_payload_hex[:16]}...  strategy={strategy}"
             )
 
+        # Decode BEFORE forwarding, so the spooled record carries the same local
+        # decode a WiFi record does — including the aircraft's GPS time, which is
+        # what lets the node place this detection in its own history when its
+        # clock was wrong. "decoded" is local-only for BLE, so the POST does not
+        # change: the server still receives the raw advertisement and decodes it.
+        #
+        # 🚨 A decode failure must NEVER cost the forward. Decoding used to run
+        # after forwarder.add(), so an exception here could only lose the local
+        # publish. Moving it first would otherwise put the detection itself at
+        # risk, on the most important path this feeder has.
+        try:
+            decoded = decode_rid_message(bytes.fromhex(rid_payload_hex))
+        except Exception as e:
+            log.debug(f"[BLE] local decode failed, forwarding raw only: {e}")
+            decoded = None
+        if decoded:
+            event["decoded"] = decoded
+
         self.forwarder.add(event)
 
-        # Local publish — decode and fan out sub-messages for Message Pack
-        decoded = decode_rid_message(bytes.fromhex(rid_payload_hex))
+        # Local publish — fan out sub-messages for Message Pack
         if decoded:
             if decoded.get("message_type") == "Message Pack":
                 sub_messages = decoded.get("messages", [])
@@ -1560,6 +1602,13 @@ class BLEFeeder:
                                if getattr(self, "last_adv_mono", None) is not None
                                else None),
                 "scanning":   _scanning_alive(self),
+                # Seconds this node's clock is behind the GPS time aircraft
+                # broadcast; positive means SLOW. None until several agree.
+                # Local only, like adv_total. Same field wifi_feeder writes to
+                # its per-band state files — web_ui reads this file for it, and
+                # until now BLE measured the skew and never published it, so a
+                # BLE-only node could not show the out-of-sync warning at all.
+                "clock_skew_sec": CLOCK_SKEW.seconds,
                 **{f"adapter_{k}": v
                    for k, v in _adapter_hardware(adapter or "hci0").items()},
                 "sent_total": getattr(getattr(self, "forwarder", None),
