@@ -5,6 +5,11 @@
 GITHUB_REPO="fduflyer/DroneAware-Node-Releases"
 INSTALL_DIR="/opt/droneaware"
 VERSION_FILE="${INSTALL_DIR}/version"
+# Where the non-binary release assets live on a node — the same paths install.sh
+# writes. Named so the unit-file sync can be exercised against a temp tree.
+SYSTEMD_UNIT_DIR="/etc/systemd/system"
+CLI_DIR="/usr/local/bin"
+STATE_DIR="/var/lib/droneaware"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
 info()    { echo -e "  ${GREEN}✓${NC}  $*"; }
@@ -1349,8 +1354,12 @@ cmd_refresh() {
     echo -e "${BOLD}DroneAware Refresh${NC}"
     echo ""
     echo "  Re-detecting hardware and syncing configuration..."
-    echo "  (WiFi adapters, GPS protocol, gpsd conflict, NM config, service topology)"
+    echo "  (unit files, WiFi adapters, GPS protocol, gpsd conflict, NM config, service topology)"
     echo ""
+    # Unit files FIRST, so everything after — including the orchestration inside
+    # migrate_config_env that starts and stops the WiFi units — works from the
+    # installed version's definitions. Runs once per version; free otherwise.
+    _ensure_unit_files_current
     migrate_config_env
     # Fetch anything this version ships that the node has not got yet. Safe to
     # call every time: each item is skipped when already present.
@@ -1418,6 +1427,130 @@ _grant_webui_access() {
 #
 # Keyed on the installed version, not "latest": the assets a node needs are
 # the ones belonging to the release it is running.
+# Release assets that are neither feeder nor Web UI binaries, kept current by
+# _ensure_unit_files_current below.
+#
+# 🚨 Before v1.6.0.9 no path re-fetched these on a node that already existed:
+#   - droneaware-web.service, droneaware-bt-select.service and the
+#     droneaware-bt-select script were written by install.sh / install-webui
+#     ONLY, so any later change to them never reached an upgraded node
+#   - droneaware-ble.service and droneaware-wifi.service were re-fetched only by
+#     a v1.6 cmd_update — but a node jumping from v1.5.x runs its OLD cmd_update,
+#     so their changes arrived one release late
+# refresh is the fix because it is the one step every update runs from the NEW
+# CLI: cmd_update re-execs it at the end (since v1.5.0.2). A change to any of
+# these therefore reaches a node on the very update that ships it.
+_SYNCED_UNITS=(
+    droneaware-bt-select.service
+    droneaware-ble.service
+    droneaware-wifi.service
+    droneaware-wifi-2g.service
+    droneaware-wifi-5g.service
+    droneaware-web.service
+)
+
+# curl exit codes meaning the release host cannot be reached at all: proxy, DNS,
+# connect, timeout, TLS, empty reply, dropped connection, certificate. Every
+# remaining fetch would fail identically, so the sync stops at the first one
+# instead of stalling a Refresh button file by file.
+_UNREACHABLE_CURL_CODES=" 5 6 7 28 35 52 56 60 "
+
+_asset_looks_valid() {
+    local name="$1" file="$2"
+    [[ -s "$file" ]] || return 1
+    case "$name" in
+        *.service) grep -q '^\[Service\]' "$file" ;;
+        *)         [[ "$(head -c 2 "$file")" == '#!' ]] ;;
+    esac
+}
+
+_ensure_unit_files_current() {
+    local ver stamp="${STATE_DIR}/unit-files-synced"
+    ver=$(cat "$VERSION_FILE" 2>/dev/null | tr -d '[:space:]')
+    [[ -n "$ver" ]] || return 0
+    [[ "$ver" =~ ^v ]] || ver="v${ver}"
+
+    # Once per installed version. "Refresh hardware" in the Web UI runs this, so a
+    # routine refresh must cost nothing: no network and no delay, online or off.
+    [[ "$(cat "$stamp" 2>/dev/null)" == "$ver" ]] && return 0
+
+    local base="https://github.com/${GITHUB_REPO}/releases/download/${ver}"
+    local tmp
+    tmp=$(mktemp -d) || return 0
+
+    local -a names=("${_SYNCED_UNITS[@]}" droneaware-bt-select)
+    local name dest mode rc attempted=0 changed=0 incomplete=0
+    for name in "${names[@]}"; do
+        if [[ "$name" == *.service ]]; then
+            dest="${SYSTEMD_UNIT_DIR}/${name}"; mode=644
+        else
+            dest="${CLI_DIR}/${name}";          mode=755
+        fi
+        # Only ever refresh what the node already has. Other commands read the
+        # presence of droneaware-web.service as "the Web UI is installed", so
+        # creating one here would fake an installation.
+        [[ -f "$dest" ]] || continue
+
+        attempted=$((attempted + 1))
+        rc=0
+        curl -fsSL --connect-timeout 5 --max-time 30 "${base}/${name}" -o "${tmp}/${name}" || rc=$?
+        if (( rc != 0 )); then
+            incomplete=1
+            if [[ "$_UNREACHABLE_CURL_CODES" == *" $rc "* ]]; then
+                warn "Could not reach the release server to check unit files for ${ver} — will retry on the next refresh."
+                break
+            fi
+            if (( rc == 22 && attempted == 1 )); then
+                # HTTP error on the very first file: no published release carries
+                # this version string, as on a local or development build.
+                warn "No published release found for ${ver} — unit files left as installed."
+                break
+            fi
+            warn "${name}: download failed — keeping the installed copy."
+            continue
+        fi
+        if ! _asset_looks_valid "$name" "${tmp}/${name}"; then
+            # A captive portal or proxy can answer 200 with an HTML page. It must
+            # never replace a working unit.
+            incomplete=1
+            warn "${name}: download was not a valid ${name} — keeping the installed copy."
+            continue
+        fi
+        cmp -s "${tmp}/${name}" "$dest" && continue
+
+        # Write beside the target and rename over it, so nothing — systemd, or a
+        # boot-time run of the bt-select script — ever reads a partial file.
+        if cp "${tmp}/${name}" "${dest}.new" && chmod "$mode" "${dest}.new" \
+           && mv -f "${dest}.new" "$dest"; then
+            changed=1
+            info "${name} updated to the ${ver} version."
+        else
+            rm -f "${dest}.new"
+            incomplete=1
+            warn "${name}: could not be replaced — keeping the installed copy."
+        fi
+    done
+    rm -rf "$tmp"
+
+    # Reload so systemd holds the new definitions. Deliberately NO restart:
+    # "Refresh hardware" in the Web UI runs refresh from inside droneaware-web,
+    # and restarting that unit would kill the refresh doing the restarting.
+    # Settings read at stop time (TimeoutStopSec) apply as soon as this reloads;
+    # settings read at start (ExecStartPre, StateDirectory) apply at the next
+    # start. What those protect is enforced in this same refresh regardless —
+    # _ensure_webui_current re-grants the Web UI's access, and the spool creates
+    # its own directory.
+    if (( changed )); then
+        systemctl daemon-reload
+    fi
+
+    # Stamp only a COMPLETE check, so a partial one is retried next refresh.
+    if (( ! incomplete )); then
+        mkdir -p "$STATE_DIR" 2>/dev/null && echo "$ver" > "$stamp" 2>/dev/null
+    fi
+    return 0
+}
+
 _ensure_webui_current() {
     [[ -f /etc/systemd/system/droneaware-web.service ]] || return 0
     local ver
