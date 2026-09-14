@@ -10,6 +10,7 @@ VERSION_FILE="${INSTALL_DIR}/version"
 SYSTEMD_UNIT_DIR="/etc/systemd/system"
 CLI_DIR="/usr/local/bin"
 STATE_DIR="/var/lib/droneaware"
+WEBUI_SUDOERS_FILE="/etc/sudoers.d/droneaware-webui"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
 info()    { echo -e "  ${GREEN}✓${NC}  $*"; }
@@ -1551,8 +1552,75 @@ _ensure_unit_files_current() {
     return 0
 }
 
+# The sudoers rule that lets the Web UI run its action buttons. One definition,
+# kept byte-identical to install.sh's by test, and covering every command
+# web_ui.py's ACTIONS table runs through `sudo -n` — also asserted by test.
+#
+# Commands are exact-match WITH their arguments. Granting bare
+# /usr/local/bin/droneaware would also grant `uninstall`.
+_webui_sudoers_rule() {
+    cat <<'SUDOERS'
+droneaware ALL=(root) NOPASSWD: /usr/local/bin/droneaware refresh
+droneaware ALL=(root) NOPASSWD: /usr/local/bin/droneaware swap
+droneaware ALL=(root) NOPASSWD: /usr/local/bin/droneaware update
+droneaware ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff
+SUDOERS
+}
+
+# 🚨 Before v1.6.0.10 this rule reached nodes inconsistently. Everything below
+# was introduced together in v1.6.0:
+#   - install.sh wrote all four commands
+#   - cmd_update wrote only refresh / swap / update, and only when no rule
+#     existed — so a node that updated had no working Shut Down button, and a
+#     rule was never corrected once present
+#   - a node updating from v1.5.x runs its OLD cmd_update, and cmd_install_webui
+#     wrote no rule at all — so those nodes had no working action buttons
+# On nodes where the Web UI runs as its own system account this broke the
+# buttons outright; where the login account is named droneaware and holds
+# blanket sudo, it was invisible.
+#
+# Called from refresh, which every update ends by running from the NEW CLI, so
+# a correction reaches a node on the update that ships it.
+_ensure_webui_sudoers() {
+    [[ -f "${SYSTEMD_UNIT_DIR}/droneaware-web.service" ]] || return 0
+    local tmp
+    tmp=$(mktemp) || return 0
+    _webui_sudoers_rule > "$tmp"
+
+    if [[ -f "$WEBUI_SUDOERS_FILE" ]] && cmp -s "$tmp" "$WEBUI_SUDOERS_FILE"; then
+        rm -f "$tmp"
+        return 0
+    fi
+
+    # A malformed file in /etc/sudoers.d breaks sudo for EVERYONE, on a node the
+    # operator may only reach over SSH. Never install anything visudo has not
+    # accepted — and if visudo is missing, install nothing.
+    if ! command -v visudo >/dev/null 2>&1 || ! visudo -c -f "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        warn "Web UI sudoers rule failed validation — leaving the installed rule unchanged."
+        return 0
+    fi
+
+    # Written beside the target and renamed over it. sudo ignores any file in
+    # sudoers.d whose name contains a '.', so the half-installed copy is never
+    # read, and the rename is atomic.
+    local new
+    new="$(dirname "$WEBUI_SUDOERS_FILE")/.droneaware-webui.new"
+    if install -m 0440 -o root -g root "$tmp" "$new" && mv -f "$new" "$WEBUI_SUDOERS_FILE"; then
+        info "Web UI may run refresh / swap / update / shut down."
+    else
+        rm -f "$new"
+        warn "Could not install the Web UI sudoers rule — its action buttons may not work."
+    fi
+    rm -f "$tmp"
+    return 0
+}
+
 _ensure_webui_current() {
     [[ -f /etc/systemd/system/droneaware-web.service ]] || return 0
+    # Before the version check: the rule does not depend on which release is
+    # installed, and a node with no version file still needs working buttons.
+    _ensure_webui_sudoers
     local ver
     ver=$(cat "$VERSION_FILE" 2>/dev/null | tr -d '[:space:]')
     [[ -n "$ver" ]] || return 0
@@ -1749,24 +1817,9 @@ if candidates:
             warn "Web UI binary will remain at the previously installed version."
         fi
 
-        # Nodes installed before the settings panel have no sudoers rule, so
-        # its Refresh / Swap / Install buttons would fail. Validated before
-        # installing — a malformed file in /etc/sudoers.d locks sudo out.
-        if [[ ! -f /etc/sudoers.d/droneaware-webui ]]; then
-            _sd="$(mktemp)"
-            cat > "$_sd" <<'SUDOERS'
-droneaware ALL=(root) NOPASSWD: /usr/local/bin/droneaware refresh
-droneaware ALL=(root) NOPASSWD: /usr/local/bin/droneaware swap
-droneaware ALL=(root) NOPASSWD: /usr/local/bin/droneaware update
-SUDOERS
-            if visudo -c -f "$_sd" >/dev/null 2>&1; then
-                install -m 0440 -o root -g root "$_sd" /etc/sudoers.d/droneaware-webui
-                info "Web UI may run refresh / swap / update."
-            else
-                warn "sudoers rule failed validation — Web UI buttons unavailable."
-            fi
-            rm -f "$_sd"
-        fi
+        # Grant, or correct, the rule the Web UI's buttons need. See
+        # _ensure_webui_sudoers — this copy used to omit poweroff.
+        _ensure_webui_sudoers
 
         _grant_webui_access
         _ensure_webui_assets "$BASE"
@@ -2800,6 +2853,9 @@ cmd_install_webui() {
     fi
     chown droneaware:droneaware "${INSTALL_DIR}/web_ui" 2>/dev/null || true
     _grant_webui_access
+    # This path used to write no rule at all, leaving every action button broken
+    # on a node that added the Web UI after installing.
+    _ensure_webui_sudoers
 
     # Bump LocalPublisher buffer + add port (idempotent additions).
     if grep -q '^DRONEAWARE_LOCAL_BUFFER_MAX_BYTES=' "${INSTALL_DIR}/config.env"; then

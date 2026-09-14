@@ -1451,8 +1451,10 @@ install_webui() {
         fi
     fi
 
-    # Let the Web UI run the three operator actions its settings panel
-    # offers. Written to a temp file and validated with `visudo -c` BEFORE
+    # Let the Web UI run the operator actions its settings panel offers. The
+    # rule must stay byte-identical to _webui_sudoers_rule in the droneaware
+    # CLI, which refresh uses to grant or correct it on nodes that update —
+    # a test asserts they match. Written to a temp file and validated with `visudo -c` BEFORE
     # being installed: a malformed file in /etc/sudoers.d locks sudo out
     # entirely, and this runs on a node the operator may only reach by SSH.
     #
