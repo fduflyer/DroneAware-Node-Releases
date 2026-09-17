@@ -3,8 +3,9 @@
 # Version: 1.1.3
 # Usage:  sudo bash install.sh
 #
-# Requires: Raspberry Pi OS Bookworm 64-bit, internet connection,
-#           USB BT dongle (UD100 or equivalent), USB WiFi adapter (Alfa AWUS036N or equivalent)
+# Requires: Raspberry Pi OS 64-bit (Trixie recommended; Bookworm supported), internet
+#           connection, USB BT dongle (UD100 or equivalent), USB WiFi adapter (Panda
+#           AC600, or Alfa AWUS036ACS on Trixie only — Bookworm has no driver for it)
 
 set -e
 
@@ -377,7 +378,7 @@ detect_wifi_adapter() {
         warn "No USB WiFi adapter detected."
         warn "Continuing in BLE-only mode — WiFi detection will be disabled."
         warn "The wifi feeder will start, report FAULT status, and produce no detections."
-        warn "To enable WiFi later: connect a USB monitor-mode adapter (e.g. Alfa AWUS036N)"
+        warn "To enable WiFi later: connect a USB monitor-mode adapter (e.g. Panda AC600, or Alfa AWUS036ACS on Trixie)"
         warn "and re-run this installer."
         echo ""
         read -rp "  Continue without a WiFi adapter? [y/N]: " WIFI_SKIP </dev/tty

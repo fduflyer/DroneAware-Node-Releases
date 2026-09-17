@@ -5,6 +5,19 @@
 > **Adapter:** ALFA AWUS036ACH (RTL8812AU chipset, USB-C)  
 > **Status:** ✅ Confirmed working
 
+> **Update, September 2026 — read this before building anything.** These steps
+> were written for the 6.12 kernel, which had no built-in driver for this
+> adapter. Raspberry Pi OS Trixie now ships a 6.18 kernel that includes one
+> (`rtw88_8812au`). On Trixie, update and reboot first
+> (`sudo apt update && sudo apt full-upgrade -y && sudo reboot`), then check
+> `ip link show` for the adapter before following Steps 1–4 — a driver built by
+> hand has to be rebuilt after every kernel update. The built-in driver has not
+> yet been tested with DroneAware on this adapter. On a 6.12 kernel, including
+> Bookworm, the steps below still apply.
+>
+> Since v1.5.0, DroneAware identifies adapters by MAC address. In place of
+> Step 5, run `sudo droneaware refresh`.
+
 ---
 
 This guide was contributed by community member **AndyVickers**, who successfully 

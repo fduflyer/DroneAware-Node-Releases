@@ -27,27 +27,35 @@ Both `dump1090` (FlightAware) and the DroneAware feeder run as independent
 
 ## OS Requirement
 
-> ⚠️ **The DroneAware installer requires Raspberry Pi OS Bookworm 64-bit.**
-> If your FlightAware setup is running an older OS (Buster or Bullseye), you
+> ⚠️ **DroneAware needs Raspberry Pi OS 64-bit. Trixie is recommended.**
+> Bookworm is supported with the Panda AC600, but the Alfa AWUS036ACS will not
+> work on Bookworm — its driver is not in Bookworm's kernel, and no update adds
+> it. If your FlightAware setup is running an older OS (Buster or Bullseye), you
 > will need to reflash and reconfigure before proceeding. Check your OS version
-> with `cat /etc/os-release`.
+> with `grep VERSION_CODENAME /etc/os-release`.
 
 ---
 
 ## Additional Hardware Required
 
-| Item | Recommended | Approx. Cost |
-|---|---|---|
-| USB WiFi adapter | Alfa AWUS036N (Ralink RT3070 chipset) | $15–$20 |
-| External antenna | 2.4 GHz omni, N-female, 5–9 dBi | $8–$15 |
-| Pigtail cable | RP-SMA male to N-male | $5–$8 |
-| **Total upgrade cost** | | **~$28–$43** |
+| Item | Recommended |
+|---|---|
+| USB WiFi adapter | **Panda AC600** (MT7610U) — works on Bookworm and Trixie. On Trixie, the **Alfa AWUS036ACS** is faster. |
+| External antenna (optional) | Dual-band (2.4 + 5 GHz) omni for rooftop or attic placement. Match the connector on your adapter. |
 
-**Why the Alfa AWUS036N?** The RT3070 chipset has native monitor mode
-support in the Pi OS kernel — no additional drivers required. Plug in and go.
+**Why a dual-band adapter?** Drones broadcast Remote ID on both 2.4 GHz and
+5 GHz. A 2.4 GHz-only adapter such as the Alfa AWUS036N still works and sees
+most DJI aircraft, but it cannot see anything broadcasting on 5 GHz. See
+[Which WiFi adapter](../../README.md#which-wifi-adapter) for measured
+comparisons.
 
-If you already have a compatible adapter from a previous project, check
-the [confirmed working adapters list](AWUS036ACH.md) before buying new.
+**Staying on Bookworm?** Use the Panda AC600 — its driver is in both Bookworm
+and Trixie, so it works without any additional drivers. The AWUS036ACS is the
+fastest adapter we've measured, but on Bookworm it shows up in `lsusb` and
+never gets a network interface.
+
+If you already have an adapter from a previous project, check the
+[community hardware guides](README.md) before buying new.
 
 **Optional: Bluetooth adapter**
 Adding a USB Bluetooth dongle (e.g. Sena UD100 with BLE support, or any
@@ -63,9 +71,10 @@ which covers this without any additional hardware.
 The same logic that makes your ADS-B antenna placement good applies here:
 
 - **Higher is better.** Rooftop or attic placement dramatically extends range.
-- **Clear sky view.** Walls and floors attenuate 2.4 GHz signals significantly.
+- **Clear sky view.** Walls and floors attenuate WiFi signals significantly,
+  and 5 GHz more than 2.4 GHz.
 - **Away from WiFi routers.** Your home router operates on the same frequency
-  band. Distance reduces noise.
+  bands. Distance reduces noise.
 
 If your ADS-B antenna is already on your roof, run the DroneAware antenna
 alongside it. Detection range of 1–3 miles is typical; elevated outdoor
@@ -90,40 +99,46 @@ insufficient power — if you see it, upgrade the supply before proceeding.
 Your existing FlightAware setup is untouched. The DroneAware installer adds
 its own service alongside it.
 
-**Step 1 — Plug in the Alfa adapter.**
+**Step 1 — Plug in the USB WiFi adapter.**
 
 **Step 2 — Confirm it's detected:**
 
 ```bash
 lsusb
-# Should show: Ralink Technology, Corp. RT2870/RT3070
+# Panda AC600:     ID 0e8d:7610 MediaTek Inc. WiFi
+# Alfa AWUS036ACS: ID 0bda:0811 Realtek Semiconductor Corp. Realtek 8812AU/8821AU ...
 ```
 
-**Step 3 — Confirm the interface name:**
+**Step 3 — Confirm it has a network interface:**
 
 ```bash
 ip link show
-# Look for wlan1 (your Alfa) alongside wlan0 (onboard chip)
+# Look for a new wlan interface alongside wlan0 (your onboard chip)
 ```
+
+If `lsusb` lists the adapter but no new interface appears, your kernel has no
+driver for it — see [Troubleshooting](#troubleshooting) before running the
+installer.
 
 **Step 4 — Run the DroneAware installer:**
 
 ```bash
-curl -fsSL https://github.com/fduflyer/DroneAware-Node-Releases/releases/download/v1.0.18/install.sh | sudo bash
+curl -fsSL https://github.com/fduflyer/DroneAware-Node-Releases/releases/latest/download/install.sh | sudo bash
 ```
 
-The installer will detect the Alfa on `wlan1` and configure it automatically.
+The installer finds the USB adapter and configures it automatically.
 When prompted for a node name, choose something that identifies your location
 (e.g. `seattle-wa-01`).
 
-**Step 5 — Verify both services are running:**
+**Step 5 — Verify both are running:**
 
 ```bash
-sudo systemctl status droneaware-wifi
+sudo droneaware status
 sudo systemctl status piaware        # or dump1090-fa, depending on your setup
 ```
 
-Both should show `active (running)`.
+`droneaware status` should list your adapter in `monitor` mode as a feeder,
+and `piaware` should show `active (running)`.
 
 ---
 
@@ -143,27 +158,35 @@ more frequently.
 
 **The installer says "No USB WiFi adapter detected"**
 
-The Alfa may have been assigned `wlan0` if the onboard chip was disabled or
-not detected at boot. Check:
+First check whether the Pi sees the adapter at all:
 
 ```bash
+lsusb
 ip link show
 ```
 
-If the Alfa is on `wlan0`, you can either re-enable the onboard chip or edit
-the config after installation:
-
-```bash
-sudo nano /opt/droneaware/config.env
-# Change WIFI_ADAPTER=wlan1 to WIFI_ADAPTER=wlan0
-sudo systemctl restart droneaware-wifi
-```
+- **Not in `lsusb`:** the adapter isn't connecting. Try another USB port or
+  cable, and check your power supply (see [Power Supply Note](#power-supply-note)).
+- **In `lsusb`, but no new `wlan` interface:** your kernel has no driver for
+  it. Run `grep VERSION_CODENAME /etc/os-release`. On `bookworm` with an Alfa
+  AWUS036ACS, no update will fix this — use a Panda AC600, or reflash with
+  Trixie. On `trixie`, update to the current kernel and reboot:
+  `sudo apt update && sudo apt full-upgrade -y && sudo reboot`.
+- **The adapter is carrying your Pi's network connection:** the installer
+  never takes that interface. Connect the Pi over Ethernet or its onboard WiFi
+  instead.
 
 **My node shows "Wi-Fi — Fault"**
 
-The interface name in the config doesn't match where the Alfa actually landed.
-Run `ip link show` to find the correct interface and update
-`/opt/droneaware/config.env` accordingly.
+Run:
+
+```bash
+sudo droneaware refresh
+```
+
+DroneAware identifies adapters by MAC address, so this finds your adapter even
+if its interface name changed after a reboot or a move to another USB port. If
+the fault remains, run `sudo droneaware status` and check the adapter is listed.
 
 **Will DroneAware affect my ADS-B feed quality?**
 

@@ -36,9 +36,10 @@ Once connected, you'll also get real-time email alerts anytime your node(s) dete
 | Item | Notes |
 |---|---|
 | Raspberry Pi 4 (1 GB or more) | 2 GB+ recommended if running other software |
+| Raspberry Pi OS Lite (64-bit) | **Trixie** is recommended, and it is what Raspberry Pi Imager installs today. **Bookworm** (listed in Imager as *Legacy*) is supported with the Panda AC600, but the Alfa AWUS036ACS will not work on Bookworm. |
 | MicroSD card (16 GB+, Class 10) | Samsung Endurance or SanDisk High Endurance preferred |
 | USB Bluetooth adapter | **Sena UD100** (newer variants with Bluetooth 4.0+ only) or any CSR/Cambridge Silicon Radio USB dongle. **Older UD100 variants (G01, G02, G03 and similar) are Bluetooth Classic (BT 2.0/2.1) only and will not work.** If unsure which version you have, the Pi's built-in Bluetooth works out of the box at shorter range. |
-| WiFi adapter (required) | **Alfa AWUS036ACS** (RTL8811AU) or **Panda AC600** (MT7610U). Both are dual-band — see the table below, and note that 2.4 GHz-only adapters cannot see a large share of drones. |
+| WiFi adapter (required) | **Alfa AWUS036ACS** (RTL8811AU) or **Panda AC600** (MT7610U). Both are dual-band — see the table below, and note that 2.4 GHz-only adapters cannot see a large share of drones. The ACS needs Trixie; on Bookworm, use the Panda AC600. |
 | Second WiFi adapter (recommended) | A second dual-band adapter lets the node sweep 5 GHz about seven times faster. See **Two adapters** below. |
 | 5V/3A USB-C power supply | Official Raspberry Pi PSU recommended |
 | Ethernet cable or WiFi credentials | For initial setup |
@@ -62,15 +63,21 @@ same test and same code path:
 
 | Adapter | Chipset | Channel change | Notes |
 |---|---|---|---|
-| **Alfa AWUS036ACS** | RTL8811AU | **22 ms** | Fastest we've measured. The best choice for the 5 GHz sweep. |
-| **Panda AC600** | MT7610U | 111 ms | Inexpensive and works well. |
+| **Alfa AWUS036ACS** | RTL8811AU | **22 ms** | Fastest we've measured. The best choice for the 5 GHz sweep. **Trixie only.** |
+| **Panda AC600** | MT7610U | 111 ms | Inexpensive and works well. Works on Trixie and Bookworm. |
 | Alfa AWUS036ACM | MT7612U | **1007 ms** | Dual-band, but 45x slower to change channel than the ACS. Usable, noticeably worse. |
 | Alfa AWUS036N | RT3070 | — | **2.4 GHz only.** Cannot see any drone broadcasting on 5 GHz. |
 
 The ACS reports as `Realtek 8812AU/8821AU` in `lsusb` and loads the
 `rtw88_8821au` driver. That is not a different adapter — the USB ID and the
-driver are shared across Realtek's 88xx family. Alfa have confirmed the silicon
+driver are shared across Realtek's 88xx family. Alfa has confirmed the silicon
 is the RTL8811AU.
+
+**The ACS needs Raspberry Pi OS Trixie.** Its driver is included in Trixie's
+kernel but not in any Bookworm kernel, and no Bookworm update adds it. On
+Bookworm the adapter appears in `lsusb` but never gets a network interface, so
+the node reports that no WiFi adapter was found. The Panda AC600's driver is in
+both, which makes it the adapter to use if you are staying on Bookworm.
 
 The spread between adapters is larger than anything you can fix in software.
 In a side-by-side test, identical code on the ACM captured 51% of a drone's
@@ -141,7 +148,16 @@ heartbeat to the server every 60 seconds so the dashboard shows the node as
 online. Detections are forwarded to the DroneAware server in real time and also
 written to a local ring buffer (`/run/droneaware/detections.jsonl`) stored in
 RAM — the last 60 minutes of detections are kept on the Pi and purged
-automatically. Nothing is written to the SD card.
+automatically.
+
+From v1.6, the node also keeps its own detection history on the SD card
+(`/var/lib/droneaware/spool`), so detections survive a lost internet connection
+or a reboot and upload once the node is back online. A sudden power cut can
+lose the last few seconds. Writes are batched about every 15 seconds to spare
+the card. Uploaded detections are kept for 90 days and the whole history is
+capped at 4 GB — both adjustable under **History** in the Web UI settings.
+Detections that have not been uploaded yet are never deleted because of their
+age.
 
 **What data is collected?**
 Only data broadcast publicly by the drones themselves via FAA-mandated Remote ID
@@ -168,6 +184,8 @@ DroneAware server to correctly place detections on the map.
 
 1. Download **[Raspberry Pi Imager](https://www.raspberrypi.com/software/)** on your computer.
 2. Click **Choose OS → Raspberry Pi OS (other) → Raspberry Pi OS Lite (64-bit)**.
+   This installs **Trixie**, the recommended version. Avoid the *Legacy* images
+   unless you need to stay on Bookworm — they cannot use the Alfa AWUS036ACS.
 3. Click the **gear icon** (Advanced Options) and configure:
    - Set hostname: e.g. `droneaware-node`
    - Enable SSH and set a username/password
@@ -545,6 +563,24 @@ This is normal — there may simply be no drones broadcasting Remote ID nearby.
 Remote ID is only required for drones registered after September 2023, and most
 recreational fliers are not yet compliant. Detection depends entirely on local
 drone activity.
+
+**My WiFi adapter shows in `lsusb`, but the node says no adapter was found**
+The adapter is on the USB bus, but the kernel has no driver for it, so it never
+gets a network interface. Check which OS and kernel you are running:
+```bash
+grep VERSION_CODENAME /etc/os-release
+uname -r
+```
+- **`bookworm` with an Alfa AWUS036ACS:** no update will fix this, because
+  Bookworm's kernels do not include the ACS driver. Reflash with Raspberry Pi
+  OS Lite (64-bit), which is Trixie, or use a Panda AC600.
+- **`trixie` with a kernel starting `6.12`:** update to the current kernel —
+  over Ethernet if you can, since this also updates the onboard WiFi firmware:
+  ```bash
+  sudo apt update && sudo apt full-upgrade -y && sudo reboot
+  ```
+
+Once the adapter appears in `ip link show`, run `sudo droneaware refresh`.
 
 **WiFi feeder fails to start or keeps restarting**
 ```bash

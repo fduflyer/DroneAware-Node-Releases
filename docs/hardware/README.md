@@ -3,8 +3,11 @@
 These guides are contributed by DroneAware community members who have successfully 
 run the node software on non-standard or advanced hardware configurations.
 
-The standard supported setup is **Raspberry Pi 4** running **Raspberry Pi OS Bookworm 64-bit** 
-with an **Alfa AWUS036N** or **AWUS036NHA**. Everything in this folder is beyond that baseline.
+The standard supported setup is a **Raspberry Pi 4** running **Raspberry Pi OS Trixie 64-bit**
+with an **Alfa AWUS036ACS** or **Panda AC600** — see
+[Which WiFi adapter](../../README.md#which-wifi-adapter). Bookworm is also supported with the
+Panda AC600, but the AWUS036ACS will not work on Bookworm. Everything in this folder is beyond
+that baseline.
 
 ## Confirmed Working
 
