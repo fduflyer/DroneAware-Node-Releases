@@ -296,8 +296,22 @@ CONFIG_SCHEMA = [
     # reassigns them on every refresh, so a hand-typed MAC silently reverts —
     # the exact trap `droneaware swap` was built to close. Rendered as live
     # hardware plus a Swap button instead; see /api/adapters.
+    #
+    # Bluetooth is the same trap: droneaware-bt-select rewrites BLE_ADAPTER
+    # and BLE_ADAPTER_MAC at every boot, so the free-text "Bluetooth adapter"
+    # field this replaces could never take effect. The operator chooses the
+    # policy instead, and the selector honors it.
     {"group": "Radios", "widget": "adapters", "fields": [
-        {"key": "BLE_ADAPTER", "label": "Bluetooth adapter", "type": "text"},
+        {"key": "BLE_ADAPTER_MODE", "default": "auto", "label": "Bluetooth adapter",
+         "type": "select",
+         "options": [["auto", "Automatic"], ["usb", "USB dongle"],
+                     ["onboard", "Built-in"]],
+         "info": "Automatic uses a USB Bluetooth dongle when one is working, "
+                 "and the Pi's built-in radio otherwise. Choose USB dongle or "
+                 "Built-in to make the choice yourself — for example to keep "
+                 "using a dongle the node cannot see. Applies when you press "
+                 "Refresh. On a Raspberry Pi, turning the built-in radio on "
+                 "or off also needs a reboot."},
     ]},
     # "default" mirrors wifi_feeder.py ScanPlanHopper.DEFAULT_* (~line 1426-1468).
     # Duplicated across a process boundary because the feeder is a separate
@@ -416,6 +430,8 @@ CONFIG_SCHEMA = [
 CONFIG_EDITABLE = frozenset(
     f["key"] for g in CONFIG_SCHEMA for f in g["fields"]
 ) - CONFIG_SECRETS
+
+CONFIG_FIELDS = {f["key"]: f for g in CONFIG_SCHEMA for f in g["fields"]}
 
 # ── Offline map region packs (v1.6.0) ────────────────────────────────────────
 # The bundled world bundle is zoom 0-6: a global overview, far too coarse to
@@ -2008,6 +2024,12 @@ def api_config_set():
         v = "" if v is None else str(v)
         # A newline would let one field forge additional config lines.
         if "\n" in v or "\r" in v:
+            return jsonify({"error": "invalid_value", "key": k}), 400
+        # A choice field accepts only its listed values (or empty, meaning the
+        # default). Its consumers are shell scripts that would otherwise act
+        # on whatever arrived.
+        options = CONFIG_FIELDS.get(k, {}).get("options")
+        if options and v.strip() and v.strip() not in {o[0] for o in options}:
             return jsonify({"error": "invalid_value", "key": k}), 400
         clean[k] = v.strip()
 

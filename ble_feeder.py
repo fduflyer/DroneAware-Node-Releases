@@ -446,10 +446,224 @@ def _scanning_alive(feeder) -> bool:
     quiet one -- and it is the ONLY thing derived from the advertisement count
     that leaves the node. The count itself stays local.
     """
+    # BlueZ saying it is not discovering is definitive, and the watchdog learns
+    # it within a poll or two. Without this a bluetoothd restart kept reporting
+    # scanning=True for the whole silence window while the radio heard nothing.
+    if getattr(feeder, "discovering", None) is False:
+        return False
     last = getattr(feeder, "last_adv_mono", None)
     if last is None:
         return False
     return (time.monotonic() - last) <= BLE_SILENCE_RESTART_SEC
+
+
+# -- Scan Watchdog -------------------------------------------------------------
+#
+# A scan can die while the adapter still reports UP RUNNING. Reproduced on
+# demand: `systemctl restart bluetooth` under a live scanner drops it to zero
+# advertisements for good, and BlueZ's own `Discovering` property flips to
+# false. Rebuilding the scanner inside the same process brings it back.
+#
+# Two signals, deliberately treated differently:
+#   - BlueZ says it is NOT discovering while we believe we are scanning. That
+#     is never a quiet field, so act within a couple of polls.
+#   - BlueZ says it IS discovering, but nothing has been heard for a long time.
+#     That may be a node alone in a field, so act slowly and back off.
+#
+# Both escalate through one ladder, a step per consecutive attempt that did not
+# bring advertisements back. Hearing anything at all resets it.
+
+SCAN_TICK_SEC = 1.0              # main loop cadence: flushes and lag tracking
+SCAN_CHECK_INTERVAL_SEC = 30     # how often BlueZ's Discovering is polled
+SCANNER_START_TIMEOUT_SEC = 20
+SCANNER_STOP_TIMEOUT_SEC = 10
+ADAPTER_RETURN_TIMEOUT_SEC = 20  # wait for the adapter after a power-cycle/restart
+
+SCAN_ACTIONS = ("rebuild", "power_cycle", "restart_bluetooth")
+_SCAN_ACTION_TEXT = {
+    "rebuild":           "rebuilding the scan",
+    "power_cycle":       "power-cycling the adapter, then rebuilding the scan",
+    "restart_bluetooth": "restarting bluetooth.service, then rebuilding the scan",
+}
+# Seconds to wait before each consecutive attempt. The last entry repeats.
+NOT_DISCOVERING_WAIT_SEC = (30, 5 * 60, 15 * 60, 60 * 60)
+SILENT_WAIT_SEC = (BLE_SILENCE_RESTART_SEC, 30 * 60, 60 * 60)
+# Silence alone never escalates past power-cycling the adapter. Restarting
+# bluetooth.service every hour does nothing for a radio that simply has nothing
+# to hear, and BlueZ still saying "discovering" means the service is not the
+# problem.
+SILENT_MAX_ACTION = 1
+
+
+def _step(table, n: int):
+    return table[min(n, len(table) - 1)]
+
+
+class _ScanWatchdog:
+    """Decides when a scan is dead and what to try next. Touches nothing.
+
+    Kept free of BlueZ and asyncio so the policy can be exercised directly.
+    The check it replaces had two defects that reading the code did not catch:
+    it rebuilt the scanner every second once tripped, and it never tried at all
+    for a scan that was dead from the moment the feeder started.
+    """
+
+    def __init__(self):
+        self.failures = 0               # consecutive attempts that did not help
+        self.recoveries = 0             # total this process, local status only
+        self.scan_started = None        # monotonic time the current scan began
+        self.not_discovering_since = None
+
+    def started(self, now: float) -> None:
+        self.scan_started = now
+        self.not_discovering_since = None
+
+    def heard(self) -> None:
+        self.failures = 0
+
+    def acted(self) -> None:
+        self.failures += 1
+        self.recoveries += 1
+
+    def decide(self, now: float, last_adv: float | None,
+               discovering: bool | None) -> tuple[str, str] | None:
+        """(action, reason) when the scan should be recovered, else None.
+
+        `discovering` is BlueZ's Discovering property: True, False, or None when
+        it could not be read -- then only silence counts.
+        """
+        if discovering is False:
+            if self.not_discovering_since is None:
+                self.not_discovering_since = now
+            waited = now - self.not_discovering_since
+            if waited >= _step(NOT_DISCOVERING_WAIT_SEC, self.failures):
+                return (_step(SCAN_ACTIONS, self.failures),
+                        f"BlueZ reports the adapter is not discovering "
+                        f"(for {int(waited)}s)")
+            return None
+
+        self.not_discovering_since = None
+        # Silence runs from whichever is later: the last advertisement, or the
+        # start of THIS scan. Counting from the last advertisement alone is what
+        # made the old check rebuild every second -- each new scanner inherited
+        # all the silence that came before it and tripped again at once.
+        since = now if self.scan_started is None else self.scan_started
+        if last_adv is not None and last_adv > since:
+            since = last_adv
+        silence = now - since
+        if silence >= _step(SILENT_WAIT_SEC, self.failures):
+            return (SCAN_ACTIONS[min(self.failures, SILENT_MAX_ACTION)],
+                    f"no BLE advertisements of any kind for {int(silence)}s")
+        return None
+
+
+# busctl's wording when there is nothing to ask: the adapter is not in BlueZ
+# ("Method \"Get\" ... doesn't exist" -- not "Unknown object"), the interface is
+# gone, or BlueZ is not on the bus at all. Each means nothing is scanning.
+# Captured from a real node rather than assumed.
+_NOT_DISCOVERING_ERRORS = (
+    "doesn't exist",
+    "no such interface",
+    "not provided by any .service",
+    "has no owner",
+)
+
+
+def _parse_discovering(returncode: int, stdout: str, stderr: str) -> bool | None:
+    """Interpret `busctl get-property ... org.bluez.Adapter1 Discovering`.
+
+    None when the answer cannot be known (an unexpected reply or error), so the
+    caller falls back to silence alone instead of acting on a guess.
+    """
+    if returncode == 0:
+        out = (stdout or "").strip()
+        if out == "b true":
+            return True
+        if out == "b false":
+            return False
+        return None
+    err = (stderr or "").lower()
+    if any(marker in err for marker in _NOT_DISCOVERING_ERRORS):
+        return False
+    return None
+
+
+async def _run_command(*cmd: str, timeout: float) -> tuple[int | None, str, str]:
+    """Run a command without blocking the event loop.
+
+    (returncode, stdout, stderr); returncode is None if it could not run or
+    timed out. Never raises.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    except OSError:
+        return None, "", ""
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        return None, "", ""
+    return (proc.returncode, out.decode(errors="replace"),
+            err.decode(errors="replace"))
+
+
+async def _bluez_discovering(adapter: str) -> bool | None:
+    rc, out, err = await _run_command(
+        "busctl", "get-property", "org.bluez", f"/org/bluez/{adapter}",
+        "org.bluez.Adapter1", "Discovering", timeout=5)
+    if rc is None:
+        return None
+    return _parse_discovering(rc, out, err)
+
+
+async def _wait_for_adapter(adapter: str, timeout: float) -> bool:
+    """True once BlueZ reports the adapter powered again."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rc, out, _ = await _run_command(
+            "busctl", "get-property", "org.bluez", f"/org/bluez/{adapter}",
+            "org.bluez.Adapter1", "Powered", timeout=5)
+        if rc == 0 and out.strip() == "b true":
+            return True
+        await asyncio.sleep(1)
+    return False
+
+
+async def _recover_scan(adapter: str, action: str) -> None:
+    """Carry out one watchdog step. Best-effort by design: the scanner is
+    rebuilt afterwards whatever happens here, and the next poll judges whether
+    it worked."""
+    if action == "power_cycle":
+        path = f"/org/bluez/{adapter}"
+        off, _, _ = await _run_command(
+            "busctl", "set-property", "org.bluez", path, "org.bluez.Adapter1",
+            "Powered", "b", "false", timeout=10)
+        await asyncio.sleep(2)
+        on, _, _ = await _run_command(
+            "busctl", "set-property", "org.bluez", path, "org.bluez.Adapter1",
+            "Powered", "b", "true", timeout=10)
+        if off != 0 or on != 0:
+            # BlueZ could not do it, so go underneath BlueZ.
+            log.warning(f"[Liveness] BlueZ could not power-cycle {adapter}; "
+                        f"using hciconfig down/up instead")
+            await _run_command("hciconfig", adapter, "down", timeout=5)
+            await asyncio.sleep(2)
+            await _run_command("hciconfig", adapter, "up", timeout=5)
+    elif action == "restart_bluetooth":
+        rc, _, err = await _run_command("systemctl", "restart", "bluetooth",
+                                        timeout=30)
+        if rc != 0:
+            log.warning(f"[Liveness] systemctl restart bluetooth failed "
+                        f"(rc={rc}): {err.strip()[:200]}")
+    if action != "rebuild":
+        if not await _wait_for_adapter(adapter, ADAPTER_RETURN_TIMEOUT_SEC):
+            log.warning(f"[Liveness] {adapter} did not report powered within "
+                        f"{ADAPTER_RETURN_TIMEOUT_SEC}s; rebuilding anyway")
 
 
 async def _attempt_ble_recovery(adapter: str) -> bool:
@@ -1268,8 +1482,17 @@ class BLEFeeder:
         # reception and retains nothing: no address, no name, no payload. The
         # count stays on the node; only a boolean reaches the server.
         self.adv_total      = 0          # every advertisement, local only
-        self.adv_ever_seen  = False      # gate for self-heal, see below
         self.last_adv_mono  = None
+
+        # v1.6.1 — decides when the scan is dead and how to recover it; see
+        # _ScanWatchdog. `discovering` is BlueZ's last-polled Discovering
+        # property (None until read, or when it cannot be).
+        self.watchdog       = _ScanWatchdog()
+        self.discovering    = None
+        # True while _fault_loop runs. That loop sends its own FAULT
+        # heartbeats, and the scanning heartbeat task now lives for the whole
+        # process, so it stands aside rather than double-reporting.
+        self.in_fault       = False
 
     def on_advertisement(self, device: BLEDevice, adv: AdvertisementData):
         """Callback for every BLE advertisement the adapter receives.
@@ -1281,8 +1504,11 @@ class BLEFeeder:
         # about the advertisement is read, kept or logged unless it turns out
         # to be Remote ID below.
         self.adv_total += 1
-        self.adv_ever_seen = True
         self.last_adv_mono = time.monotonic()
+        if self.watchdog.failures:
+            log.warning(f"[Liveness] BLE advertisements arriving again after "
+                        f"{self.watchdog.failures} recovery attempt(s)")
+            self.watchdog.heard()
 
         # Locate the FFFA service data entry
         svc_data  = None
@@ -1386,6 +1612,13 @@ class BLEFeeder:
         someone restarted the service — the same gap the WiFi feeder had.
         """
         log.warning(f"[FAULT] ble feeder running in degraded mode: {reason}")
+        self.in_fault = True
+        try:
+            return await self._fault_loop_body(reason)
+        finally:
+            self.in_fault = False
+
+    async def _fault_loop_body(self, reason: str) -> bool:
         while True:
             try:
                 await asyncio.sleep(60)
@@ -1456,9 +1689,29 @@ class BLEFeeder:
         `_run_once` returns False when the adapter recovered and setup should
         be retried, True when finished. A loop rather than recursion: a
         flapping adapter would otherwise add a stack frame per recovery.
+
+        v1.6.1: the heartbeat task is created HERE, once for the life of the
+        process. It used to be created inside `_run_once` and cancelled on
+        the way out, and its first write comes 60 s after it starts -- so a
+        feeder rebuilding its scan every second never wrote ble_state.json,
+        never sent a heartbeat and never marked the spool live. The local UI
+        showed "state stale" while the server kept the last heartbeat and
+        said all was well.
         """
-        while not await self._run_once():
-            log.info("[RECOVERY] restarting BLE scan setup with the recovered adapter")
+        # v1.4.8: heartbeat runs in its own asyncio task, independent of the
+        # scanner loop. Even if the scanner loop is saturated processing
+        # advertisement callbacks (as phillyrox was 2026-07-16), the heartbeat
+        # coroutine still gets its own turn on the event loop.
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        try:
+            while not await self._run_once():
+                log.info("[RECOVERY] restarting BLE scan setup")
+        finally:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     async def _run_once(self) -> bool:
         log.info(f"DroneAware BLE Feeder - Node: {self.node_id}  Adapter: {self.adapter}")
@@ -1493,71 +1746,74 @@ class BLEFeeder:
             adapter=self.adapter,
         )
 
-        # v1.4.8: heartbeat runs in its own asyncio task, independent of
-        # the scanner loop. Even if the scanner loop is saturated processing
-        # advertisement callbacks (as phillyrox was 2026-07-16), the
-        # heartbeat coroutine still gets its own turn on the event loop.
-        # Scanner-loop flushes go through asyncio.to_thread so the sync
-        # requests.post inside Forwarder._flush never blocks the loop
-        # dispatch. Both changes together should make it impossible for
-        # a single burst of BLE traffic to make a node go silent from
-        # the server's perspective.
-        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        # Started and stopped explicitly rather than with `async with`. A scan
+        # killed by a bluetoothd restart makes stop() RAISE ("No discovery
+        # started"); inside `async with` that escaped the feeder and crashed
+        # it. And a start that fails is now just a scan that is not
+        # discovering, which the watchdog below already knows how to recover,
+        # instead of an exception that takes down the heartbeat with it.
+        self.watchdog.started(time.monotonic())
+        # The last reading described the scanner being replaced. Kept, it would
+        # report "not scanning" for up to a poll after a successful rebuild,
+        # while advertisements were already flowing again.
+        self.discovering = None
         try:
-            async with scanner:
-                last_tick_time = time.monotonic()
-                while True:
-                    await asyncio.sleep(1.0)
+            await asyncio.wait_for(scanner.start(), SCANNER_START_TIMEOUT_SEC)
+        except Exception as e:
+            log.warning(f"[Liveness] BLE scan did not start on {self.adapter}: {e}")
 
-                    # Measure event loop lag: how much MORE than 1.0s the
-                    # scheduled sleep actually took. Under healthy load
-                    # this is 0-20ms. Under saturation (phillyrox-style)
-                    # this climbs into the thousands of ms.
-                    now = time.monotonic()
-                    lag_ms = max(0, int((now - last_tick_time - 1.0) * 1000))
-                    if lag_ms > self.max_lag_ms_this_interval:
-                        self.max_lag_ms_this_interval = lag_ms
-                    last_tick_time = now
+        decision = None
+        try:
+            last_tick_time = time.monotonic()
+            next_check = last_tick_time + SCAN_CHECK_INTERVAL_SEC
+            while True:
+                await asyncio.sleep(SCAN_TICK_SEC)
 
-                    # Liveness. If the radio has heard nothing whatsoever for
-                    # BLE_SILENCE_RESTART_SEC, the scan is dead even though
-                    # hciconfig still says UP RUNNING — rebuild it. Returning
-                    # False hands control back to run()'s retry wrapper, the
-                    # same path adapter recovery already uses.
-                    #
-                    # Gated on having seen at least one advertisement since
-                    # start. A node genuinely alone in a field would otherwise
-                    # rebuild its scanner every 15 minutes forever, achieving
-                    # nothing; it reports scanning=False instead, which is
-                    # visible and does not thrash. The failure this fixes —
-                    # working, then orphaned — always has traffic before the
-                    # silence.
-                    if (self.adv_ever_seen and self.last_adv_mono is not None
-                            and now - self.last_adv_mono > BLE_SILENCE_RESTART_SEC):
-                        log.warning(
-                            f"[Liveness] No BLE advertisements of any kind for "
-                            f"{int(now - self.last_adv_mono)}s while the adapter "
-                            f"reports UP RUNNING — the scan is dead. Rebuilding."
-                        )
-                        return False
+                # Measure event loop lag: how much MORE than one tick the
+                # scheduled sleep actually took. Under healthy load this is
+                # 0-20ms. Under saturation (phillyrox-style) it climbs into the
+                # thousands of ms.
+                now = time.monotonic()
+                lag_ms = max(0, int((now - last_tick_time - SCAN_TICK_SEC) * 1000))
+                if lag_ms > self.max_lag_ms_this_interval:
+                    self.max_lag_ms_this_interval = lag_ms
+                last_tick_time = now
 
-                    # Flush via a worker thread — sync requests.post inside
-                    # Forwarder._flush no longer blocks the async loop.
-                    if self.forwarder.should_flush():
-                        try:
-                            await asyncio.to_thread(self.forwarder._flush)
-                        except Exception as e:
-                            log.warning(f"Forwarder flush task failed: {e}")
+                # Liveness: ask BlueZ whether it is still discovering, and let
+                # the watchdog weigh that against how long the radio has been
+                # silent. hciconfig saying UP RUNNING proves nothing here.
+                if now >= next_check:
+                    next_check = now + SCAN_CHECK_INTERVAL_SEC
+                    self.discovering = await _bluez_discovering(self.adapter)
+                    decision = self.watchdog.decide(
+                        time.monotonic(), self.last_adv_mono, self.discovering)
+                    if decision:
+                        break
+
+                # Flush via a worker thread — sync requests.post inside
+                # Forwarder._flush never blocks the async loop.
+                if self.forwarder.should_flush():
+                    try:
+                        await asyncio.to_thread(self.forwarder._flush)
+                    except Exception as e:
+                        log.warning(f"Forwarder flush task failed: {e}")
         finally:
-            heartbeat_task.cancel()
             try:
-                await heartbeat_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        # Scanning ended by shutdown, not by a recoverable adapter fault.
-        # Returning None here would read as falsy and restart setup in a
-        # tight loop — the same trap as on the WiFi side.
-        return True
+                await asyncio.wait_for(scanner.stop(), SCANNER_STOP_TIMEOUT_SEC)
+            except Exception as e:
+                # Expected when the scan is already dead.
+                log.debug(f"[Liveness] stopping the old scanner: {e}")
+
+        action, reason = decision
+        self.watchdog.acted()
+        log.warning(
+            f"[Liveness] {reason} on {self.adapter} — "
+            f"{_SCAN_ACTION_TEXT[action]} (attempt {self.watchdog.failures})"
+        )
+        await _recover_scan(self.adapter, action)
+        # False hands control back to run(), which rebuilds the scan — the same
+        # path adapter recovery already uses.
+        return False
 
     def _write_ble_state(self, ble_ok: bool, adapter: str | None,
                          fault: str | None = None):
@@ -1602,6 +1858,13 @@ class BLEFeeder:
                                if getattr(self, "last_adv_mono", None) is not None
                                else None),
                 "scanning":   _scanning_alive(self),
+                # Local only. BlueZ's own Discovering property as last polled
+                # (None until read), and how many times this process has had
+                # to recover its scan -- the first two things to look at when
+                # a node reports BLE not scanning.
+                "discovering":    getattr(self, "discovering", None),
+                "scan_recoveries": getattr(getattr(self, "watchdog", None),
+                                           "recoveries", 0),
                 # Seconds this node's clock is behind the GPS time aircraft
                 # broadcast; positive means SLOW. None until several agree.
                 # Local only, like adv_total. Same field wifi_feeder writes to
@@ -1638,6 +1901,11 @@ class BLEFeeder:
                 await asyncio.sleep(60)
             except asyncio.CancelledError:
                 return
+
+            # _fault_loop sends its own FAULT heartbeats and state. This task
+            # lives for the whole process now, so it stands aside meanwhile.
+            if self.in_fault:
+                continue
 
             try:
                 # Mark this bucket as "the node was up and recording". Set here

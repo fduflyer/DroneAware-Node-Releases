@@ -3604,6 +3604,18 @@ ${multiSerialHTML}
             input.appendChild(o);
           }
           input.value = String(value).toLowerCase() === "true" ? "true" : "false";
+        } else if (f.type === "select") {
+          input = document.createElement("select");
+          for (const [v, text] of f.options || []) {
+            const o = document.createElement("option");
+            o.value = v;
+            o.textContent = text;
+            input.appendChild(o);
+          }
+          // An unset or unrecognized value shows the default rather than a
+          // blank select, which would save as an empty string.
+          const known = (f.options || []).some(([v]) => v === String(value));
+          input.value = known ? String(value) : (f.default ?? f.options?.[0]?.[0] ?? "");
         } else {
           input = document.createElement("input");
           input.type = (f.type === "number" || f.type === "megabytes")

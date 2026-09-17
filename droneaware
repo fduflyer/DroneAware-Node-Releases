@@ -1355,13 +1355,14 @@ cmd_refresh() {
     echo -e "${BOLD}DroneAware Refresh${NC}"
     echo ""
     echo "  Re-detecting hardware and syncing configuration..."
-    echo "  (unit files, WiFi adapters, GPS protocol, gpsd conflict, NM config, service topology)"
+    echo "  (unit files, WiFi adapters, Bluetooth adapter, GPS protocol, gpsd conflict, NM config, service topology)"
     echo ""
     # Unit files FIRST, so everything after — including the orchestration inside
     # migrate_config_env that starts and stops the WiFi units — works from the
     # installed version's definitions. Runs once per version; free otherwise.
     _ensure_unit_files_current
     migrate_config_env
+    _refresh_bt_adapter
     # Fetch anything this version ships that the node has not got yet. Safe to
     # call every time: each item is skipped when already present.
     _ensure_webui_current
@@ -1378,6 +1379,32 @@ cmd_refresh() {
         echo "    no WiFi services active — check 'sudo droneaware gps-diagnose' and 'sudo droneaware status'"
     fi
     echo ""
+}
+
+# Re-run the Bluetooth adapter selection that otherwise only runs at boot, so a
+# changed BLE_ADAPTER_MODE (Settings, or config.env by hand) or a dongle plugged
+# in since boot takes effect now rather than after a reboot.
+#
+# --no-reboot: refresh also runs at the end of every `update`, and a node must
+# never reboot in the middle of one. A needed config.txt change is still made
+# and applies on the next boot, which the selector says.
+#
+# Restarts the BLE feeder only when the adapter it should use actually changed.
+_refresh_bt_adapter() {
+    local selector="${CLI_DIR}/droneaware-bt-select"
+    [[ -x "$selector" ]] || return 0
+    local before after
+    before=$(grep -E '^BLE_ADAPTER(_MAC)?=' "${INSTALL_DIR}/config.env" 2>/dev/null)
+    echo "  Checking the Bluetooth adapter..."
+    "$selector" --no-reboot 2>&1 | sed 's/^/    /'
+    after=$(grep -E '^BLE_ADAPTER(_MAC)?=' "${INSTALL_DIR}/config.env" 2>/dev/null)
+    if [[ "$before" != "$after" ]] && systemctl is-enabled --quiet droneaware-ble.service 2>/dev/null; then
+        if systemctl restart droneaware-ble.service 2>/dev/null; then
+            info "Bluetooth adapter changed — restarted droneaware-ble"
+        else
+            warn "Bluetooth adapter changed, but droneaware-ble did not restart — run: sudo systemctl restart droneaware-ble"
+        fi
+    fi
 }
 
 # Assets the Web UI needs that are not the feeders themselves. Split out and

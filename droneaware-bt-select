@@ -1,118 +1,277 @@
 #!/bin/bash
 # droneaware-bt-select
-# Runs at every boot. Detects whether a USB BT dongle is present.
-# - USB dongle present  → disable onboard BT (dtoverlay=disable-bt in config.txt)
-# - No USB dongle       → enable onboard BT (remove the overlay)
-# If config.txt needs to change, rewrites it and reboots.
-# On a correct boot, writes the active adapter MAC to config.env.
+# Chooses the Bluetooth adapter the BLE feeder uses. Runs at every boot, and
+# from `droneaware refresh` with --no-reboot.
+#
+# BLE_ADAPTER_MODE in config.env:
+#   auto     (default) use a USB dongle when one is working, otherwise the
+#            Pi's built-in radio
+#   usb      always the USB dongle; never turn the built-in radio back on
+#   onboard  always the built-in radio; never turn it off
+#
+# Using a dongle on a Raspberry Pi turns the built-in radio off with an overlay
+# in config.txt (disable-bt, or disable-bt-pi5 on a Pi 5). That only takes
+# effect after a reboot, so a change to it reboots -- unless --no-reboot.
+#
+# Writes the chosen adapter to BLE_ADAPTER / BLE_ADAPTER_MAC in config.env.
+#
+# Usage: droneaware-bt-select [--no-reboot] [--dry-run]
+#
+# v1.6.1: this used to look for a USB adapter exactly once, with no wait, and
+# REMOVE the overlay whenever none was registered at that instant -- so a dongle
+# that was plugged in but slow, or had no working driver, turned the built-in
+# radio back on and pinned BLE to it on every boot, overriding the operator. It
+# also wrote config.txt and "rebooted" on hosts that are not a Pi at all.
 
-CONFIG_TXT="/boot/firmware/config.txt"
-DA_CONFIG="/opt/droneaware/config.env"
-OVERLAY="dtoverlay=disable-bt"
+CONFIG_TXT="${DA_CONFIG_TXT:-/boot/firmware/config.txt}"
+DA_CONFIG="${DA_CONFIG_ENV:-/opt/droneaware/config.env}"
+SYSFS="${DA_SYSFS:-/sys}"
+MODEL_FILE="${DA_MODEL_FILE:-/proc/device-tree/model}"
+STATE_DIR="${DA_STATE_DIR:-/var/lib/droneaware}"
+# A dongle that is on the USB bus has not necessarily registered its Bluetooth
+# adapter yet. Measured at 0.27 s on a CSR dongle, but firmware-loading chips
+# take longer, so wait this long before concluding it never will.
+USB_WAIT_SEC="${DA_BT_USB_WAIT_SEC:-20}"
+# Consecutive boots allowed to flip the overlay back and forth before refusing.
+MAX_FLIPS=2
 
-log()  { echo "$*"; }
-fatal(){ log "FATAL: $1"; exit 1; }
-
-# ---------------------------------------------------------------------------
-# 1. Detect USB BT adapter
-#    A USB-connected hci device has its subsystem symlink pointing into /usb
-# ---------------------------------------------------------------------------
-USB_HCI=""
-USB_MAC=""
-ONBOARD_HCI=""
-ONBOARD_MAC=""
-
-for hci_path in /sys/class/bluetooth/hci*/; do
-    [[ -d "$hci_path" ]] || continue
-    hci=$(basename "$hci_path")
-    subsystem=$(readlink -f "$hci_path/device/subsystem" 2>/dev/null)
-    mac=$(cat "$hci_path/address" 2>/dev/null)
-
-    if [[ "$subsystem" == */usb* ]]; then
-        USB_HCI="$hci"
-        USB_MAC="$mac"
-    else
-        ONBOARD_HCI="$hci"
-        ONBOARD_MAC="$mac"
-    fi
+NO_REBOOT=0
+DRY_RUN=0
+for arg in "$@"; do
+    case "$arg" in
+        --no-reboot) NO_REBOOT=1 ;;
+        --dry-run)   DRY_RUN=1 ;;
+        *) echo "usage: $0 [--no-reboot] [--dry-run]" >&2; exit 2 ;;
+    esac
 done
 
-log "Scan results: USB_HCI=${USB_HCI:-none} ONBOARD_HCI=${ONBOARD_HCI:-none}"
+log() { echo "$*"; }
 
 # ---------------------------------------------------------------------------
-# 2. Check current config.txt state
+# 1. What is plugged in, and what has registered
 # ---------------------------------------------------------------------------
-overlay_set=false
-grep -qF "$OVERLAY" "$CONFIG_TXT" 2>/dev/null && overlay_set=true
 
-log "config.txt disable-bt overlay: $overlay_set"
+# Registered Bluetooth adapters, split by bus. Lowest index wins within a bus.
+scan_hci() {
+    USB_HCI=""; USB_MAC=""; ONBOARD_HCI=""; ONBOARD_MAC=""
+    local hci_path hci subsystem mac
+    for hci_path in "$SYSFS"/class/bluetooth/hci*; do
+        [[ -e "$hci_path" ]] || continue
+        hci=$(basename "$hci_path")
+        subsystem=$(readlink -f "$hci_path/device/subsystem" 2>/dev/null)
+        mac=$(cat "$hci_path/address" 2>/dev/null)
+        if [[ "$subsystem" == */bus/usb ]]; then
+            [[ -z "$USB_HCI" ]] && { USB_HCI="$hci"; USB_MAC="$mac"; }
+        else
+            [[ -z "$ONBOARD_HCI" ]] && { ONBOARD_HCI="$hci"; ONBOARD_MAC="$mac"; }
+        fi
+    done
+}
 
-# ---------------------------------------------------------------------------
-# 3. Decide if a change is needed
-# ---------------------------------------------------------------------------
-reboot_needed=false
+# USB Bluetooth controllers present on the bus, whether or not a driver has
+# registered an adapter for them: interface class e0 (wireless), subclass 01
+# (RF), protocol 01 (Bluetooth). Prints vendor:product, one per device.
+usb_bt_devices() {
+    local intf dev
+    for intf in "$SYSFS"/bus/usb/devices/*:*; do
+        [[ -r "$intf/bInterfaceClass" ]] || continue
+        [[ "$(cat "$intf/bInterfaceClass")"    == "e0" ]] || continue
+        [[ "$(cat "$intf/bInterfaceSubClass")" == "01" ]] || continue
+        [[ "$(cat "$intf/bInterfaceProtocol")" == "01" ]] || continue
+        dev="${intf%:*}"
+        echo "$(cat "$dev/idVendor" 2>/dev/null):$(cat "$dev/idProduct" 2>/dev/null)"
+    done | sort -u | paste -sd' ' -
+}
 
-if [[ -n "$USB_HCI" ]] && ! $overlay_set; then
-    # USB dongle present but onboard BT not yet disabled → add overlay
-    log "USB BT dongle detected ($USB_MAC) but onboard BT is still enabled."
-    log "Adding '$OVERLAY' to $CONFIG_TXT and rebooting..."
-    if grep -q '^\[all\]' "$CONFIG_TXT"; then
-        echo "$OVERLAY" >> "$CONFIG_TXT"
-    else
-        printf '\n[all]\n%s\n' "$OVERLAY" >> "$CONFIG_TXT"
-    fi
-    reboot_needed=true
+scan_hci
+USB_BT_IDS=$(usb_bt_devices)
 
-elif [[ -z "$USB_HCI" ]] && $overlay_set; then
-    # No USB dongle but onboard BT is disabled → remove overlay
-    log "No USB BT dongle found. Removing '$OVERLAY' from $CONFIG_TXT and rebooting..."
-    sed -i "/^${OVERLAY}$/d" "$CONFIG_TXT"
-    reboot_needed=true
+if [[ -n "$USB_BT_IDS" && -z "$USB_HCI" ]] && (( USB_WAIT_SEC > 0 )); then
+    log "USB Bluetooth device present ($USB_BT_IDS) but no adapter registered yet — waiting up to ${USB_WAIT_SEC}s"
+    for ((i = 0; i < USB_WAIT_SEC; i++)); do
+        sleep 1
+        scan_hci
+        [[ -n "$USB_HCI" ]] && break
+    done
 fi
 
-# ---------------------------------------------------------------------------
-# 4. If config changed, reboot (the fix takes effect on next boot)
-# ---------------------------------------------------------------------------
-if $reboot_needed; then
-    log "BT adapter config changed. Rebooting in 3 seconds..."
-    sync
-    sleep 3
-    systemctl reboot
-    exit 0
-fi
+log "Scan results: USB_HCI=${USB_HCI:-none} ONBOARD_HCI=${ONBOARD_HCI:-none} USB_BT_DEVICES=${USB_BT_IDS:-none}"
 
 # ---------------------------------------------------------------------------
-# 5. Config is correct — update config.env with the active adapter
+# 2. What the operator asked for
 # ---------------------------------------------------------------------------
-# Determine which adapter is active
-if [[ -n "$USB_HCI" ]]; then
-    ACTIVE_HCI="$USB_HCI"
-    ACTIVE_MAC="$USB_MAC"
-    log "Using USB BT adapter: $ACTIVE_HCI ($ACTIVE_MAC)"
-elif [[ -n "$ONBOARD_HCI" ]]; then
-    ACTIVE_HCI="$ONBOARD_HCI"
-    ACTIVE_MAC="$ONBOARD_MAC"
-    log "Using onboard BT adapter: $ACTIVE_HCI ($ACTIVE_MAC)"
+MODE=$(grep -E '^[[:space:]]*BLE_ADAPTER_MODE=' "$DA_CONFIG" 2>/dev/null | tail -1 \
+       | cut -d= -f2- | tr -d "\"' \t\r")
+MODE="${MODE,,}"
+case "$MODE" in
+    ""|auto)     MODE=auto ;;
+    usb|onboard) ;;
+    *) log "WARNING: unknown BLE_ADAPTER_MODE='$MODE' — using auto"; MODE=auto ;;
+esac
+log "BLE_ADAPTER_MODE=$MODE"
+
+# ---------------------------------------------------------------------------
+# 3. The built-in radio's on/off switch (Raspberry Pi only)
+# ---------------------------------------------------------------------------
+want=""   # add | remove
+if [[ ! -f "$CONFIG_TXT" ]]; then
+    log "No $CONFIG_TXT — not a Raspberry Pi. Leaving built-in Bluetooth alone."
 else
-    log "WARNING: No BT adapter found at all. Feeder will fail to start."
+    OVERLAY="dtoverlay=disable-bt"
+    if tr -d '\0' 2>/dev/null < "$MODEL_FILE" | grep -qE 'Raspberry Pi 5|Compute Module 5'; then
+        OVERLAY="dtoverlay=disable-bt-pi5"
+    fi
+    # Either name counts as "off" -- a card moved between a Pi 4 and a Pi 5
+    # must not gain a second line. Commented-out lines do not count.
+    overlay_set=false
+    grep -qE '^[[:space:]]*dtoverlay=disable-bt(-pi5)?[[:space:]]*$' "$CONFIG_TXT" && overlay_set=true
+    log "config.txt: built-in Bluetooth $($overlay_set && echo disabled || echo enabled)"
+
+    case "$MODE" in
+        usb)
+            if [[ -n "$USB_HCI" ]] && ! $overlay_set; then
+                want=add
+            elif [[ -z "$USB_HCI" ]]; then
+                log "WARNING: BLE_ADAPTER_MODE=usb but no USB Bluetooth adapter is working${USB_BT_IDS:+ (device $USB_BT_IDS is plugged in but registered no adapter — driver or power)}. Leaving config.txt unchanged."
+            fi
+            ;;
+        onboard)
+            $overlay_set && want=remove
+            ;;
+        auto)
+            if [[ -n "$USB_HCI" ]] && ! $overlay_set; then
+                want=add
+            elif [[ -z "$USB_BT_IDS" && -z "$USB_HCI" ]] && $overlay_set; then
+                # No USB Bluetooth device on the bus at all: the dongle really
+                # is gone, so give the built-in radio back. Both checks, because
+                # some dongles declare a vendor-specific class (ff) instead of
+                # e0/01/01 and btusb binds them by ID -- a working one of those
+                # shows only as a registered adapter. (One of those with NO
+                # driver is invisible here, so it falls back to the old
+                # behavior.)
+                want=remove
+            elif [[ -n "$USB_BT_IDS" && -z "$USB_HCI" ]] && $overlay_set; then
+                log "WARNING: USB Bluetooth device $USB_BT_IDS is plugged in but registered no adapter (driver or power problem). Leaving the built-in radio off rather than switching behind your back. Set BLE_ADAPTER_MODE=onboard to use it instead."
+            fi
+            ;;
+    esac
+fi
+
+# Refuse to ping-pong. Each run that changes config.txt counts a flip in the
+# direction it went; a run needing no change clears the record.
+FLIP_FILE="$STATE_DIR/bt-select-flips"
+if [[ -n "$want" ]]; then
+    read -r last_dir flips 2>/dev/null < "$FLIP_FILE" || { last_dir=""; flips=0; }
+    if [[ -n "$last_dir" && "$last_dir" != "$want" ]]; then
+        flips=$(( ${flips:-0} + 1 ))
+    else
+        flips=1
+    fi
+    if (( flips > MAX_FLIPS )); then
+        log "WARNING: config.txt has been switched back and forth on consecutive boots. Not changing it again. Set BLE_ADAPTER_MODE=usb or onboard in $DA_CONFIG to decide."
+        want=""
+    fi
+elif (( ! DRY_RUN )); then
+    rm -f "$FLIP_FILE" 2>/dev/null
+fi
+
+if [[ -n "$want" ]]; then
+    if [[ "$want" == add ]]; then
+        log "Turning the built-in radio off so the USB adapter is used: adding '$OVERLAY' to $CONFIG_TXT"
+    else
+        log "Turning the built-in radio back on: removing the disable-bt line from $CONFIG_TXT"
+    fi
+    if (( DRY_RUN )); then
+        log "DRY RUN: config.txt not changed"
+    else
+        if [[ "$want" == add ]]; then
+            # Must land under [all]. Appending after a trailing [pi4]/[cm5]
+            # section would scope the overlay to that model only.
+            [[ -s "$CONFIG_TXT" && -n "$(tail -c1 "$CONFIG_TXT")" ]] && echo >> "$CONFIG_TXT"
+            if [[ "$(grep -E '^[[:space:]]*\[[^]]*\]' "$CONFIG_TXT" | tail -1 | tr -d '[:space:]')" == "[all]" ]]; then
+                echo "$OVERLAY" >> "$CONFIG_TXT"
+            else
+                printf '\n[all]\n%s\n' "$OVERLAY" >> "$CONFIG_TXT"
+            fi
+        else
+            sed -i -E '/^[[:space:]]*dtoverlay=disable-bt(-pi5)?[[:space:]]*$/d' "$CONFIG_TXT"
+        fi
+        mkdir -p "$STATE_DIR" 2>/dev/null && echo "$want $flips" > "$FLIP_FILE"
+        if (( NO_REBOOT )); then
+            log "config.txt changed — takes effect after the next reboot."
+        else
+            log "BT adapter config changed. Rebooting in 3 seconds..."
+            sync
+            sleep 3
+            systemctl reboot
+            exit 0
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Which adapter the feeder should use right now
+# ---------------------------------------------------------------------------
+# Preferred bus first, the other as a fallback: with a config.txt change still
+# waiting for its reboot, the preferred radio may not exist yet.
+ACTIVE_HCI=""; ACTIVE_MAC=""; KIND=""
+if [[ "$MODE" == onboard ]]; then
+    if   [[ -n "$ONBOARD_HCI" ]]; then ACTIVE_HCI="$ONBOARD_HCI"; ACTIVE_MAC="$ONBOARD_MAC"; KIND=onboard
+    elif [[ -n "$USB_HCI" ]];     then ACTIVE_HCI="$USB_HCI";     ACTIVE_MAC="$USB_MAC";     KIND=USB
+        log "Built-in radio not available yet — using the USB adapter for now"
+    fi
+else
+    if   [[ -n "$USB_HCI" ]];     then ACTIVE_HCI="$USB_HCI";     ACTIVE_MAC="$USB_MAC";     KIND=USB
+    elif [[ -n "$ONBOARD_HCI" ]]; then ACTIVE_HCI="$ONBOARD_HCI"; ACTIVE_MAC="$ONBOARD_MAC"; KIND=onboard
+    fi
+fi
+
+if [[ -z "$ACTIVE_HCI" ]]; then
+    log "WARNING: No BT adapter found at all. The BLE feeder will report FAULT."
     exit 1
 fi
+log "Using $KIND BT adapter: $ACTIVE_HCI"
 
-# MAC may be empty if BlueZ hasn't fully initialized; try hciconfig as fallback
+# The sysfs address file does not exist on newer kernels (6.18); ask the tools.
 if [[ -z "$ACTIVE_MAC" || "$ACTIVE_MAC" == "00:00:00:00:00:00" ]]; then
     ACTIVE_MAC=$(hciconfig "$ACTIVE_HCI" 2>/dev/null | awk '/BD Address/{print $3}')
 fi
-
+if [[ -z "$ACTIVE_MAC" || "$ACTIVE_MAC" == "00:00:00:00:00:00" ]]; then
+    ACTIVE_MAC=$(busctl get-property org.bluez "/org/bluez/$ACTIVE_HCI" org.bluez.Adapter1 Address 2>/dev/null \
+                 | awk -F'"' '{print $2}')
+fi
 if [[ -z "$ACTIVE_MAC" ]]; then
     log "WARNING: Could not determine MAC for $ACTIVE_HCI. Leaving config.env unchanged."
     exit 0
 fi
 
-# Update BLE_ADAPTER and BLE_ADAPTER_MAC in config.env
+# ---------------------------------------------------------------------------
+# 5. Record it for the feeder
+# ---------------------------------------------------------------------------
+set_key() {
+    local key="$1" value="$2"
+    if grep -qE "^${key}=" "$DA_CONFIG"; then
+        [[ "$(grep -E "^${key}=" "$DA_CONFIG" | tail -1 | cut -d= -f2-)" == "$value" ]] && return 1
+        sed -i "s|^${key}=.*|${key}=${value}|" "$DA_CONFIG"
+    else
+        echo "${key}=${value}" >> "$DA_CONFIG"
+    fi
+    return 0
+}
+
 if [[ -f "$DA_CONFIG" ]]; then
-    sed -i "s|^BLE_ADAPTER=.*|BLE_ADAPTER=${ACTIVE_HCI}|" "$DA_CONFIG"
-    sed -i "s|^BLE_ADAPTER_MAC=.*|BLE_ADAPTER_MAC=${ACTIVE_MAC}|" "$DA_CONFIG"
-    log "config.env updated: BLE_ADAPTER=$ACTIVE_HCI  BLE_ADAPTER_MAC=$ACTIVE_MAC"
+    if (( DRY_RUN )); then
+        log "DRY RUN: would set BLE_ADAPTER=$ACTIVE_HCI BLE_ADAPTER_MAC=$ACTIVE_MAC"
+    else
+        changed=0
+        set_key BLE_ADAPTER "$ACTIVE_HCI" && changed=1
+        set_key BLE_ADAPTER_MAC "$ACTIVE_MAC" && changed=1
+        if (( changed )); then
+            log "config.env updated: BLE_ADAPTER=$ACTIVE_HCI  BLE_ADAPTER_MAC=$ACTIVE_MAC"
+        else
+            log "config.env already set: BLE_ADAPTER=$ACTIVE_HCI  BLE_ADAPTER_MAC=$ACTIVE_MAC"
+        fi
+    fi
 fi
 
 exit 0

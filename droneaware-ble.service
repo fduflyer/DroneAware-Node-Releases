@@ -1,8 +1,11 @@
 [Unit]
 Description=DroneAware BLE Remote ID Feeder
 After=network-online.target bluetooth.target droneaware-bt-select.service
-Wants=network-online.target
-Requires=droneaware-bt-select.service
+# Wants, not Requires: the selector choosing an adapter is useful, but its
+# failing -- no config.txt on a non-Pi host, no adapter found, or an operator
+# disabling it -- must not stop the BLE feeder from starting. The feeder already
+# reports FAULT on its own when there is no working adapter.
+Wants=network-online.target droneaware-bt-select.service
 
 [Service]
 Type=simple
