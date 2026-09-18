@@ -872,6 +872,7 @@ def _wclassifier_parse_bands(iw_info: str) -> list:
 def wclassifier_enumerate() -> list:
     """Return list of adapter dicts. See wifi_probe.py for schema."""
     result = []
+    links = _network_link_ifaces()
     for path in sorted(glob.glob("/sys/class/net/wlan*")):
         iface = os.path.basename(path)
         a = {
@@ -904,7 +905,14 @@ def wclassifier_enumerate() -> list:
         if a["driver"] == "brcmfmac" or a["bus"] in ("sdio", "mmc"):
             a["classification"] = "onboard"
         elif a["bus"] == "usb":
-            a["classification"] = "usb-monitor" if a["supports_monitor"] else "usb-no-monitor"
+            # v1.6.1: a USB adapter carrying the node's connection, or one the
+            # operator excluded, is never a monitor candidate.
+            reason = _reserved_reason(iface, a["mac"], links)
+            if reason:
+                a["classification"] = "usb-reserved"
+                a["reserved"] = reason
+            else:
+                a["classification"] = "usb-monitor" if a["supports_monitor"] else "usb-no-monitor"
         else:
             a["classification"] = "other"
         result.append(a)
@@ -1044,6 +1052,64 @@ def _is_onboard_iface(iface: str | None) -> bool:
     return driver == "brcmfmac" or bus in ("sdio", "mmc")
 
 
+# v1.6.1 — adapters that must never be taken for monitoring, even though they
+# are USB and monitor-capable: the ones carrying this node's network
+# connection, and any the operator has declared off limits. The onboard check
+# above only covers the Pi's own chip, so a USB adapter an operator uses as
+# their internet link was classified as a feeder candidate; `refresh` gave it a
+# role, handed it to monitor mode and took the node off the network.
+# Keep in sync with _classify_wifi_adapters in the droneaware CLI.
+
+def _excluded_adapter_macs() -> set:
+    """MACs listed in WIFI_ADAPTER_EXCLUDE_MACS (comma or space separated)."""
+    raw = os.environ.get("WIFI_ADAPTER_EXCLUDE_MACS", "")
+    return {m.lower() for m in re.split(r"[\s,;]+", raw) if m}
+
+
+def _network_link_ifaces() -> set:
+    """Interfaces carrying this node's network connection right now.
+
+    Any interface holding a default route (IPv4 or IPv6), plus any that
+    NetworkManager reports connected. The second catches a secondary link that
+    holds no default route -- still somebody's connection, so still off
+    limits. Best-effort: a tool that is missing or fails adds nothing.
+    """
+    links = set()
+    for family in ("-4", "-6"):
+        try:
+            out = subprocess.run(["ip", family, "-o", "route", "show", "default"],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            continue
+        for line in out.splitlines():
+            parts = line.split()
+            if "dev" in parts and parts.index("dev") + 1 < len(parts):
+                links.add(parts[parts.index("dev") + 1])
+    try:
+        out = subprocess.run(["nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"],
+                             capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            dev, _, state = line.partition(":")
+            # "connected" and "connected (externally)"; never "disconnected".
+            if state.startswith("connected") and dev != "lo":
+                links.add(dev)
+    except Exception:
+        pass
+    return links
+
+
+def _reserved_reason(iface: str | None, mac: str | None,
+                     links: set | None = None) -> str | None:
+    """Why this adapter must be left alone, or None if it may be monitored."""
+    if mac and mac.lower() in _excluded_adapter_macs():
+        return "it is listed in WIFI_ADAPTER_EXCLUDE_MACS"
+    if links is None:
+        links = _network_link_ifaces()
+    if iface and iface in links:
+        return "it carries this node's network connection"
+    return None
+
+
 def resolve_monitor_iface(fallback_iface: str | None, band: str = "auto") -> str:
     """v1.5.0 Step 3 — pick which wlanN the feeder monitors, applying the
     new MAC-based selection with fallbacks to legacy behavior.
@@ -1103,6 +1169,20 @@ def resolve_monitor_iface(fallback_iface: str | None, band: str = "auto") -> str
                         # would pick peer band's adapter and cause contention.
                         return ""
                     break  # single-adapter mode — safe to fall through
+                # v1.6.1: the same refusal for a USB adapter that carries the
+                # node's connection or that the operator excluded. A stale key
+                # from before this check existed is the likely way to land here.
+                reason = _reserved_reason(iface, mac)
+                if reason:
+                    log.error(
+                        f"[iface v1.6.1] REFUSING — configured MAC {configured_mac} "
+                        f"is {iface}, but {reason}. Monitoring it would take it "
+                        "off the network. Run 'sudo droneaware refresh' to "
+                        "reassign adapters."
+                    )
+                    if band_specific_configured:
+                        return ""
+                    break
                 # Name the key the value actually came from. This said
                 # WIFI_ADAPTER_MAC unconditionally, so on a two-adapter node it
                 # reported a key the operator had not set while the real one --
@@ -1150,6 +1230,7 @@ def resolve_monitor_iface(fallback_iface: str | None, band: str = "auto") -> str
     if fallback_iface and os.path.exists(f"/sys/class/net/{fallback_iface}"):
         # v1.5.0 Step 5: also apply hard-filter here. Common misconfig on
         # older nodes: WIFI_ADAPTER=wlan0 accidentally points at Pi onboard.
+        reason = _reserved_reason(fallback_iface, _get_iface_mac(fallback_iface))
         if _is_onboard_iface(fallback_iface):
             log.error(
                 f"[iface v1.5.0] REFUSING — legacy WIFI_ADAPTER={fallback_iface} "
@@ -1157,6 +1238,11 @@ def resolve_monitor_iface(fallback_iface: str | None, band: str = "auto") -> str
                 "onboard as monitor would break SSH access. Fix "
                 "WIFI_ADAPTER in /opt/droneaware/config.env. Falling "
                 "through to classifier."
+            )
+        elif reason:
+            log.error(
+                f"[iface v1.6.1] REFUSING — legacy WIFI_ADAPTER={fallback_iface}, "
+                f"but {reason}. Falling through to classifier."
             )
         else:
             log.info(
@@ -1277,6 +1363,15 @@ def _ensure_monitor_safe(iface: str):
             ["nmcli", "-g", "GENERAL.STATE", "device", "show", iface],
             capture_output=True, text=True, timeout=5, check=False,
         )
+        # "100 (connected)" / "100 (connected (externally))". A connected
+        # adapter is somebody's live network link even without the default
+        # route, and releasing it from NetworkManager below would cut it.
+        if "(connected" in r.stdout.lower():
+            log.error(f"Refusing to monitor {iface} — NetworkManager has it "
+                      "connected to a network.")
+            log.error("Add its MAC to WIFI_ADAPTER_EXCLUDE_MACS in "
+                      "/opt/droneaware/config.env and run 'sudo droneaware refresh'.")
+            sys.exit(1)
         if "unmanaged" not in r.stdout.lower():
             mac = _get_iface_mac(iface)
             log.warning(

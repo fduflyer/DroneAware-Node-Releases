@@ -515,19 +515,36 @@ EOF
 # disk. Prevents mtime churn on every update.
 _regenerate_nm_monitor_config() {
     local cfg="$1"
-    local nm_conf="/etc/NetworkManager/conf.d/droneaware.conf"
+    local nm_conf="${DA_NM_CONF:-/etc/NetworkManager/conf.d/droneaware.conf}"
     local mac_single mac_2g mac_5g macs_spec
+    local MONITOR_COUNT="" ROLE_2G_MAC="" ROLE_5G_MAC="" RESERVED_MACS=""
+    eval "$(_classify_wifi_adapters 2>/dev/null)"
 
     mac_single=$(_cfg_get "$cfg" WIFI_ADAPTER_MAC)
     mac_2g=$(_cfg_get "$cfg" WIFI_ADAPTER_2G_MAC)
     mac_5g=$(_cfg_get "$cfg" WIFI_ADAPTER_5G_MAC)
+    # v1.6.1: never hand NetworkManager's control of a reserved adapter to
+    # DroneAware — listing it here is what cut the node off the network.
+    _is_reserved_mac "$mac_single" && mac_single=""
+    _is_reserved_mac "$mac_2g" && mac_2g=""
+    _is_reserved_mac "$mac_5g" && mac_5g=""
 
     if [[ -n "$mac_2g" && -n "$mac_5g" ]]; then
         macs_spec="mac:${mac_2g};mac:${mac_5g}"
     elif [[ -n "$mac_single" ]]; then
         macs_spec="mac:${mac_single}"
     else
-        # Nothing to write. Leave whatever's on disk alone.
+        # Nothing to write, so leave whatever is on disk alone — unless the
+        # file on disk is holding a reserved adapter, which must be released.
+        local _m
+        for _m in $RESERVED_MACS; do
+            if [[ -r "$nm_conf" ]] && grep -qiF "mac:${_m}" "$nm_conf"; then
+                rm -f "$nm_conf"
+                nmcli general reload 2>/dev/null || systemctl reload NetworkManager 2>/dev/null || true
+                info "Removed ${nm_conf} — it kept ${_m} away from NetworkManager, and that adapter must be left alone"
+                break
+            fi
+        done
         return 0
     fi
 
@@ -778,10 +795,45 @@ _gps_sanity_check_update() {
 # lines to stdout: MONITOR_COUNT, ROLE_2G_MAC, ROLE_5G_MAC. Kept in sync
 # with wifi_feeder.py's wclassifier_enumerate / wclassifier_assign_roles.
 _classify_wifi_adapters() {
-    python3 <<'PY'
-import glob, os, re, subprocess
+    local _excl
+    _excl=$(_cfg_get "${INSTALL_DIR}/config.env" WIFI_ADAPTER_EXCLUDE_MACS 2>/dev/null)
+    DA_EXCLUDE_MACS="$_excl" python3 <<'PY'
+import glob, os, re, shlex, subprocess
 IW = "/usr/sbin/iw" if os.path.exists("/usr/sbin/iw") else (
     "/sbin/iw" if os.path.exists("/sbin/iw") else "iw")
+
+# v1.6.1 — USB adapters that must never become feeders: the ones carrying this
+# node's network connection, and any listed in WIFI_ADAPTER_EXCLUDE_MACS.
+# Without this, a USB adapter an operator uses as their internet link was
+# assigned a role, put under NetworkManager's unmanaged list, and the node
+# went offline. Keep in sync with _network_link_ifaces / _reserved_reason in
+# wifi_feeder.py.
+EXCLUDED = {m.lower() for m in re.split(r"[\s,;]+", os.environ.get("DA_EXCLUDE_MACS", "")) if m}
+
+def _network_links():
+    links = set()
+    for fam in ("-4", "-6"):
+        try:
+            out = subprocess.run(["ip", fam, "-o", "route", "show", "default"],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            continue
+        for line in out.splitlines():
+            p = line.split()
+            if "dev" in p and p.index("dev") + 1 < len(p):
+                links.add(p[p.index("dev") + 1])
+    try:
+        out = subprocess.run(["nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"],
+                             capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            dev, _, state = line.partition(":")
+            if state.startswith("connected") and dev != "lo":
+                links.add(dev)
+    except Exception:
+        pass
+    return links
+
+LINKS = _network_links()
 
 def _read(p):
     try: return open(p).read().strip()
@@ -832,7 +884,14 @@ for path in sorted(glob.glob("/sys/class/net/wlan*")):
     if a["driver"] == "brcmfmac" or a["bus"] in ("sdio", "mmc"):
         a["classification"] = "onboard"
     elif a["bus"] == "usb":
-        a["classification"] = "usb-monitor" if a["supports_monitor"] else "usb-no-monitor"
+        if a["mac"] in EXCLUDED:
+            a["classification"], a["role"] = "usb-reserved", "excluded (WIFI_ADAPTER_EXCLUDE_MACS)"
+            a["why"] = "it is listed in WIFI_ADAPTER_EXCLUDE_MACS"
+        elif iface in LINKS:
+            a["classification"], a["role"] = "usb-reserved", "network uplink"
+            a["why"] = "it carries this node's network connection"
+        else:
+            a["classification"] = "usb-monitor" if a["supports_monitor"] else "usb-no-monitor"
     adapters.append(a)
 
 monitor = sorted([a for a in adapters if a["classification"] == "usb-monitor"],
@@ -871,7 +930,33 @@ for _i, _a in enumerate(monitor):
     print(f"MON{_i}_IFACE={_a.get('iface','')}")
     print(f"MON{_i}_DRIVER={_a.get('driver','')}")
     print(f"MON{_i}_BANDS={','.join(_a['bands'])}")
+# Reserved adapters, so callers can say why one was left alone, clear any key
+# still pointing at one, and keep it out of NetworkManager's unmanaged list.
+reserved = [a for a in adapters if a["classification"] == "usb-reserved"]
+print("RESERVED_MACS=" + shlex.quote(" ".join(a["mac"] for a in reserved)))
+for _i, _a in enumerate(reserved):
+    print(f"RES{_i}_MAC={_a['mac']}")
+    print(f"RES{_i}_IFACE={_a['iface']}")
+    print(f"RES{_i}_ROLE={shlex.quote(_a['role'])}")
+    print(f"RES{_i}_WHY={shlex.quote(_a['why'])}")
 PY
+}
+
+# True when MAC (any case) is in the classifier's RESERVED_MACS list.
+_is_reserved_mac() {
+    local mac="${1,,}"
+    [[ -n "$mac" && " ${RESERVED_MACS:-} " == *" ${mac} "* ]]
+}
+
+# The status label the classifier gave a reserved adapter.
+_reserved_role() {
+    local mac="${1,,}" _i _mv _rv
+    for ((_i = 0; ; _i++)); do
+        _mv="RES${_i}_MAC"; _rv="RES${_i}_ROLE"
+        [[ -n "${!_mv:-}" ]] || break
+        [[ "${!_mv}" == "$mac" ]] && { echo "${!_rv}"; return; }
+    done
+    echo "left alone"
 }
 
 # Set-or-add a config.env key. Idempotent — only touches the file when
@@ -909,13 +994,30 @@ _service_start_suppressed() {
 
 _orchestrate_wifi_mode() {
     local cfg="$1"
-    local MONITOR_COUNT="" ROLE_2G_MAC="" ROLE_5G_MAC=""
+    local MONITOR_COUNT="" ROLE_2G_MAC="" ROLE_5G_MAC="" RESERVED_MACS=""
     eval "$(_classify_wifi_adapters 2>/dev/null)"
 
     if [[ -z "$MONITOR_COUNT" ]]; then
         warn "v1.5.0 mode-detect: classifier failed — leaving adapter mode unchanged"
         return 0
     fi
+
+    # v1.6.1: say which adapters were left alone and why, and release any
+    # that a config key still points at — a node an earlier version already
+    # took offline this way is repaired by the next refresh.
+    local _i _mv _iv _wv _key _val
+    for ((_i = 0; ; _i++)); do
+        _mv="RES${_i}_MAC"; _iv="RES${_i}_IFACE"; _wv="RES${_i}_WHY"
+        [[ -n "${!_mv:-}" ]] || break
+        info "Leaving ${!_iv} (${!_mv}) alone — ${!_wv}"
+    done
+    for _key in WIFI_ADAPTER_MAC WIFI_ADAPTER_2G_MAC WIFI_ADAPTER_5G_MAC; do
+        _val=$(_cfg_get "$cfg" "$_key")
+        if _is_reserved_mac "$_val"; then
+            warn "${_key} named ${_val}, which must not be used for detection — clearing it"
+            _set_cfg_key "$cfg" "$_key" ""
+        fi
+    done
 
     info "v1.5.0 mode-detect: ${MONITOR_COUNT} monitor-capable USB adapter(s) present"
 
@@ -931,13 +1033,14 @@ _orchestrate_wifi_mode() {
             _p2g=$(_cfg_get "$cfg" WIFI_ADAPTER_2G_MAC)
             _p5g=$(_cfg_get "$cfg" WIFI_ADAPTER_5G_MAC)
             if [[ -n "$_p2g" && -n "$_p5g" ]] \
+               && ! _is_reserved_mac "$_p2g" && ! _is_reserved_mac "$_p5g" \
                && grep -qixF "$_p2g" /sys/class/net/*/address 2>/dev/null \
                && grep -qixF "$_p5g" /sys/class/net/*/address 2>/dev/null; then
                 info "v1.5.0 mode-detect: keeping operator-pinned adapter roles (droneaware swap)"
                 ROLE_2G_MAC="$_p2g"
                 ROLE_5G_MAC="$_p5g"
             else
-                warn "Pinned adapter roles name hardware that is no longer attached — reverting to automatic assignment"
+                warn "Pinned adapter roles name hardware that is no longer attached or must not be used — reverting to automatic assignment"
                 _set_cfg_key "$cfg" WIFI_ADAPTER_ROLES_PINNED "false"
             fi
         fi
@@ -1696,6 +1799,15 @@ _ensure_webui_assets() {
 
 cmd_update() {
     require_root "update"
+    # --prerelease opts in to release candidates, the same as
+    # DRONEAWARE_ALLOW_PRERELEASE=1. The variable alone was not enough: sudo
+    # refuses to set one on its command line whenever the last sudoers rule
+    # matching this command is a narrow one -- and the Web UI's own rule for
+    # `droneaware update` is exactly that for a login user named droneaware.
+    local _arg
+    for _arg in "$@"; do
+        [[ "$_arg" == "--prerelease" ]] && DRONEAWARE_ALLOW_PRERELEASE=1
+    done
     echo ""
     echo -e "${BOLD}DroneAware Update${NC}"
     echo ""
@@ -1727,7 +1839,7 @@ cmd_update() {
     # ability to roll the fleet back to one.
     #
     # To validate a release candidate on a test node, opt in explicitly:
-    #     sudo DRONEAWARE_ALLOW_PRERELEASE=1 droneaware update
+    #     sudo droneaware update --prerelease
     LATEST=$(curl -sf "https://api.github.com/repos/${GITHUB_REPO}/releases" \
         | ALLOW_PRE="${DRONEAWARE_ALLOW_PRERELEASE:-0}" python3 -c '
 import json, os, sys
@@ -1758,7 +1870,7 @@ if candidates:
         if [[ "${DRONEAWARE_ALLOW_PRERELEASE:-0}" == "1" ]]; then
             fatal "Could not reach GitHub or no release with binaries found — check internet connection."
         fi
-        fatal "Could not reach GitHub or no stable release with binaries found. If you are testing a release candidate, use: sudo DRONEAWARE_ALLOW_PRERELEASE=1 droneaware update"
+        fatal "Could not reach GitHub or no stable release with binaries found. If you are testing a release candidate, use: sudo droneaware update --prerelease"
     fi
     if [[ "${DRONEAWARE_ALLOW_PRERELEASE:-0}" == "1" ]]; then
         warn "Pre-releases enabled — ${LATEST} may be a release candidate."
@@ -2154,6 +2266,8 @@ cmd_status() {
         m2g=$(_cfg_get "$cfg" WIFI_ADAPTER_2G_MAC)
         m5g=$(_cfg_get "$cfg" WIFI_ADAPTER_5G_MAC)
         m1=$(_cfg_get "$cfg" WIFI_ADAPTER_MAC)
+        local MONITOR_COUNT="" ROLE_2G_MAC="" ROLE_5G_MAC="" RESERVED_MACS=""
+        eval "$(_classify_wifi_adapters 2>/dev/null)"
         echo "  Radios:"
         local dev
         for dev in /sys/class/net/wl*; do
@@ -2169,6 +2283,7 @@ cmd_status() {
             elif [[ -n "$mac" && "$mac" == "$m5g" ]]; then role="5 GHz feeder"
             elif [[ -n "$mac" && "$mac" == "$m1"  ]]; then role="detection"
             elif [[ "$drv" == brcmfmac* ]];          then role="network uplink"
+            elif _is_reserved_mac "$mac";            then role=$(_reserved_role "$mac")
             elif [[ "$mode" == "monitor" ]];         then role="unused — run 'sudo droneaware refresh'"
             else                                          role="not used for detection"
             fi
@@ -3123,7 +3238,7 @@ PY
 }
 
 case "$1" in
-    update)         cmd_update ;;
+    update)         cmd_update "$@" ;;
     status)         cmd_status ;;
     logs)           cmd_logs "$@" ;;
     test)           cmd_test "$@" ;;
@@ -3151,6 +3266,7 @@ case "$1" in
         echo ""
         echo "  Commands:"
         echo "    update          Download and install the latest firmware"
+        echo "    update --prerelease   Include release candidates (for testing)"
         echo "    status          Show service status and firmware version"
         echo "    logs            Tail live logs  (wifi by default, or: droneaware logs ble)"
         echo "    test            Transmit a 60-second test flight and verify detection"
