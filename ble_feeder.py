@@ -2025,7 +2025,35 @@ def resolve_token() -> str:
 
 # -- Entry Point ---------------------------------------------------------------
 
+def _restore_system_library_path() -> None:
+    """Give every program this process runs the system's libraries, not ours.
+
+    The frozen binary's bootloader points LD_LIBRARY_PATH at its own bundle so
+    Python finds the libraries it ships, and every child inherits it. The
+    bundle comes from the build image (Bookworm), so on Trixie `busctl` and
+    `systemctl` die before they start:
+        libcrypto.so.3: version `OPENSSL_3.4.0' not found
+    That left the scan watchdog unable to read BlueZ's Discovering property or
+    restart bluetooth, and the hciuart recovery step failing silently.
+
+    Version-neutral: children get whatever the OS itself provides, exactly as
+    when run from a shell. On Bookworm the bundle matches the system (its
+    libsystemd needs only OPENSSL_3.0.0), so nothing changes there.
+
+    Safe for this process: the dynamic loader reads LD_LIBRARY_PATH once, at
+    startup, so libraries it loads later still come from the bundle.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    orig = os.environ.get("LD_LIBRARY_PATH_ORIG")
+    if orig is not None:
+        os.environ["LD_LIBRARY_PATH"] = orig
+    else:
+        os.environ.pop("LD_LIBRARY_PATH", None)
+
+
 def main():
+    _restore_system_library_path()
     parser = argparse.ArgumentParser(
         description="DroneAware BLE Remote ID Feeder"
     )

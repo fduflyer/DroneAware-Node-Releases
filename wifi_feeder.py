@@ -3818,7 +3818,34 @@ def resolve_token() -> str:
 
 # -- Entry Point ---------------------------------------------------------------
 
+def _restore_system_library_path() -> None:
+    """Give every program this process runs the system's libraries, not ours.
+
+    The frozen binary's bootloader points LD_LIBRARY_PATH at its own bundle,
+    and every child inherits it. The bundle comes from the build image
+    (Bookworm); on Trixie that already breaks systemctl/busctl in ble_feeder
+    and web_ui ("libcrypto.so.3: version `OPENSSL_3.4.0' not found"). The
+    programs this feeder runs (ip, nmcli) load the bundled zlib and libffi and
+    happen to work today, which is luck rather than design.
+
+    Version-neutral: children get whatever the OS itself provides, exactly as
+    when run from a shell. On Bookworm the bundle matches the system, so
+    nothing changes there.
+
+    Safe for this process: the dynamic loader reads LD_LIBRARY_PATH once, at
+    startup, so libraries it loads later still come from the bundle.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    orig = os.environ.get("LD_LIBRARY_PATH_ORIG")
+    if orig is not None:
+        os.environ["LD_LIBRARY_PATH"] = orig
+    else:
+        os.environ.pop("LD_LIBRARY_PATH", None)
+
+
 def main():
+    _restore_system_library_path()
     parser = argparse.ArgumentParser(
         description="DroneAware WiFi Remote ID Feeder (Raspberry Pi + Alfa AWUS036N)"
     )
