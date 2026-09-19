@@ -823,8 +823,11 @@ def _network_links():
             if "dev" in p and p.index("dev") + 1 < len(p):
                 links.add(p[p.index("dev") + 1])
     try:
+        # LC_ALL=C: NetworkManager translates device states, so "connected"
+        # is "verbunden" on a German node and every comparison below fails.
         out = subprocess.run(["nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"],
-                             capture_output=True, text=True, timeout=5).stdout
+                             capture_output=True, text=True, timeout=5,
+                             env={**os.environ, "LC_ALL": "C", "LANG": "C"}).stdout
         for line in out.splitlines():
             dev, _, state = line.partition(":")
             if state.startswith("connected") and dev != "lo":

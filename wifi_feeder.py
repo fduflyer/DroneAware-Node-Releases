@@ -35,7 +35,10 @@ import os
 import re
 import sys
 import collections
+import ctypes
+import ctypes.util
 import uuid
+from datetime import datetime, timezone
 import serial
 import requests
 
@@ -1060,6 +1063,17 @@ def _is_onboard_iface(iface: str | None) -> bool:
 # role, handed it to monitor mode and took the node off the network.
 # Keep in sync with _classify_wifi_adapters in the droneaware CLI.
 
+def _c_locale_env() -> dict:
+    """Environment for a command whose OUTPUT we parse.
+
+    NetworkManager ships translations, so `nmcli` prints device states in the
+    node's language -- "verbunden" rather than "connected" on a German node.
+    Every string comparison against that output is wrong on such a node unless
+    the locale is pinned, and the fleet is not English-only.
+    """
+    return {**os.environ, "LC_ALL": "C", "LANG": "C"}
+
+
 def _excluded_adapter_macs() -> set:
     """MACs listed in WIFI_ADAPTER_EXCLUDE_MACS (comma or space separated)."""
     raw = os.environ.get("WIFI_ADAPTER_EXCLUDE_MACS", "")
@@ -1087,7 +1101,8 @@ def _network_link_ifaces() -> set:
                 links.add(parts[parts.index("dev") + 1])
     try:
         out = subprocess.run(["nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"],
-                             capture_output=True, text=True, timeout=5).stdout
+                             capture_output=True, text=True, timeout=5,
+                             env=_c_locale_env()).stdout
         for line in out.splitlines():
             dev, _, state = line.partition(":")
             # "connected" and "connected (externally)"; never "disconnected".
@@ -1362,6 +1377,7 @@ def _ensure_monitor_safe(iface: str):
         r = subprocess.run(
             ["nmcli", "-g", "GENERAL.STATE", "device", "show", iface],
             capture_output=True, text=True, timeout=5, check=False,
+            env=_c_locale_env(),
         )
         # "100 (connected)" / "100 (connected (externally))". A connected
         # adapter is somebody's live network link even without the default
@@ -2742,6 +2758,12 @@ def _write_gps_state(*, device: str | None = None, baud: int | None = None,
             "lon":          lon,
             "protocol":     protocol,
             "fix_quality":  fix_quality,
+            # v1.6.1 — where this node's clock is coming from, so the offline
+            # UI can say "synced (GPS)" rather than warning on a node that has
+            # no internet but does know the time. Local only.
+            "clock_source": GPS_CLOCK.source,
+            "clock_step_s": GPS_CLOCK.last_step_sec,
+            "clock_set_at": GPS_CLOCK.set_at,
             "sats_in_use":  sats_in_use,
             "updated_at":   time.time(),
         }
@@ -2884,6 +2906,185 @@ def detect_baud_rate(device: str) -> int | None:
     return None
 
 
+# -- GPS as a clock source (v1.6.1) --------------------------------------------
+#
+# A Pi has no RTC. Booted with no internet it restores whatever systemd saved
+# last, so every detection it records carries a wrong timestamp until the node
+# reaches a time server -- which for a node in a field may be hours away, or
+# never. Its own GPS already knows UTC to the second.
+#
+# Deliberately the node's OWN receiver, never an aircraft's broadcast: a Remote
+# ID transmitter is anything anyone cares to build, and taking time from one
+# would let a passer-by decide what time this node thinks it is. Aircraft time
+# stays what it already is -- a local hint about how far off this clock looks.
+
+GPS_CLOCK_MIN_STEP_SEC = 2.0        # below this, not worth stepping
+GPS_CLOCK_SAMPLES = 3               # consistent fixes required before stepping
+GPS_CLOCK_AGREE_SEC = 2.0           # how closely those samples must agree
+GPS_CLOCK_SAMPLE_WINDOW_SEC = 120   # forget samples older than this
+# Receivers hit by the GPS week rollover report a date ~19.6 years in the past.
+# Nothing this fleet does predates 2026, so an earlier date is a broken
+# receiver rather than a wrong clock, and must never be acted on.
+GPS_TIME_FLOOR = 1767225600         # 2026-01-01T00:00:00Z
+_TIMESYNC_STAMP = "/var/lib/systemd/timesync/clock"
+
+_ntp_cache = {"at": 0.0, "synced": False}
+
+
+def _clock_is_ntp_synced() -> bool:
+    """True when the kernel says its clock is disciplined by a time source.
+
+    Same question web_ui._clock_synced asks, the same way: ntp_adjtime() rather
+    than any particular daemon, so it reads correctly under systemd-timesyncd,
+    chrony or ntpd. A zeroed buffer makes the call a read-only query, and
+    TIME_ERROR (5) is what the kernel returns while STA_UNSYNC is set.
+    """
+    now = time.monotonic()
+    if now - _ntp_cache["at"] < 30:
+        return _ntp_cache["synced"]
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        buf = (ctypes.c_byte * 512)()
+        synced = libc.ntp_adjtime(ctypes.byref(buf)) != 5
+    except Exception:
+        synced = os.path.exists("/run/systemd/timesync/synchronized")
+    _ntp_cache.update(at=now, synced=bool(synced))
+    return _ntp_cache["synced"]
+
+
+def _nmea_checksum_ok(sentence: str) -> bool:
+    """Validate an NMEA sentence's trailing *HH checksum.
+
+    The position parser never checked it, and for a position it hardly matters
+    -- a corrupt fix is a dot in the wrong place for one second. A corrupt DATE
+    would step this node's clock by years, so every sentence used for time is
+    checked first.
+    """
+    body, star, given = sentence.partition("*")
+    if not star or len(given) < 2:
+        return False
+    check = 0
+    for ch in (body[1:] if body.startswith("$") else body):
+        check ^= ord(ch)
+    try:
+        return check == int(given[:2], 16)
+    except ValueError:
+        return False
+
+
+def _parse_rmc_epoch(parts: list) -> float | None:
+    """UTC epoch seconds from an $GxRMC sentence: field 1 HHMMSS(.sss), field 9
+    DDMMYY, both UTC. None unless the fix is valid and both fields parse."""
+    if len(parts) < 10 or parts[2] != "A":
+        return None
+    hms, date = parts[1], parts[9]
+    if len(hms) < 6 or len(date) != 6:
+        return None
+    try:
+        second = float(hms[4:])
+        stamp = datetime(2000 + int(date[4:6]), int(date[2:4]), int(date[0:2]),
+                         int(hms[0:2]), int(hms[2:4]), int(second),
+                         tzinfo=timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+    return stamp.timestamp() + (second - int(second))
+
+
+def _set_system_clock(epoch: float) -> bool:
+    """clock_settime(CLOCK_REALTIME). Requires root, which the feeder has."""
+    class _Timespec(ctypes.Structure):
+        _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        ts = _Timespec(int(epoch), int((epoch - int(epoch)) * 1_000_000_000))
+        if libc.clock_settime(0, ctypes.byref(ts)) != 0:
+            log.warning("[GPS] clock_settime failed: "
+                        f"{os.strerror(ctypes.get_errno())}")
+            return False
+        return True
+    except Exception as e:
+        log.warning(f"[GPS] Could not set the clock: {e}")
+        return False
+
+
+def _persist_clock_for_next_boot() -> None:
+    """Bump systemd's saved-clock stamp so the next offline boot starts near
+    the right time instead of back where this one started."""
+    try:
+        if os.path.exists(_TIMESYNC_STAMP):
+            os.utime(_TIMESYNC_STAMP, None)
+    except OSError:
+        pass
+
+
+class _GpsClock:
+    """Steps the system clock onto GPS time while nothing better exists.
+
+    Guards, in order: a date before 2026 is a broken receiver; an NTP-synced
+    clock outranks GPS and is left alone; several fixes must agree before
+    anything is touched, so one mangled sentence cannot move the clock.
+    """
+
+    def __init__(self):
+        self.samples = []          # (monotonic, gps_epoch - system_time)
+        self.source = None         # None | "ntp" | "gps"
+        self.last_step_sec = None
+        self.set_at = None
+        self._warned_rollover = False
+
+    def observe(self, gps_epoch: float) -> float | None:
+        """Feed one valid RMC timestamp. Returns the step applied, if any."""
+        if gps_epoch < GPS_TIME_FLOOR:
+            if not self._warned_rollover:
+                self._warned_rollover = True
+                log.warning(
+                    "[GPS] Receiver reports "
+                    f"{datetime.fromtimestamp(gps_epoch, timezone.utc):%Y-%m-%d}, "
+                    "which is before this software existed — ignoring it as a "
+                    "time source (GPS week rollover in an older receiver)."
+                )
+            return None
+
+        if _clock_is_ntp_synced():
+            # NTP wins: it is what the server validates timestamps against.
+            self.source = "ntp"
+            self.samples.clear()
+            return None
+
+        now_mono = time.monotonic()
+        self.samples = [(m, d) for (m, d) in self.samples
+                        if now_mono - m <= GPS_CLOCK_SAMPLE_WINDOW_SEC]
+        self.samples.append((now_mono, gps_epoch - time.time()))
+        if len(self.samples) < GPS_CLOCK_SAMPLES:
+            return None
+
+        recent = [d for _, d in self.samples[-GPS_CLOCK_SAMPLES:]]
+        if max(recent) - min(recent) > GPS_CLOCK_AGREE_SEC:
+            return None            # receiver still settling — wait
+        step = sorted(recent)[len(recent) // 2]
+        if abs(step) < GPS_CLOCK_MIN_STEP_SEC:
+            self.source = "gps"    # already on GPS time, nothing to do
+            return None
+
+        if not _set_system_clock(time.time() + step):
+            return None
+        self.samples.clear()
+        self.source = "gps"
+        self.last_step_sec = step
+        self.set_at = time.time()
+        log.warning(
+            f"[GPS] Clock was {abs(step):.1f}s "
+            f"{'behind' if step > 0 else 'ahead of'} GPS — set from this "
+            f"node's own receiver to {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC. "
+            "Detections recorded from now on carry the correct time."
+        )
+        _persist_clock_for_next_boot()
+        return step
+
+
+GPS_CLOCK = _GpsClock()
+
+
 def gps_reader_thread(device: str):
     """Background thread: reads NMEA sentences, updates _gps_lat/_gps_lon,
     and surfaces current state to /run/droneaware/gps_state.json for the
@@ -3001,6 +3202,15 @@ def gps_reader_thread(device: str):
                     if not line.startswith(('$GPRMC', '$GNRMC')):
                         continue
                     parts = line.split(',')
+                    # v1.6.1: this sentence also carries UTC date and time, and
+                    # on a node with no internet it is the only thing that
+                    # knows them. Checksum first — a corrupt date must never
+                    # reach the clock. Position handling below is unchanged and
+                    # stays tolerant of a missing checksum.
+                    if _nmea_checksum_ok(line):
+                        epoch = _parse_rmc_epoch(parts)
+                        if epoch is not None:
+                            GPS_CLOCK.observe(epoch)
                     if len(parts) < 7 or parts[2] != 'A':
                         continue
                     try:
@@ -3217,7 +3427,9 @@ class WiFiFeeder:
         self.verbose     = verbose
         self.token       = token
         self.band        = band  # "auto" | "2g" | "5g" — v1.5.0 dual-adapter mode
-        self.start_time  = time.time()
+        # Monotonic: uptime must survive the clock being stepped onto GPS
+        # time, which on a node that booted offline can move it by hours.
+        self.start_time  = time.monotonic()
         # Each feeder process gets its own spool directory. wifi-2g and
         # wifi-5g run as separate processes against one node_id; sharing a
         # segment directory would have them appending to the same file and
@@ -3765,7 +3977,7 @@ class WiFiFeeder:
                     return True
                 log.info(
                     f"[Heartbeat] FAULT — wifi_ok=False  reason={reason}  "
-                    f"uptime={int(time.time() - self.start_time)}s"
+                    f"uptime={int(time.monotonic() - self.start_time)}s"
                 )
                 if not self.token:
                     continue
@@ -3778,7 +3990,7 @@ class WiFiFeeder:
                 mobile   = os.environ.get("NODE_MOBILE", "false").lower() == "true"
                 common = {
                     "node_id":      self.node_id,
-                    "uptime_s":     int(time.time() - self.start_time),
+                    "uptime_s":     int(time.monotonic() - self.start_time),
                     "fw_version":   FW_VERSION,
                     "cpu_count":    os.cpu_count(),
                     "cpu_temp_c":   cpu_temp,
@@ -3848,7 +4060,7 @@ class WiFiFeeder:
                             # uses presence of an ok-field to route the
                             # heartbeat to that feeder's status row.
                             "node_id":      self.node_id,
-                            "uptime_s":     int(time.time() - self.start_time),
+                            "uptime_s":     int(time.monotonic() - self.start_time),
                             "fw_version":   FW_VERSION,
                             "cpu_count":    os.cpu_count(),
                             "cpu_temp_c":   cpu_temp,
