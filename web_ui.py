@@ -1281,6 +1281,12 @@ def api_status():
         # "by how much, and in which direction" — and it works with no server,
         # no internet and no RTC, because the aircraft carry GPS time.
         "clock_skew_sec": _clock_skew_sec(),
+        # Where the node's time came from: "ntp", "gps" (v1.6.1 — set from the
+        # node's own receiver when no time server was reachable), or None. A
+        # node with GPS and no internet knows the time perfectly well, and the
+        # UI warned about it anyway because `clock_synced` only knows about
+        # NTP.
+        "clock_source": _clock_source(),
         "node_id":     _read_config_env("NODE_ID") or "this-node",
         # Whether a Protomaps region pack has been downloaded. When true the
         # frontend renders vector tiles from /map.pmtiles and needs neither
@@ -1779,6 +1785,24 @@ def _clock_skew_sec() -> float | None:
         if worst is None or abs(skew) > abs(worst):
             worst = float(skew)
     return worst
+
+
+def _clock_source() -> str | None:
+    """"ntp", "gps", or None — what last set this node's clock.
+
+    The WiFi feeder records this in gps_state.json when it steps the clock
+    from the node's own GPS. NTP is asked directly, and wins: a node that
+    reaches a time server is disciplined continuously, while GPS only sets
+    the clock when nothing else can.
+    """
+    if _clock_synced():
+        return "ntp"
+    try:
+        with open(GPS_STATE_PATH) as f:
+            src = json.load(f).get("clock_source")
+        return src if src in ("gps", "ntp") else None
+    except Exception:
+        return None
 
 
 def _clock_synced() -> bool:

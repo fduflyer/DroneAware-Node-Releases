@@ -1114,8 +1114,13 @@
       to   { transform: translateY(0);    opacity: 1; }
     }
 
-    /* ========== Mobile responsive (< 768px) ========== */
-    @media (max-width: 767px) {
+    /* ========== Mobile responsive ==========
+       Narrow OR short. A phone in landscape is ~844x390: wide enough to miss
+       a width-only breakpoint, far too short for a 340px sidebar beside the
+       map — it left the map about 500x300 and sent operators back to portrait,
+       where the header controls were off-screen. Flipping the sidebar to the
+       same bottom sheet on short screens gives the map the full width. */
+    @media (max-width: 767px), (max-height: 500px) {
       .main { flex-direction: column; }
       .sidebar {
         position: fixed;
@@ -1145,6 +1150,53 @@
       .sidebar-filters { padding-top: 24px; }
       .map { width: 100%; height: 100%; }
       .modal-body { grid-template-columns: 1fr; }
+    }
+
+    /* ---- Phone widths: the header has to wrap ----
+       Brand, the LOCAL VIEWER line and four 44px controls do not fit across a
+       360-390px screen, and the header is one non-wrapping row: every control
+       (Replay, units, theme, Settings) sat off the right edge with no way to
+       scroll to them, so on a phone the UI was the map and nothing else.
+       Controls stay on the first row with the mark; the status line moves to a
+       second row. --header-h must grow with it, because .main computes the map
+       height from that variable. */
+    @media (max-width: 767px) {
+      :root { --header-h: 92px; }
+      .header {
+        height: var(--header-h);
+        flex-wrap: wrap;
+        align-content: center;
+        row-gap: 4px;
+        padding: 0 12px;
+      }
+      /* The mark alone identifies the page; the words cost 110px that the
+         controls need. */
+      .brand-wordmark span { display: none; }
+      .header-right { margin-left: auto; gap: 6px; }
+      .header-center {
+        order: 3;
+        width: 100%;
+        flex: none;
+        justify-content: flex-start;
+        gap: 8px;
+      }
+    }
+
+    /* ---- Touch targets ----
+       Settings tabs (33px tall), the close button (32px) and Leaflet's zoom
+       controls (30px) are comfortable with a mouse and fiddly with a finger.
+       Only on touch devices, so desktop density is unchanged. */
+    @media (pointer: coarse) {
+      .cfg-tab { min-height: 44px; }
+      #settings-close { width: 44px; height: 44px; }
+      .leaflet-touch .leaflet-bar a,
+      .leaflet-control-zoom-in,
+      .leaflet-control-zoom-out {
+        width: 44px !important;
+        height: 44px !important;
+        line-height: 44px !important;
+        font-size: 22px !important;
+      }
     }
   </style>
 </head>
@@ -2229,6 +2281,7 @@
       open: false,
       active: false,           // true while the map is showing history
       loading: false,
+      fitted: false,           // has this session put the map on the flights yet
       savedFreshness: null,
 
       async show() {
@@ -2379,6 +2432,7 @@
         // which every historical record is, by definition.
         if (!replay.active) {
           replay.active = true;
+          replay.fitted = false;
           replay.savedFreshness = new Set(state.filters.freshness);
         }
         // Historical records are old by definition, so the freshness chips
@@ -2416,6 +2470,29 @@
         }
         for (const mac of state.macs.keys()) { updateMarker(mac); renderCard(mac); }
         applyFilters();
+
+        // Put the map where the flights actually are. The map stays on the
+        // node's home location, which is wrong for exactly the nodes replay
+        // matters most to: a node that travels records its flights somewhere
+        // else entirely, so replay reported thousands of detections over an
+        // empty screen. Fit once per replay session, and afterwards only when
+        // nothing is on screen, so scrubbing the slider never fights the
+        // operator's own panning.
+        const pts = [];
+        for (const e of state.macs.values()) {
+          if (e.trail && e.trail.length) {
+            for (const p of e.trail) pts.push(L.latLng(p[0], p[1]));
+          } else if (e.marker) {
+            pts.push(e.marker.getLatLng());
+          }
+        }
+        if (pts.length) {
+          const view = state.map.getBounds();
+          if (!replay.fitted || !pts.some(p => view.contains(p))) {
+            state.map.fitBounds(L.latLngBounds(pts), { padding: [40, 40], maxZoom: 16 });
+            replay.fitted = true;
+          }
+        }
 
         const n = state.macs.size;
         if (n) {
@@ -2673,12 +2750,48 @@
      */
     const CLOCK_SKEW_WARN_SEC = 60;
 
-    function renderClockSkew(skewSec) {
+    // The clock row says where the node's time comes from, and shows that time.
+    // It used to appear only to warn, in amber, and a node whose clock was
+    // perfectly fine still got an amber row reading "—" with nothing to act on.
+    // A node with GPS and no internet knows the time exactly; saying so is the
+    // point of the row.
+    function renderClock(s) {
       const row = document.getElementById("row-clock");
-      if (skewSec == null || Math.abs(skewSec) < CLOCK_SKEW_WARN_SEC) {
-        row.hidden = true;
+      const icon = document.getElementById("clock-icon");
+      const value = document.getElementById("clock-value");
+      const skewSec = s.clock_skew_sec;
+      const clock = new Date(nodeNow() * 1000).toLocaleTimeString([], {
+        hour: "2-digit", minute: "2-digit",
+      });
+      row.hidden = false;
+
+      const bad = skewSec != null && Math.abs(skewSec) >= CLOCK_SKEW_WARN_SEC;
+      if (!bad && (s.clock_source === "ntp" || s.clock_source === "gps")) {
+        const from = s.clock_source === "gps" ? "GPS" : "network";
+        icon.setAttribute("class", "health-icon ic-gps");
+        value.textContent = `${clock} · ${from}`;
+        row.title = s.clock_source === "gps"
+          ? "This node has no time server, and set its clock from its own GPS "
+            + "receiver. Times on this page are correct."
+          : "This node's clock is set from a time server. Times on this page "
+            + "are correct.";
         return;
       }
+
+      icon.setAttribute("class", "health-icon ic-warn");
+      if (!bad) {
+        // Nothing has set the clock, and no aircraft has been heard to say by
+        // how far it is out. The time shown is whatever the node restored at
+        // boot, which is the state worth flagging.
+        value.textContent = `${clock} · not set`;
+        row.title =
+          "Nothing has set this node's clock: no time server was reachable "
+          + "and it has no GPS fix. Times on this page may be wrong. They "
+          + "correct themselves once the node reaches the internet, or gets a "
+          + "GPS fix.";
+        return;
+      }
+
       const behind = skewSec > 0;          // node clock is SLOW
       const mag = Math.abs(skewSec);
       let amount;
@@ -2689,9 +2802,7 @@
       } else {
         amount = `${Math.round(mag / 60)}m`;
       }
-      document.getElementById("clock-value").textContent =
-        `out of sync by ${amount}`;
-      row.hidden = false;
+      value.textContent = `out of sync by ${amount}`;
       row.title =
         `This node's clock is ${amount} ${behind ? "behind" : "ahead of"} the `
         + "GPS time broadcast by nearby aircraft. Times shown on this page are "
@@ -2751,7 +2862,7 @@
         setNodeClock(s.now);
         renderFeeders(s.feeders);
         renderLocation(s);
-        renderClockSkew(s.clock_skew_sec);
+        renderClock(s);
         setHeaderStatus(undefined, s.uplink_ok !== false);
         document.getElementById("stat-buffer").textContent =
           `${s.buffer_pct}% (${(s.buffer_bytes / 1e6).toFixed(1)} MB)`;
