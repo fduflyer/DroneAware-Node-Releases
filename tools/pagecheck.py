@@ -100,6 +100,13 @@ def main():
     ap.add_argument("--port", type=int, default=9222)
     ap.add_argument("--screenshot", help="write a PNG here after evaluating")
     ap.add_argument("--window", default="1280,800", help="WIDTH,HEIGHT")
+    # Headless Chromium refuses to size its window below 500px, so --window
+    # cannot reach phone widths and every phone layout went untested. Device
+    # emulation can: it drives the viewport the page actually sees, and turns
+    # on touch so `pointer: coarse` rules apply as they would on a phone.
+    ap.add_argument("--mobile", metavar="WIDTH,HEIGHT",
+                    help="emulate a phone viewport, e.g. 390,844 (portrait) "
+                         "or 844,390 (landscape)")
     args = ap.parse_args()
 
     if not CHROME:
@@ -112,6 +119,13 @@ def main():
         cdp.send("Runtime.enable")
         cdp.send("Log.enable")
         cdp.send("Page.enable")
+        if args.mobile:
+            w, h = (int(n) for n in args.mobile.split(","))
+            cdp.send("Emulation.setDeviceMetricsOverride", width=w, height=h,
+                     deviceScaleFactor=1, mobile=True)
+            cdp.send("Emulation.setTouchEmulationEnabled", enabled=True,
+                     maxTouchPoints=5)
+            print(f"  emulating {w}x{h} with touch")
         cdp.send("Page.navigate", url=args.url)
         cdp.drain(args.wait)
 
