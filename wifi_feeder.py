@@ -2784,6 +2784,18 @@ _SIRF_SYNC = b"\xa0\xa2"    # SiRF binary frame start
 _UBX_SYNC  = b"\xb5\x62"    # u-blox UBX frame start
 
 
+# How often the GPS reader re-checks a port nothing is transmitting on, and
+# how often it repeats the "wrong protocol" warning. Both used to be one
+# message every 30s forever, which is the bulk of the journal on any node
+# without a GPS.
+# 60s, not longer: `droneaware status` calls the state file stale after 120s
+# and says the feeder may have stopped, so the reader has to keep refreshing
+# it even while there is nothing to report.
+GPS_SILENT_RETRY_SEC = 60
+GPS_PROTOCOL_WARN_EVERY_SEC = 3600
+_gps_quiet = {"warned_silent": False, "last_protocol_warn": 0.0}
+
+
 def detect_gps_protocol(device: str) -> tuple[str, int | None]:
     """Sniff the GPS device to identify its output protocol.
 
@@ -2797,12 +2809,14 @@ def detect_gps_protocol(device: str) -> tuple[str, int | None]:
     the runtime just reports the state and lets those paths handle it.
     Log-only at feeder startup: we never modify the chip from the reader.
     """
+    heard_anything = False
     for baud in GPS_BAUD_RATES:
         try:
             with serial.Serial(device, baudrate=baud, timeout=2) as ser:
                 sample = ser.read(512)
                 if not sample:
                     continue
+                heard_anything = True
                 # NMEA sentences start with '$G' followed by two ASCII letters
                 # (GP, GN, GL, GA, GB — every talker prefix we care about).
                 # Any occurrence within the sample counts as a positive ID.
@@ -2815,7 +2829,12 @@ def detect_gps_protocol(device: str) -> tuple[str, int | None]:
                     return ("ubx", baud)
         except serial.SerialException:
             continue
-    return ("unknown", None)
+    # "silent" and "unknown" are different problems and only one is worth
+    # nagging about. /dev/serial0 exists on every Pi whether or not anything
+    # is wired to the GPIO header, so a mobile node with no GPS probes a port
+    # that will never say anything — and used to log a warning about it every
+    # 38 seconds for the life of the node.
+    return ("unknown" if heard_anything else "silent", None)
 
 
 def find_gps_device() -> str | None:
@@ -3106,14 +3125,40 @@ def gps_reader_thread(device: str):
             # `droneaware gps-diagnose` can guide the operator to run the
             # remediation path (installer / cmd_update / gps-diagnose --fix).
             protocol, sniff_baud = detect_gps_protocol(device)
+            if protocol == "silent":
+                # Nothing is transmitting. On a mobile node with no GPS wired
+                # to the GPIO header this is the normal, permanent state of
+                # /dev/serial0, so say it once and then keep checking quietly
+                # — a receiver plugged in later is still picked up, just
+                # without a warning every 38 seconds in between.
+                _write_gps_state(device=device, status="no_signal",
+                                 protocol=protocol, baud=None)
+                if not _gps_quiet["warned_silent"]:
+                    _gps_quiet["warned_silent"] = True
+                    log.warning(
+                        f"[GPS] Nothing is transmitting on {device}. If no GPS "
+                        "is attached, that is expected — the Pi's own serial "
+                        "port exists either way — and nothing else here needs "
+                        "one. If you do have a receiver, check its wiring and "
+                        "power. Still checking every minute; this will not be "
+                        "repeated."
+                    )
+                time.sleep(GPS_SILENT_RETRY_SEC)
+                continue
+            _gps_quiet["warned_silent"] = False   # something spoke; start over
             if protocol != "nmea":
                 _write_gps_state(device=device, status="wrong_protocol",
                                  protocol=protocol, baud=sniff_baud)
-                log.warning(
-                    f"[GPS] Device {device} is in '{protocol}' mode, not NMEA — "
-                    "DroneAware cannot parse this. Run 'sudo droneaware gps-diagnose' "
-                    "for remediation. Retrying in 30s."
-                )
+                # A real device speaking the wrong language is worth repeating,
+                # but hourly, not twice a minute.
+                now = time.monotonic()
+                if now - _gps_quiet["last_protocol_warn"] >= GPS_PROTOCOL_WARN_EVERY_SEC:
+                    _gps_quiet["last_protocol_warn"] = now
+                    log.warning(
+                        f"[GPS] Device {device} is in '{protocol}' mode, not NMEA — "
+                        "DroneAware cannot parse this. Run 'sudo droneaware gps-diagnose' "
+                        "for remediation. Retrying every 30s."
+                    )
                 time.sleep(30)
                 continue
 

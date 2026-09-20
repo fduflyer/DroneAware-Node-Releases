@@ -2543,6 +2543,11 @@ elif status == "wrong_protocol":
     print(f"             run 'sudo droneaware gps-diagnose' for remediation")
 elif status == "detecting_baud":
     print(f"  GPS      : {device} — detecting baud rate...")
+elif status == "no_signal":
+    # The port exists but nothing is transmitting on it. Normal and permanent
+    # on a mobile node with no GPS wired to the GPIO header: /dev/serial0 is
+    # there on every Pi regardless.
+    print(f"  GPS      : {device} — nothing transmitting (no receiver attached?)")
 elif status == "no_nmea":
     print(f"  GPS      : {device} — device exists but no valid NMEA detected")
 elif status == "reading":
