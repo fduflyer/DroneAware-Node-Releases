@@ -2320,6 +2320,14 @@ def sse_events():
                     event = q.get(timeout=15)
                     yield f"data: {json.dumps(event)}\n\n"
                 except Empty:
+                    # A named event, not a bare comment. Browsers never
+                    # surface comments to the page, so a client could not tell
+                    # a quiet node from a connection that had died: a
+                    # half-open TCP connection stays readyState OPEN, no error
+                    # fires, and the page shows stale data until someone
+                    # reloads it. This gives the page a signal it can miss.
+                    # Old clients ignore an event type they never registered.
+                    yield "event: ping\ndata: {}\n\n"
                     yield ": keep-alive\n\n"
         except GeneratorExit:
             pass

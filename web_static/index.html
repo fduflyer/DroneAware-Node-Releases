@@ -741,6 +741,22 @@
       flex: 1;
       min-height: 0;
       background: var(--bg-primary);
+      position: relative;        /* anchors the follow lock */
+    }
+
+    /* Follow lock. Above Leaflet's own controls (z-index 400-1000) and clear
+       of the zoom buttons on the other side. */
+    .map-follow {
+      position: absolute;
+      top: 12px; right: 12px;
+      z-index: 500;
+      background: var(--bg-surface);
+      font-size: 20px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+    }
+    .map-follow.is-on {
+      color: var(--accent);
+      border-color: var(--accent);
     }
 
     /* ---- Replay ---- */
@@ -1389,7 +1405,13 @@
         </div>
         <p class="replay-note" id="replay-note" hidden></p>
       </div>
-      <div class="map" id="map"></div>
+      <div class="map" id="map">
+        <!-- Only on a node that moves. Blue = the map is locked to the node
+             and follows its GPS; grey = you have panned away and it is
+             holding still. -->
+        <button class="icon-btn map-follow is-on" id="btn-follow" hidden
+                aria-pressed="true" title="Locked to this node — following its GPS">◎</button>
+      </div>
     </div>
   </div>
 
@@ -1583,6 +1605,11 @@
       macs: new Map(),               // mac -> { event, first_seen, last_seen, marker, card, trail, polyline, showTrail, opMarker, connector }
       // nodeClockOffset = node time - browser time, in seconds. See nodeNow().
       nodeClockOffset: 0,
+      // A node that moves keeps the map on itself until you pan away.
+      followNode: true,
+      mapMoveIsOurs: false,          // true while WE move the map, so the
+                                     // handlers below can tell our own
+                                     // recentering from a human panning
       filters: {
         freshness: new Set(["live", "recent", "older"]),
         radio:     new Set(["wifi", "ble"]),
@@ -1736,6 +1763,14 @@
         preferCanvas: true,
       });
       state.map = m;
+      // Panning or zooming by hand releases the follow lock — the map is
+      // yours until you ask for it back. Guarded so our own recentering does
+      // not switch itself off.
+      m.on("dragstart", () => { if (!state.mapMoveIsOurs) setFollowLock(false); });
+      m.on("zoomstart", () => { if (!state.mapMoveIsOurs) setFollowLock(false); });
+      document.getElementById("btn-follow").addEventListener("click", () => {
+        setFollowLock(!state.followNode, true);
+      });
       state.homeLayer = L.layerGroup().addTo(m);   // holds home marker + rings
       // Deliberately NOT applying a basemap here. Which one is correct
       // depends on whether this node has a pack or can reach the tile host,
@@ -1791,6 +1826,50 @@
       };
     }
 
+    // ── Follow lock (mobile nodes) ───────────────────────────────────────
+    // Blue: the map is locked to the node and recenters on every GPS fix.
+    // Grey: you panned away, so it holds still until you lock it again.
+    // Only shown on a node that reports a live GPS position — a node bolted
+    // to a roof has nothing to follow.
+    // Every map move the page makes itself goes through here. A plain flag
+    // set around the call is not enough: Leaflet starts an animated move on
+    // the next frame, so the flag is already cleared when the map reports the
+    // move starting, and our own recentering reads as the operator panning —
+    // which switches the follow lock off. Hold the flag until the movement
+    // settles, with a timeout in case no event arrives.
+    function ourMapMove(fn) {
+      state.mapMoveIsOurs = true;
+      try {
+        fn();
+      } finally {
+        state.map.once("moveend zoomend", () => { state.mapMoveIsOurs = false; });
+        setTimeout(() => { state.mapMoveIsOurs = false; }, 1200);
+      }
+    }
+
+    function setFollowLock(on, recenter) {
+      state.followNode = !!on;
+      if (on && recenter && state.home && state.home.lat != null) {
+        ourMapMove(() => state.map.setView(
+          [state.home.lat, state.home.lon], state.map.getZoom(), { animate: true }));
+      }
+      updateFollowLock();
+    }
+
+    function updateFollowLock() {
+      const btn = document.getElementById("btn-follow");
+      if (!btn) return;
+      const mobile = !!(state.home && state.home.source === "gps");
+      btn.hidden = !mobile;
+      if (!mobile) return;
+      const on = !!state.followNode;
+      btn.classList.toggle("is-on", on);
+      btn.setAttribute("aria-pressed", on ? "true" : "false");
+      btn.title = on
+        ? "Locked to this node — following its GPS"
+        : "Not following. Tap to lock the map to this node.";
+    }
+
     function drawHomeView(home) {
       if (!home || home.lat == null || home.lon == null) {
         // No home location available — leave map at continental-US default
@@ -1827,8 +1906,22 @@
         // at that scale in a world overview. Pull back to where it has
         // something to draw; a region pack or the proxy has no such limit.
         if (state.mapSource === "world") z = Math.min(z, WORLD_PACK_MAX_ZOOM);
-        state.map.setView(center, z);
+        // Guarded: this zoom is ours, not the operator's. Unguarded it fired
+        // the same handler a human pan does and switched the follow lock off
+        // during startup, so a moving node never followed until someone
+        // noticed the grey button.
+        ourMapMove(() => state.map.setView(center, z));
+      } else if (home.source === "gps" && state.followNode) {
+        // A node that travels drives off its own map: the marker moved while
+        // the view stayed where the node started, so an operator driving with
+        // the UI open watched empty space and had to reload the page to find
+        // themselves. A mobile node now follows its own GPS, the way any
+        // moving map does. Panning releases the lock so this never fights a
+        // deliberate look elsewhere; the lock button puts it back.
+        ourMapMove(() => state.map.setView(center, state.map.getZoom(),
+                                           { animate: false }));
       }
+      updateFollowLock();
       const ring       = ringStyle();
 
       // Concentric distance rings, dashed. Colour comes from the active
@@ -2489,7 +2582,10 @@
         if (pts.length) {
           const view = state.map.getBounds();
           if (!replay.fitted || !pts.some(p => view.contains(p))) {
-            state.map.fitBounds(L.latLngBounds(pts), { padding: [40, 40], maxZoom: 16 });
+            // Guarded like every move we make ourselves, so framing the
+            // history does not read as the operator panning away.
+            ourMapMove(() => state.map.fitBounds(L.latLngBounds(pts),
+                                                 { padding: [40, 40], maxZoom: 16 }));
             replay.fitted = true;
           }
         }
@@ -2918,16 +3014,42 @@
     /* ----- SSE ----- */
     function connectSSE() {
       if (state.sse) try { state.sse.close(); } catch (e) {}
+      if (state.sse) { try { state.sse.close(); } catch {} }
       const es = new EventSource("/events");
+      state.sseLastAt = Date.now();
+      state.sseConnects = (state.sseConnects || 0) + 1;
       es.onmessage = (e) => {
+        state.sseLastAt = Date.now();
         try { handleEvent(JSON.parse(e.data)); } catch {}
       };
+      // The node sends one of these every 15s when nothing is flying. Their
+      // absence is the only way this page can tell a quiet node from a dead
+      // connection.
+      es.addEventListener("ping", () => {
+        state.sseLastAt = Date.now();
+        setHeaderStatus(true, undefined);
+      });
       es.onerror = () => {
         setHeaderStatus(false, undefined);
         // EventSource auto-reconnects; just visually flip to OFFLINE
       };
-      es.onopen = () => setHeaderStatus(true, undefined);
+      es.onopen = () => {
+        state.sseLastAt = Date.now();
+        setHeaderStatus(true, undefined);
+      };
       state.sse = es;
+    }
+
+    // A connection that dies without closing — a phone that slept, a car
+    // network that dropped, any NAT that forgot the mapping — leaves
+    // EventSource in readyState OPEN with nothing arriving and no error
+    // raised, so the page kept showing stale detections until someone
+    // reloaded it by hand. Three missed pings is dead: reconnect.
+    function sseWatchdog() {
+      const stallMs = (state.sseStallSec || 45) * 1000;
+      if (!state.sse || Date.now() - (state.sseLastAt || 0) < stallMs) return;
+      setHeaderStatus(false, undefined);
+      connectSSE();
     }
     // Two independent things fail here and they mean different things:
     //   browser -> node   the page has lost this node; nothing on screen can
@@ -3386,6 +3508,7 @@ ${multiSerialHTML}
       // Periodic loops
       setInterval(refreshStatus, 2000);
       setInterval(refreshFreshness, 1000);
+      setInterval(sseWatchdog, 5000);
 
       // Pause SSE handling when tab is hidden (per brand guide)
       document.addEventListener("visibilitychange", () => {
