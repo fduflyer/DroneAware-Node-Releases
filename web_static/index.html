@@ -742,10 +742,16 @@
       min-height: 0;
       background: var(--bg-primary);
       position: relative;        /* anchors the follow lock */
+      /* Leaflet gives its panes and controls z-indexes of 200-1000. Without a
+         stacking context of its own the map competed with the rest of the
+         page on those numbers and won: on a phone it painted over the bottom
+         sheet (z-index 50), hiding everything but the one feeder row that
+         hung below the map's edge. */
+      isolation: isolate;
     }
 
-    /* Follow lock. Above Leaflet's own controls (z-index 400-1000) and clear
-       of the zoom buttons on the other side. */
+    /* Follow lock. Above Leaflet's map panes (z-index 400) and clear of the
+       zoom buttons on the other side. */
     .map-follow {
       position: absolute;
       top: 12px; right: 12px;
@@ -927,6 +933,8 @@
       color: var(--text-dim);
     }
     .statusbar .sep { color: var(--text-muted); }
+    /* Only the phone layout shows it; see the bottom sheet below. */
+    .sheet-handle { display: none; }
     .statusbar .label {
       text-transform: uppercase;
       letter-spacing: 0.08em;
@@ -1137,6 +1145,7 @@
        where the header controls were off-screen. Flipping the sidebar to the
        same bottom sheet on short screens gives the map the full width. */
     @media (max-width: 767px), (max-height: 500px) {
+      :root { --sheet-peek: 48px; }
       .main { flex-direction: column; }
       .sidebar {
         position: fixed;
@@ -1144,7 +1153,7 @@
         left: 0; right: 0;
         width: 100%;
         max-height: 60vh;
-        transform: translateY(calc(100% - 48px));
+        transform: translateY(calc(100% - var(--sheet-peek)));
         transition: transform 0.25s ease-out;
         border-right: none;
         border-top: 1px solid var(--border);
@@ -1153,7 +1162,13 @@
         z-index: 50;
       }
       .sidebar.open { transform: translateY(0); }
-      .sidebar::before {
+      /* One scroll for the whole sheet. As a flex column the list was the
+         only part allowed to shrink, so on a landscape phone (sheet = 60% of
+         390px) the radio rows filled the sheet and the list got zero height
+         with nothing to scroll to. */
+      .sidebar { display: block; overflow-y: auto; overscroll-behavior: contain; }
+      .sidebar-list { overflow: visible; }
+      .sheet-handle::before {
         content: "";
         position: absolute;
         top: 6px; left: 50%;
@@ -1163,6 +1178,46 @@
         background: var(--text-muted);
         opacity: 0.5;
       }
+      /* The collapsed sheet is this strip and nothing else. It used to show
+         whatever happened to be at the top of the panel — one feeder row —
+         and nothing opened it: .open was styled but never set, so on a phone
+         the other radios, the filters and the detection list could not be
+         reached at all. Now the strip summarizes every radio and opens the
+         sheet. */
+      .sheet-handle {
+        display: flex;
+        position: sticky;           /* stays put while the sheet scrolls */
+        top: 0;
+        z-index: 1;
+        background: var(--bg-surface);
+        align-items: center;
+        justify-content: center;
+        gap: 16px;
+        width: 100%;
+        height: var(--sheet-peek);
+        padding: 8px 16px 0;
+        border: 0;
+        border-bottom: 1px solid var(--border);
+        color: var(--text-dim);
+        font: inherit;
+        font-size: 12px;
+        cursor: pointer;
+        -webkit-tap-highlight-color: transparent;
+      }
+      .sheet-sum { display: inline-flex; align-items: center; gap: 6px; }
+      .sheet-sum .dot {
+        width: 9px; height: 9px;
+        border-radius: 50%;
+        background: #475569;
+      }
+      .sheet-chev { color: var(--text-muted); transition: transform 0.25s ease-out; }
+      .sidebar.open .sheet-chev { transform: rotate(180deg); }
+      /* The strip sits over the bottom of the map; lift the map's own bottom
+         corners above it so the OpenStreetMap attribution stays visible. */
+      .leaflet-bottom { bottom: var(--sheet-peek); }
+      /* The sheet is translated down, not clipped, so its hidden part hangs
+         over the status bar. Keep the status bar on top of it. */
+      .statusbar { position: relative; z-index: 60; }
       .sidebar-filters { padding-top: 24px; }
       .map { width: 100%; height: 100%; }
       .modal-body { grid-template-columns: 1fr; }
@@ -1196,6 +1251,22 @@
         justify-content: flex-start;
         gap: 8px;
       }
+      /* Six status readouts do not fit one 28px row this narrow: they wrapped
+         out of the bar and the version ran off the edge. Here the bar moves
+         to the end of the sheet (initSheet), where it can wrap, and the map
+         gets the 28px back. The end, not the top: above the list it pushed
+         the detections below the fold of the open sheet. */
+      .main { height: calc(100% - var(--header-h)); }
+      .sidebar { bottom: 0; }
+      .sidebar .statusbar {
+        position: static;
+        height: auto;
+        flex-wrap: wrap;
+        row-gap: 6px;
+        column-gap: 14px;
+        padding: 10px 16px;
+      }
+      .sidebar .statusbar .sep { display: none; }
     }
 
     /* ---- Touch targets ----
@@ -1289,6 +1360,15 @@
   <!-- Main: sidebar + map -->
   <div class="main">
     <div class="sidebar" id="sidebar">
+      <!-- Phone layout only: the collapsed bottom sheet. -->
+      <button type="button" class="sheet-handle" id="sheet-handle"
+              aria-controls="sidebar" aria-expanded="false"
+              aria-label="Radio status and detections">
+        <span class="sheet-sum" data-sum="ble"><span class="dot"></span>BLE</span>
+        <span class="sheet-sum" data-sum="wifi_2g"><span class="dot"></span>2.4 GHz</span>
+        <span class="sheet-sum" data-sum="wifi_5g"><span class="dot"></span>5 GHz</span>
+        <span class="sheet-chev" aria-hidden="true">&#9650;</span>
+      </button>
       <!-- v1.5.0 Gap 3: three-row feeder status matching My Nodes.
            Populated from /api/status's `feeders` object (data comes
            from /run/droneaware/wifi_state_{2g,5g}.json + a systemd
@@ -1771,6 +1851,9 @@
       document.getElementById("btn-follow").addEventListener("click", () => {
         setFollowLock(!state.followNode, true);
       });
+      // Tapping the map is the phone's way back from the open sheet.
+      m.on("click", () => setSheetOpen(false));
+      initSheet();
       state.homeLayer = L.layerGroup().addTo(m);   // holds home marker + rings
       // Deliberately NOT applying a basemap here. Which one is correct
       // depends on whether this node has a pack or can reach the tile host,
@@ -1868,6 +1951,55 @@
       btn.title = on
         ? "Locked to this node — following its GPS"
         : "Not following. Tap to lock the map to this node.";
+    }
+
+    // Phone bottom sheet. Only the phone layout styles .open; elsewhere the
+    // class is inert, so these are safe to call on any screen.
+    function setSheetOpen(open) {
+      document.getElementById("sidebar").classList.toggle("open", !!open);
+      document.getElementById("sheet-handle")
+        .setAttribute("aria-expanded", open ? "true" : "false");
+    }
+
+    function initSheet() {
+      const handle = document.getElementById("sheet-handle");
+      const sidebar = document.getElementById("sidebar");
+      // Tap toggles; a swipe opens (up) or closes (down). A swipe that ends
+      // on the handle can still produce a click, so the click after a swipe
+      // is ignored — and the flag resets on the next touch, so a browser that
+      // sends no click after a swipe cannot swallow the following tap.
+      let startY = null, swiped = false;
+      handle.addEventListener("touchstart", (e) => {
+        startY = e.touches[0].clientY;
+        swiped = false;
+      }, { passive: true });
+      handle.addEventListener("touchend", (e) => {
+        if (startY == null) return;
+        const dy = e.changedTouches[0].clientY - startY;
+        startY = null;
+        if (Math.abs(dy) > 24) {
+          swiped = true;
+          setSheetOpen(dy < 0);
+        }
+      });
+      handle.addEventListener("click", () => {
+        if (swiped) { swiped = false; return; }
+        setSheetOpen(!sidebar.classList.contains("open"));
+      });
+
+      // Narrow screens carry the status bar inside the sheet (see the CSS).
+      // It is moved, not copied, so refreshStatus keeps writing to the same
+      // elements, and it goes back when the screen widens — a phone turned
+      // to landscape has room for the bar again.
+      const stats = document.querySelector(".statusbar");
+      const statsParent = stats.parentNode, statsNext = stats.nextSibling;
+      const narrow = window.matchMedia("(max-width: 767px)");
+      const placeStats = () => {
+        if (narrow.matches) sidebar.appendChild(stats);
+        else statsParent.insertBefore(stats, statsNext);
+      };
+      narrow.addEventListener("change", placeStats);
+      placeStats();
     }
 
     function drawHomeView(home) {
@@ -2827,6 +2959,20 @@
           _statusEl(el, HEALTH.unknown, "\u2022", "\u2014", f.iface);
         }
       }
+      renderSheetSummary();
+    }
+
+    // The phone's collapsed sheet shows one dot per radio. Each dot copies its
+    // row's color and text rather than re-deciding health, so the summary can
+    // never disagree with the rows it stands for.
+    function renderSheetSummary() {
+      for (const key of ["ble", "wifi_2g", "wifi_5g"]) {
+        const row = document.querySelector(`[data-role="${key}-status"]`);
+        const sum = document.querySelector(`[data-sum="${key}"]`);
+        if (!row || !sum) continue;
+        sum.querySelector(".dot").style.background = row.style.color || HEALTH.unknown;
+        sum.title = row.textContent;
+      }
     }
 
     /* Say when this node's clock disagrees with the aircraft.
@@ -3013,7 +3159,6 @@
 
     /* ----- SSE ----- */
     function connectSSE() {
-      if (state.sse) try { state.sse.close(); } catch (e) {}
       if (state.sse) { try { state.sse.close(); } catch {} }
       const es = new EventSource("/events");
       state.sseLastAt = Date.now();
@@ -3087,6 +3232,9 @@
       const lat = evt.lat || evt.latitude;
       const lon = evt.lon || evt.longitude;
       if (typeof lat !== "number" || typeof lon !== "number") return;
+      // On a phone the open sheet covers the middle of the map, which is
+      // exactly where this is about to put the drone.
+      setSheetOpen(false);
       state.map.setView([lat, lon], 14, { animate: true });
       // Mark the card as selected (visual confirmation)
       document.querySelectorAll(".card.selected").forEach(el =>
