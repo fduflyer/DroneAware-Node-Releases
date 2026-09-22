@@ -2356,6 +2356,82 @@ def get_cpu_load() -> tuple[float | None, float | None, float | None]:
         return None, None, None
 
 
+# ── Platform identity (v1.6.1) ───────────────────────────────────────────────
+# Mirrors ble_feeder._platform_info (this codebase keeps each feeder's small
+# helpers in its own file, like get_cpu_temp above). Which OS and kernel a
+# node runs decides half the support answers -- the Bookworm kernels carry no
+# driver for the recommended WiFi adapter -- and none of it reached the fleet
+# view, so every investigation started by asking the operator.
+#
+# Cached: these change only on an OS upgrade or a hardware swap, and a
+# heartbeat must not shell out every time. Re-read periodically so an in-place
+# upgrade appears without restarting the feeder.
+PLATFORM_REFRESH_SEC = 6 * 3600
+_platform_cache: dict = {"at": 0.0, "info": None}
+
+
+def _first_line(path: str, limit: int = 200) -> str | None:
+    """First line of a small text file, or None. Never raises."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(limit)
+    except Exception:
+        return None
+    # /proc/device-tree strings are NUL-terminated.
+    text = raw.split(b"\x00")[0].decode("utf-8", "replace").strip()
+    return text.splitlines()[0].strip() if text else None
+
+
+def _os_codename() -> str | None:
+    """VERSION_CODENAME from /etc/os-release ("trixie", "bookworm")."""
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                key, _, value = line.partition("=")
+                if key.strip() == "VERSION_CODENAME":
+                    return value.strip().strip('"\'') or None
+    except Exception:
+        pass
+    return None
+
+
+def _bluez_version_from(out: str) -> str | None:
+    """Pull the version out of `bluetoothctl --version`.
+
+    The text around it differs between releases ("bluetoothctl: 5.82" vs a
+    bare "5.66") and could be translated, so match the number, not the
+    wording.
+    """
+    m = re.search(r"(\d+\.\d+)", out or "")
+    return m.group(1) if m else None
+
+
+def _platform_info() -> dict:
+    """OS, kernel, BlueZ and Pi model. Strings or None, never raises."""
+    now = time.monotonic()
+    cached = _platform_cache["info"]
+    if cached is not None and now - _platform_cache["at"] < PLATFORM_REFRESH_SEC:
+        return cached
+    out = ""
+    try:
+        r = subprocess.run(["bluetoothctl", "--version"], capture_output=True,
+                           text=True, timeout=5, env=_c_locale_env())
+        out = r.stdout if r.returncode == 0 else ""
+    except Exception:
+        # No bluetoothctl on a WiFi-only node, or it hung. Not an error.
+        pass
+    info = {
+        "os_codename":   _os_codename(),
+        "os_version":    _first_line("/etc/debian_version"),
+        "kernel":        os.uname().release,
+        "bluez_version": _bluez_version_from(out),
+        # Absent off a Pi, which is a real answer rather than a failure.
+        "pi_model":      _first_line("/proc/device-tree/model"),
+    }
+    _platform_cache["at"], _platform_cache["info"] = now, info
+    return info
+
+
 # /proc/stat baseline for cpu_percent delta calculation.
 # Stored across heartbeat calls so we never block (the standard psutil-style
 # `cpu_percent(interval=1.0)` would sleep 1s every minute, which is wasteful
@@ -4047,6 +4123,9 @@ class WiFiFeeder:
                     "has_gps":      has_gps,
                     "lat":          lat,
                     "lon":          lon,
+                    # Carried in FAULT too: a node that cannot scan is exactly
+                    # when knowing its OS and kernel matters.
+                    **_platform_info(),
                     # v1.4.8 telemetry — restart count is meaningful even
                     # in FAULT loop. No forwarder in FAULT mode → no
                     # buffered/dropped fields.
@@ -4117,6 +4196,9 @@ class WiFiFeeder:
                             "has_gps":      has_gps,
                             "lat":          lat,
                             "lon":          lon,
+                            # OS, kernel, BlueZ, Pi model (cached, refreshed
+                            # every 6 h so an in-place upgrade shows up).
+                            **_platform_info(),
                             # v1.4.8 telemetry additions — mirror BLE.
                             "buffered":            self.forwarder.held_events,
                             "buffered_bytes":      self.forwarder.held_bytes,
