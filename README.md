@@ -456,6 +456,7 @@ message type is received:
 | `type` | string | ASTM message type | e.g. `"Basic ID"`, `"Location/Vector"`, `"System"` |
 | `operator_lat` | float | [-90, 90] degrees, WGS84 | System message |
 | `operator_lon` | float | [-180, 180] degrees, WGS84 | System message |
+| `operator_alt_geo` | float \| null | meters, geodetic (WGS84); null when not broadcast | System message |
 
 ---
 
