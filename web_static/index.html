@@ -2183,7 +2183,7 @@
       // the "Show Flight Path" button in the drone popup. The trail
       // array stays current either way, so the polyline appears with
       // full history the moment the user toggles it on.
-      appendTrail(entry, lat, lon, altitudeSource(evt));
+      appendTrail(entry, lat, lon, trailAltitude(evt));
       if (entry.showTrail) renderTrailPolyline(entry, f.color);
 
       // Operator location ("H" marker) + dashed connector to the drone,
@@ -2687,7 +2687,7 @@
           if (typeof evt.lat === "number" && typeof evt.lon === "number") {
             // Shared with the live path so replayed flights carry altitude
             // and get the same hue-coded waypoint dots.
-            appendTrail(entry, evt.lat, evt.lon, altitudeSource(evt));
+            appendTrail(entry, evt.lat, evt.lon, trailAltitude(evt));
           }
           if (evt.serial_number) {
             (entry.serials || (entry.serials = new Set())).add(evt.serial_number);
@@ -3259,23 +3259,35 @@
       12: "Rocket",    13: "Tethered Powered", 14: "Ground Obstacle",
     };
 
-    // Altitude — prefer height_agl (ASTM RID Location bytes 17-18, real AGL
-    // or above-takeoff depending on the drone's height_type flag) over the
-    // geometric MSL/WGS84 altitude that was previously used and mislabeled.
-    // Silent fallback: if height_agl is absent we still label "AGL" — a
-    // small minority of drones only broadcast geometric altitude, and the
-    // current behavior is preserved for them.
-    function altitudeSource(evt) {
-      if (typeof evt.height_agl === "number") return evt.height_agl;
-      if (typeof evt.alt === "number") return evt.alt;
-      if (typeof evt.altitude_geo === "number") return evt.altitude_geo;
-      return null;
+    // Two different altitudes arrive in a Location message:
+    //   height_agl   — height above takeoff or above ground, per the
+    //                  drone's height_type flag (ASTM RID bytes 17-18)
+    //   alt / altitude_geo — geodetic altitude, WGS-84 HAE (height above
+    //                  the ellipsoid, near but not equal to MSL) (bytes 15-16)
+    // They differ by the ground elevation, so they must never share a label
+    // or a trail. -1000 is F3411's "unknown" and older spooled records
+    // still carry it.
+    function knownAltitude(v) {
+      return (typeof v === "number" && v > -1000) ? v : null;
+    }
+    // The flight path is hue-coded by height, so it only ever takes
+    // height_agl; web_ui.py snapshot() builds restored trails the same way.
+    function trailAltitude(evt) {
+      return knownAltitude(evt.height_agl);
     }
     function formatAltitude(evt) {
-      const m = altitudeSource(evt);
-      if (m == null) return null;
-      if (state.units === "metric") return `${Math.round(m)} m AGL`;
-      return `${Math.round(m * 3.28084)} ft AGL`;
+      let m = knownAltitude(evt.height_agl), ref;
+      if (m != null) {
+        ref = evt.height_type === "Above Takeoff" ? "above takeoff" : "AGL";
+      } else {
+        // Only geodetic altitude available: label it as what it is
+        // rather than call it AGL.
+        m = knownAltitude(evt.alt) ?? knownAltitude(evt.altitude_geo);
+        if (m == null) return null;
+        ref = "HAE";
+      }
+      if (state.units === "metric") return `${Math.round(m)} m ${ref}`;
+      return `${Math.round(m * 3.28084)} ft ${ref}`;
     }
     function formatSpeed(mps) {
       if (typeof mps !== "number") return null;
@@ -3454,7 +3466,9 @@ ${multiSerialHTML}
       const minA = Math.min(...alts), maxA = Math.max(...alts);
       const group = L.layerGroup();
       for (const wp of wps) {
-        const label = formatAltitude({ height_agl: wp.alt }) || `${Math.round(wp.alt)} m`;
+        const label = formatAltitude({
+          height_agl: wp.alt, height_type: entry.event && entry.event.height_type,
+        }) || `${Math.round(wp.alt)} m`;
         L.circleMarker([wp.lat, wp.lon], {
           radius: (wp.isPeak && wps.length > 1) ? 5 : 4,
           color: "#fff", weight: 1,

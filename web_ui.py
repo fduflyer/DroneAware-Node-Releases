@@ -670,13 +670,23 @@ class DetectionStore:
                             merged[k] = v
                     lat = event.get("lat")
                     lon = event.get("lon")
-                    if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                    # 0/0 is F3411's "unknown position", sent before GPS
+                    # lock. The feeders drop it now, but spooled history
+                    # from older releases still carries it.
+                    if (isinstance(lat, (int, float)) and isinstance(lon, (int, float))
+                            and not (lat == 0 and lon == 0)):
                         # Third element is altitude. Leaflet accepts
                         # [lat, lng, alt] triples wherever it takes a LatLng,
                         # so the flight path can be hue-coded by height
                         # without carrying a second parallel array.
-                        alt = event.get("alt")
-                        pt = [lat, lon, alt if isinstance(alt, (int, float)) else None]
+                        # height_agl, not "alt": "alt" is the geodetic
+                        # (WGS-84 HAE) altitude, and the browser appends
+                        # live points by height_agl (trailAltitude() in
+                        # index.html), so using "alt" here restored every
+                        # reloaded trail hundreds of meters high and
+                        # labelled it AGL. -1000 is F3411's "unknown".
+                        alt = event.get("height_agl")
+                        pt = [lat, lon, alt if isinstance(alt, (int, float)) and alt > -1000 else None]
                         if not trail or trail[-1][:2] != pt[:2]:
                             trail.append(pt)
                 # Always include the MAC explicitly (the dict key is

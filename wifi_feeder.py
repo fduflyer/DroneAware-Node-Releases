@@ -234,12 +234,6 @@ INSTALLED_VERSION_PATH = "/opt/droneaware/version"
 
 def _read_fw_version() -> str:
     try:
-        with open("/opt/droneaware/version") as f:
-            v = f.read().strip()
-            return v if v else fallback
-    except Exception:
-        pass
-    try:
         with open(INSTALLED_VERSION_PATH) as f:
             installed = f.read().strip()
         if installed:
@@ -329,15 +323,42 @@ def parse_basic_id(data: bytes) -> dict:
     }
 
 
+def decode_vertical_speed(raw: int) -> float | None:
+    """F3411 vertical speed: a SIGNED byte in 0.5 m/s steps (+up), range
+    +/-62 m/s, with 63.0 m/s (raw 126) meaning "unknown".
+
+    Previously decoded as ``raw * 0.5 - 62.0`` (an unsigned byte with an
+    offset), which reports a stationary aircraft (raw 0) as falling at
+    -62 m/s and turns every descent into a climb above 60 m/s.
+    """
+    if raw >= 128:
+        raw -= 256
+    v = raw * 0.5
+    return None if v == 63.0 else v
+
+
+def valid_lat_lon(lat: float, lon: float) -> bool:
+    """False for out-of-range values and for F3411's 0/0 "unknown" position."""
+    if abs(lat) > 90.0 or abs(lon) > 180.0:
+        return False
+    return not (lat == 0.0 and lon == 0.0)
+
+
+def decode_f3411_altitude(raw: int) -> float | None:
+    """uint16 * 0.5 - 1000 m; raw 0 (-1000 m) is F3411's "unknown"."""
+    return None if raw == 0 else round(raw * 0.5 - 1000.0, 1)
+
+
 def parse_location(data: bytes) -> dict:
     """
     Decode ASTM F3411-22a Location/Vector message (25 bytes).
     Byte layout (matches server-side canonical decoder):
       0     header (msg_type/version)
-      1     status flags (speed_mult bit 0, EW bit 1, height_type bit 2)
+      1     status flags (speed_mult bit 0, EW bit 1,
+            height_type bit 2: 0 = above takeoff, 1 = AGL)
       2     track direction (raw 0-179, +180 if EW bit set)
       3     speed (encoding depends on speed_mult)
-      4     vertical speed (raw * 0.5 - 62.0)
+      4     vertical speed (int8, * 0.5 m/s; 63.0 = unknown)
       5-8   latitude  (int32 LE, * 1e-7)
       9-12  longitude (int32 LE, * 1e-7)
      13-14  pressure altitude (uint16 LE, * 0.5 - 1000.0)
@@ -354,28 +375,34 @@ def parse_location(data: bytes) -> dict:
 
     direction   = data[2] + (180 if ew_bit else 0)
     speed       = data[3] * 0.75 + 63.75 if speed_mult else data[3] * 0.25
-    vspeed      = data[4] * 0.5 - 62.0
+    vspeed      = decode_vertical_speed(data[4])
 
     lat = struct.unpack_from('<i', data, 5)[0] * 1e-7
     lon = struct.unpack_from('<i', data, 9)[0] * 1e-7
 
-    # Reject null/placeholder GPS values broadcast before lock (e.g. DJI firmware
-    # transmits lat>90 or lon>180 as a sentinel until GPS acquires).
-    if abs(lat) > 90.0 or abs(lon) > 180.0:
+    # Reject null/placeholder GPS values broadcast before lock. Some firmware
+    # sends lat>90 / lon>180; F3411 itself defines 0/0 as "unknown", which DJI
+    # sends before lock and which otherwise lands in the trail as a point
+    # in the Gulf of Guinea.
+    if not valid_lat_lon(lat, lon):
         return {}
 
-    geo_alt = struct.unpack_from('<H', data, 15)[0] * 0.5 - 1000.0
-    height  = struct.unpack_from('<H', data, 17)[0] * 0.5 - 1000.0
+    # Geodetic altitude (WGS-84 HAE, not MSL) and height (above takeoff or
+    # ground, per height_type) are different quantities; None = unknown.
+    geo_alt = decode_f3411_altitude(struct.unpack_from('<H', data, 15)[0])
+    height  = decode_f3411_altitude(struct.unpack_from('<H', data, 17)[0])
 
     return {
         "latitude":       round(lat, 7),
         "longitude":      round(lon, 7),
-        "altitude_geo":   round(geo_alt, 1),
-        "height_agl":     round(height, 1),
+        "altitude_geo":   geo_alt,
+        "height_agl":     height,
         "ground_speed":   round(speed, 2),
-        "vertical_speed": round(vspeed, 2),
+        "vertical_speed": round(vspeed, 2) if vspeed is not None else None,
         "heading":        round(direction, 1),
-        "height_type":    "AGL" if height_type == 0 else "Above Takeoff",
+        # F3411 HeightType: 0 = above takeoff, 1 = above ground (AGL).
+        # Previously mapped the other way round.
+        "height_type":    "Above Takeoff" if height_type == 0 else "AGL",
     }
 
 
@@ -515,14 +542,24 @@ def _for_the_wire(events: list) -> list:
 def parse_system_msg(data: bytes) -> dict:
     """
     Decode ASTM F3411-22a System Message (16+ bytes).
-    Byte layout (matches server-side canonical decoder):
-       1 (low nibble)  op_location_type  (d[1] & 0x0F)
+    Byte layout (F3411-22a Table 11 / opendroneid-core-c ODID_System_encoded):
+       1 bits 0-1      op_location_type  (0 takeoff, 1 live GNSS, 2 fixed)
+       1 bits 2-4      classification_type (0 undeclared, 1 EU)
        2-5             operator latitude   (int32 LE, * 1e-7)
        6-9             operator longitude  (int32 LE, * 1e-7)
       10-11            area_count          (uint16 LE)
       12               area_radius_m       (raw * 10)
-      13-14            alt_takeoff_geo     (uint16 LE, * 0.5 - 1000.0)
+      13-14            area_ceiling_m      (uint16 LE, * 0.5 - 1000.0)
+      15-16            area_floor_m        (uint16 LE, * 0.5 - 1000.0)
+      17               EU category (high nibble) / class (low nibble)
+      18-19            operator_alt_geo    (uint16 LE, * 0.5 - 1000.0)
       20-23            drone_time          (uint32 LE, + F3411_EPOCH)
+
+    Bytes 13-14 were previously published as ``alt_takeoff_geo``. They are
+    the operating-area ceiling, which most aircraft leave unset (-1000 m).
+    The operator's altitude is bytes 18-19 and is now ``operator_alt_geo``.
+    ``alt_takeoff_geo`` is kept as an alias of ``operator_alt_geo`` so
+    existing consumers get the value the name always promised.
 
     🚨 drone_time is the only ABSOLUTE time anywhere in the broadcast, and it
     is GPS-derived — so it is right even when this node's clock is not. A Pi
@@ -537,17 +574,16 @@ def parse_system_msg(data: bytes) -> dict:
     """
     if len(data) < 16:
         return {}
-    op_location_type = data[1] & 0x0F
+    op_location_type = data[1] & 0x03
     op_lat = struct.unpack_from('<i', data, 2)[0] * 1e-7
     op_lon = struct.unpack_from('<i', data, 6)[0] * 1e-7
 
     # Reject placeholder/pre-lock values (same convention as parse_location)
-    if abs(op_lat) > 90.0 or abs(op_lon) > 180.0:
+    if not valid_lat_lon(op_lat, op_lon):
         op_lat = op_lon = None
 
     area_count    = struct.unpack_from('<H', data, 10)[0]
     area_radius_m = data[12] * 10
-    alt_takeoff   = struct.unpack_from('<H', data, 13)[0] * 0.5 - 1000.0
 
     out = {
         "op_location_type": op_location_type,
@@ -555,8 +591,12 @@ def parse_system_msg(data: bytes) -> dict:
         "operator_lon":     round(op_lon, 7) if op_lon is not None else None,
         "area_count":       area_count,
         "area_radius_m":    area_radius_m,
-        "alt_takeoff_geo":  round(alt_takeoff, 1),
+        "area_ceiling_m":   decode_f3411_altitude(struct.unpack_from('<H', data, 13)[0]),
     }
+    if len(data) >= 20:
+        out["area_floor_m"]     = decode_f3411_altitude(struct.unpack_from('<H', data, 15)[0])
+        out["operator_alt_geo"] = decode_f3411_altitude(struct.unpack_from('<H', data, 18)[0])
+        out["alt_takeoff_geo"]  = out["operator_alt_geo"]
     # 🚨 Kept for the SPOOL and the offline UI, stripped before the POST.
     # The node's own history should carry the aircraft's absolute time so a
     # replay reads correctly even when this node's clock was wrong; the server

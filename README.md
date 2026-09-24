@@ -437,7 +437,7 @@ Each `macs[]` entry:
 | `last_seen` | float | Unix seconds — most recent event |
 | `age_sec` | float | Seconds since `last_seen` |
 | `event_count` | int | Raw events held for this drone |
-| `trail` | array of `[lat, lon]` | Last 60 unique positions, chronological |
+| `trail` | array of `[lat, lon, height]` | Last 60 unique positions, chronological. `height` is `height_agl` in meters (above takeoff or ground, per `height_type`), or `null` when not broadcast |
 
 The `latest` object — any field may be `null` until the relevant ASTM
 message type is received:
@@ -456,6 +456,7 @@ message type is received:
 | `type` | string | ASTM message type | e.g. `"Basic ID"`, `"Location/Vector"`, `"System"` |
 | `operator_lat` | float | [-90, 90] degrees, WGS84 | System message |
 | `operator_lon` | float | [-180, 180] degrees, WGS84 | System message |
+| `operator_alt_geo` | float \| null | meters, geodetic (WGS84 HAE); null when not broadcast | System message |
 
 ---
 
