@@ -3274,8 +3274,13 @@
     function formatAltitude(evt) {
       const m = altitudeSource(evt);
       if (m == null) return null;
-      if (state.units === "metric") return `${Math.round(m)} m AGL`;
-      return `${Math.round(m * 3.28084)} ft AGL`;
+      // height_agl is measured from whichever reference the aircraft
+      // declares in height_type; most report height above the takeoff
+      // point, which is not AGL once the ground rises or falls.
+      const ref = (typeof evt.height_agl === "number" && evt.height_type === "Above Takeoff")
+        ? "above takeoff" : "AGL";
+      if (state.units === "metric") return `${Math.round(m)} m ${ref}`;
+      return `${Math.round(m * 3.28084)} ft ${ref}`;
     }
     function formatSpeed(mps) {
       if (typeof mps !== "number") return null;
