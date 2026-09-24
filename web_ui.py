@@ -670,7 +670,11 @@ class DetectionStore:
                             merged[k] = v
                     lat = event.get("lat")
                     lon = event.get("lon")
-                    if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                    # 0/0 is F3411's "unknown position", sent before GPS
+                    # lock. The feeders drop it now, but spooled history
+                    # from older releases still carries it.
+                    if (isinstance(lat, (int, float)) and isinstance(lon, (int, float))
+                            and not (lat == 0 and lon == 0)):
                         # Third element is altitude. Leaflet accepts
                         # [lat, lng, alt] triples wherever it takes a LatLng,
                         # so the flight path can be hue-coded by height
