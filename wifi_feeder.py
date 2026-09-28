@@ -3264,6 +3264,19 @@ class _GpsClock:
 
 GPS_CLOCK = _GpsClock()
 
+def _clock_source() -> str | None:
+    """Where this node's time came from: "ntp", "gps", or None.
+
+    The server infers clock quality from several clocks and uses its own
+    receive time as the referee; this replaces that inference with what the
+    node knows. A Pi has no RTC, so "neither" is a real answer and is sent as
+    null rather than guessed.
+    """
+    if _clock_is_ntp_synced():
+        return "ntp"
+    return "gps" if GPS_CLOCK.source == "gps" else None
+
+
 
 def gps_reader_thread(device: str):
     """Background thread: reads NMEA sentences, updates _gps_lat/_gps_lon,
@@ -4211,6 +4224,7 @@ class WiFiFeeder:
                     # Carried in FAULT too: a node that cannot scan is exactly
                     # when knowing its OS and kernel matters.
                     **_platform_info(),
+                    "clock_source": _clock_source(),
                     # v1.4.8 telemetry — restart count is meaningful even
                     # in FAULT loop. No forwarder in FAULT mode → no
                     # buffered/dropped fields.
@@ -4284,6 +4298,7 @@ class WiFiFeeder:
                             # OS, kernel, BlueZ, Pi model (cached, refreshed
                             # every 6 h so an in-place upgrade shows up).
                             **_platform_info(),
+                            "clock_source": _clock_source(),
                             # v1.4.8 telemetry additions — mirror BLE.
                             "buffered":            self.forwarder.held_events,
                             "buffered_bytes":      self.forwarder.held_bytes,

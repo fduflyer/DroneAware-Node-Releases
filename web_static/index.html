@@ -1252,9 +1252,14 @@
         row-gap: 4px;
         padding: 0 12px;
       }
-      /* The mark alone identifies the page; the words cost 110px that the
-         controls need. */
-      .brand-wordmark span { display: none; }
+      /* The words cost 110px. Measured across phone widths: at 360px they
+         push the four controls onto a second row, at 375px there are 14px to
+         spare and at 390px there are 29px. So they are hidden only on the
+         narrowest phones rather than on every phone, which is what hiding
+         them below 768px amounted to. */
+      @media (max-width: 374px) {
+        .brand-wordmark span { display: none; }
+      }
       .header-right { margin-left: auto; gap: 6px; }
       .header-center {
         order: 3;

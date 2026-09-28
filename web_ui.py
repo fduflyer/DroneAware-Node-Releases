@@ -59,6 +59,7 @@ import json
 import logging
 import math
 import os
+import struct
 import re
 import socket
 import subprocess
@@ -256,6 +257,73 @@ def _region_pack_path() -> str | None:
         if candidate and os.path.isfile(candidate):
             return candidate
     return None
+
+
+# ── Does the downloaded pack still cover where the node is? (v1.6.1) ─────────
+# A region pack contains only its own bounding box. Drive a mobile node out of
+# that box and /map.pmtiles kept serving the pack, which has no tiles there, so
+# the map went blank at street zoom even on a node with a working uplink. A
+# pack that does not cover the node is worth less than the planet it replaced,
+# so outside its box the node falls back to what a pack-less node uses.
+#
+# Hysteresis: once outside, the node must come back well inside before the pack
+# is used again, or a node parked on the boundary would swap basemaps every
+# time its GPS wobbled. ~0.02 degrees is roughly 2 km.
+REGION_EDGE_MARGIN_DEG = 0.02
+_pack_bbox_cache: dict = {"path": None, "mtime": 0.0, "bbox": None}
+_pack_coverage = {"inside": True}
+
+
+def _region_pack_bbox() -> tuple | None:
+    """(min_lon, min_lat, max_lon, max_lat) from the pack's PMTiles header.
+
+    The bounds live at bytes 102-118 of the v3 header as four int32s in
+    hundred-nanodegrees. Cached against the file's mtime so a replaced pack is
+    re-read and a heartbeat-rate caller does not re-open the file.
+    """
+    path = _region_pack_path()
+    if path is None:
+        return None
+    try:
+        mtime = os.path.getmtime(path)
+        if _pack_bbox_cache["path"] == path and _pack_bbox_cache["mtime"] == mtime:
+            return _pack_bbox_cache["bbox"]
+        with open(path, "rb") as f:
+            head = f.read(127)
+        if len(head) < 118 or head[:7] != b"PMTiles":
+            return None
+        bbox = tuple(v / 1e7 for v in struct.unpack("<4i", head[102:118]))
+    except Exception:
+        return None
+    _pack_bbox_cache.update(path=path, mtime=mtime, bbox=bbox)
+    return bbox
+
+
+def _region_pack_covers_node() -> bool:
+    """True when the pack on disk covers the node's current position.
+
+    A node with no position at all (no fix yet, no configured coordinates)
+    keeps the pack: nothing says it is in the wrong place.
+    """
+    bbox = _region_pack_bbox()
+    if bbox is None:
+        return False
+    home = get_home_location()
+    if not home or home.get("lat") is None:
+        return True
+    lat, lon = float(home["lat"]), float(home["lon"])
+    min_lon, min_lat, max_lon, max_lat = bbox
+    margin = 0.0 if _pack_coverage["inside"] else REGION_EDGE_MARGIN_DEG
+    inside = (min_lat + margin <= lat <= max_lat - margin
+              and min_lon + margin <= lon <= max_lon - margin)
+    _pack_coverage["inside"] = inside
+    return inside
+
+
+def _active_region_pack() -> str | None:
+    """The region pack, but only while it covers where the node is."""
+    path = _region_pack_path()
+    return path if path is not None and _region_pack_covers_node() else None
 
 
 # ── Node configuration (v1.6.0) ──────────────────────────────────────────────
@@ -1291,23 +1359,23 @@ def api_status():
         # Whether a Protomaps region pack has been downloaded. When true the
         # frontend renders vector tiles from /map.pmtiles and needs neither
         # a network round trip nor a second download — any zoom, either theme.
-        "map_pack": (_region_pack_path() is not None
+        "map_pack": (_active_region_pack() is not None
                      or _tile_upstream_reachable()
                      or _world_pack_path() is not None),
-        "map_pack_bytes": (os.path.getsize(_region_pack_path())
-                           if _region_pack_path() else None),
+        "map_pack_bytes": (os.path.getsize(_active_region_pack())
+                           if _active_region_pack() else None),
         # Changes whenever the pack on disk does. The client puts it in the
         # basemap URL, so downloading a new area busts both the browser cache
         # and the reader's in-memory copy of the previous archive's directory.
         # Without it a second download is invisible: same URL, a response the
         # browser has cached for a day, and a PMTiles reader that has already
         # parsed the file that used to be there.
-        "map_pack_version": (int(os.path.getmtime(_region_pack_path()))
-                             if _region_pack_path() else 0),
+        "map_pack_version": (int(os.path.getmtime(_active_region_pack()))
+                             if _active_region_pack() else 0),
         # local  — a downloaded pack, works with no uplink
         # proxy  — streaming from the tile host through this node
         # none   — neither; the client keeps its raster fallback
-        "map_source": ("region" if _region_pack_path()
+        "map_source": ("region" if _active_region_pack()
                        else "proxy" if _tile_upstream_reachable()
                        else "world" if _world_pack_path() else "none"),
         # v1.5.0 Gap 3: per-feeder status for the three-row BLE/2.4/5
@@ -2242,7 +2310,7 @@ def region_pack():
     with the whole archive and the reader cannot seek, so the map renders
     blank with no error in the console.
     """
-    path = _region_pack_path()
+    path = _active_region_pack()
     if path is not None:
         return send_file(
             path,

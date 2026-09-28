@@ -25,6 +25,8 @@ import time
 import socket
 import struct
 import collections
+import ctypes
+import ctypes.util
 import signal
 import threading
 import uuid
@@ -1831,6 +1833,7 @@ class BLEFeeder:
                         # Same reasoning for the platform: BlueZ version and
                         # kernel are most worth knowing on a faulted node.
                         **(await _platform_info()),
+                        "clock_source": _clock_source(),
                         # v1.4.8: restart count meaningful even in FAULT
                         # (a crash-looping FAULT feeder should be visible).
                         "restarts_since_boot": self.restart_count,
@@ -2138,6 +2141,7 @@ class BLEFeeder:
                                 # OS, kernel, BlueZ, Pi model (cached,
                                 # refreshed every 6 h).
                                 **(await _platform_info()),
+                                "clock_source": _clock_source(),
                                 # v1.4.8 telemetry additions:
                                 "buffered":                   self.forwarder.held_events,
                                 "buffered_bytes":             self.forwarder.held_bytes,
@@ -2187,6 +2191,48 @@ def resolve_token() -> str:
 
 
 # -- Entry Point ---------------------------------------------------------------
+
+_NTP_CACHE = {"at": 0.0, "synced": False}
+_GPS_STATE_FOR_CLOCK = "/run/droneaware/gps_state.json"
+
+
+def _clock_is_ntp_synced() -> bool:
+    """True when the kernel says its clock is disciplined by a time source.
+
+    Same question, the same way, as wifi_feeder._clock_is_ntp_synced and
+    web_ui._clock_synced: ntp_adjtime() rather than any particular daemon. A
+    zeroed buffer makes the call a read-only query, and TIME_ERROR (5) is what
+    the kernel returns while STA_UNSYNC is set.
+    """
+    now = time.monotonic()
+    if now - _NTP_CACHE["at"] < 30:
+        return _NTP_CACHE["synced"]
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        buf = (ctypes.c_byte * 512)()
+        synced = libc.ntp_adjtime(ctypes.byref(buf)) != 5
+    except Exception:
+        synced = os.path.exists("/run/systemd/timesync/synchronized")
+    _NTP_CACHE.update(at=now, synced=bool(synced))
+    return _NTP_CACHE["synced"]
+
+
+def _clock_source() -> str | None:
+    """Where this node's time came from: "ntp", "gps", or None.
+
+    The WiFi feeder owns the GPS receiver and records what it did to the clock
+    in gps_state.json; this side reads that rather than duplicating it. A Pi
+    has no RTC, so "neither" is a real answer and is sent as null.
+    """
+    if _clock_is_ntp_synced():
+        return "ntp"
+    try:
+        with open(_GPS_STATE_FOR_CLOCK) as f:
+            source = json.load(f).get("clock_source")
+    except Exception:
+        return None
+    return source if source in ("ntp", "gps") else None
+
 
 def _restore_system_library_path() -> None:
     """Give every program this process runs the system's libraries, not ours.
