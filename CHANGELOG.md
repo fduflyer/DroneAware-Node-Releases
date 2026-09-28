@@ -10,7 +10,133 @@ Full release artifacts and discussion notes live at the
 
 ---
 
-## [1.6.0] — Unreleased
+## [1.6.1] — 2026-09-28
+
+### Bluetooth recovers by itself
+
+Operators were rebooting nodes to bring Bluetooth back. Two separate faults
+caused that, and both are fixed.
+
+A scan could stop delivering advertisements while the feeder still believed it
+was scanning — most often after the system's Bluetooth service restarted
+underneath it. The feeder now asks the adapter every 30 seconds whether it is
+actually discovering, and rebuilds the scan when it is not, escalating to a
+power cycle and then to restarting Bluetooth if that does not take. On real
+hardware, advertisements resumed 74 milliseconds after the rebuild.
+
+A node that heard nothing from the moment it started never attempted recovery
+at all, because recovery was gated on having heard something first. A node that
+was deaf from boot stayed deaf. That gate is gone, and silence is now measured
+from the current scan rather than from the process starting.
+
+Choosing between a USB Bluetooth dongle and the Pi's built-in radio also
+misbehaved: on any boot where the dongle was not enumerated in time, the node
+switched itself back to the built-in radio and rewrote its boot configuration
+to match, so the setting would not stick. The node now waits up to 20 seconds
+for the dongle, honours an explicit choice of `usb` or `onboard`, and refuses
+to flip back and forth.
+
+### The node sets its own clock from GPS
+
+A Raspberry Pi has no battery-backed clock. One that boots with no network
+restores a stale time and stamps every detection with it, and nothing on screen
+says so, because the detections and "now" share the same wrong clock.
+
+A node with a GPS receiver and no working time sync now sets its clock from
+GPS: only with a valid fix, only when several readings agree, and only once.
+Tested on a node deliberately set 261 days wrong, which corrected itself
+without any service restarting. The Clock row in the offline UI says where the
+time came from — network, GPS, or not set.
+
+### The offline UI works on a phone
+
+Enough operators use a phone rather than a screen attached to the Pi that the
+phone layout needed to work properly.
+
+- The header wraps instead of pushing Replay, Settings and the map download off
+  the right edge, where there was no way to scroll to them.
+- In landscape the map gets the full width, rather than being squeezed to about
+  500 pixels beside a sidebar built for a desktop.
+- The panel of drones and radio status at the bottom **opens**. It was designed
+  to slide up and nothing ever made it do so, so on a phone the drone list,
+  the filters and two of the three radio rows could not be reached at all.
+  Collapsed, it now shows the health of every radio at a glance; tap or swipe
+  to open it.
+- Buttons, tabs and map controls are at least 44 pixels on a touchscreen.
+- The node's own wordmark is back on any phone with room for it.
+
+### The map follows a moving node, and keeps working when it leaves its area
+
+On a node that moves, the marker tracked the GPS but the view stayed where it
+started, so an operator driving watched empty space where their node used to
+be. The map now follows. A lock button shows the state: blue means locked to
+the node, grey means you have panned away and the map will stay where you put
+it. Tap it to recentre and lock again.
+
+A node that drives outside the map area it downloaded now streams the map
+instead of showing blank space, or falls back to the world overview when it has
+no connection. A downloaded area contains only itself, so past its edge there
+was nothing to draw.
+
+Replay now frames the flights it is replaying, instead of staying over the node
+while the recorded track sits thousands of pixels off screen.
+
+### The page notices when its connection dies
+
+A phone that sleeps, a car network that drops, a router that forgets: the
+browser's connection to the node can die without either end being told. The
+page kept showing whatever was last on screen, and only a manual reload brought
+it back. The node now sends a heartbeat the page can see every 15 seconds, and
+the page reconnects after 45 seconds of silence.
+
+### Remote ID is decoded correctly
+
+Several fields were being read wrongly, and what they fed was the node's own
+screen.
+
+- A hovering aircraft reported **−62 m/s** of vertical speed, and descents
+  appeared as 60 m/s climbs. Across 828 recorded transmissions the same data
+  now reads −5.0 to +4.5 m/s.
+- Operator altitude was read from the wrong bytes — the operating area's
+  ceiling, which most aircraft leave empty — so it showed **−1000 m** on nearly
+  every message that carried it.
+- Height was labelled "AGL" whether or not that was what the aircraft meant. It
+  now says "above takeoff" when that is what is being reported.
+- An aircraft declaring an **emergency** is now shown as one. The field was
+  never decoded, so a node's own screen could not show what the network was
+  already showing.
+- Remote ID marks unknown values with real-looking numbers. An unknown speed
+  was being drawn as 915 km/h, an unset altitude as −1000 m, and an aircraft
+  with no position fix as a point in the Gulf of Guinea. These now show as
+  nothing at all, which is what they mean.
+- The Self ID text an operator writes for a flight is now shown.
+
+### An adapter carrying the node's connection is left alone
+
+A node reached over a USB WiFi adapter could be cut off by its own update: the
+adapter was claimed for scanning, taking the node off the network. Any adapter
+carrying the connection is now left alone, and `WIFI_ADAPTER_EXCLUDE_MACS` will
+protect one explicitly.
+
+Adapter states are also read in a fixed language. On a node running in German,
+"connected" reads as "verbunden", and every check against it was wrong.
+
+### Heartbeats say what the node is
+
+Each node now reports its OS, kernel, BlueZ version, Pi model and where its
+clock came from. Supporting a node previously began by asking its operator what
+they were running, and waiting.
+
+### Smaller things
+
+- `sudo droneaware update --prerelease` installs a release candidate. The
+  documented way of doing this could not work on nodes where the Web UI is
+  installed.
+- A node with no GPS receiver attached stopped logging a warning about it every
+  38 seconds, forever.
+- The Clock row no longer shows an amber warning on a node whose clock is fine.
+
+## [1.6.0] — 2026-09-14
 
 ### The map works with no internet, and it is ours
 
