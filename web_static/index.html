@@ -702,6 +702,18 @@
       width: 6px; height: 6px; border-radius: 50%;
       background: currentColor;
     }
+    /* An aircraft broadcasting ASTM op_status 3. Rare, and the one thing on a
+       card that should be readable across a room. */
+    .card-emergency {
+      padding: 1px 6px;
+      border-radius: 8px;
+      background: var(--fresh-older);
+      color: #1a1a1a;
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+    }
+    .da-popup-value.is-emergency { color: var(--fresh-older); font-weight: 700; }
     .radio-tag {
       padding: 1px 6px;
       border-radius: 8px;
@@ -2281,6 +2293,11 @@
         ? `<div class="card-stats">${statsParts.map(escapeHtml).join(" · ")}</div>`
         : "";
 
+      // An aircraft declaring an emergency should be visible without opening
+      // anything, so it rides on the card itself rather than only the popup.
+      const emergencyHTML = statusText(evt) === "Emergency"
+        ? `<span class="card-emergency">EMERGENCY</span>` : "";
+
       // Make/Model row (when server enrichment has populated it).
       const makeModelHTML = (evt.make || evt.model)
         ? `<div class="card-makemodel">
@@ -2295,6 +2312,7 @@
           <div class="card-row">
             <div class="card-id mono">${escapeHtml(id)}</div>
             <div class="card-row-right">
+              ${emergencyHTML}
               <span class="radio-tag">${escapeHtml(radio)}</span>
               <span class="card-age">${relTime(age)}</span>
             </div>
@@ -3274,8 +3292,21 @@
     function formatAltitude(evt) {
       const m = altitudeSource(evt);
       if (m == null) return null;
-      if (state.units === "metric") return `${Math.round(m)} m AGL`;
-      return `${Math.round(m * 3.28084)} ft AGL`;
+      // "AGL" and "above the takeoff point" are different references, and the
+      // aircraft says which one it is sending. Labelling both AGL was a guess
+      // that was wrong whenever a drone reported height above takeoff.
+      const ref = (typeof evt.height_agl === "number" &&
+                   evt.height_type === "Above Takeoff") ? "above takeoff" : "AGL";
+      if (state.units === "metric") return `${Math.round(m)} m ${ref}`;
+      return `${Math.round(m * 3.28084)} ft ${ref}`;
+    }
+
+    // ASTM operational status. "Emergency" is the reason this is on screen at
+    // all: the aircraft is declaring one, the network already surfaces it, and
+    // until now a node's own page could not show it.
+    function statusText(evt) {
+      const s = evt.op_status;
+      return (typeof s === "string" && s && s !== "Undeclared") ? s : null;
     }
     function formatSpeed(mps) {
       if (typeof mps !== "number") return null;
@@ -3317,6 +3348,8 @@
 
       const altTxt = formatAltitude(evt);
       const speedTxt = formatSpeed(evt.speed);
+      const statusTxt = statusText(evt);
+      const isEmergency = statusTxt === "Emergency";
       const typeTxt = UA_TYPES[evt.ua_type] || evt.type || "—";
       const headingTxt = (evt.hdg != null) ? `${evt.hdg}°`
                        : (evt.heading != null) ? `${evt.heading}°`
@@ -3347,6 +3380,8 @@
             <div class="da-popup-value">${speedTxt || "—"}</div>
             <div class="da-popup-label">Heading</div>
             <div class="da-popup-value">${escapeHtml(headingTxt)}</div>
+            ${statusTxt ? `<div class="da-popup-label">Status</div>
+            <div class="da-popup-value${isEmergency ? " is-emergency" : ""}">${escapeHtml(statusTxt)}</div>` : ""}
           </div>
           <div class="da-popup-divider"></div>
           <div class="da-popup-noderow">
@@ -3361,6 +3396,7 @@
               <span class="k">Channel</span><span class="v">${evt.channel ?? "—"}</span>
 ${multiSerialHTML}
               <span class="k">Msg type</span><span class="v">${escapeHtml(evt.type || "—")}</span>
+              ${evt.self_id_text ? `<span class="k">Self ID</span><span class="v">${escapeHtml(evt.self_id_text)}</span>` : ""}
               <span class="k">Lat</span><span class="v">${(typeof evt.lat === "number") ? evt.lat.toFixed(6) : "—"}</span>
               <span class="k">Lon</span><span class="v">${(typeof evt.lon === "number") ? evt.lon.toFixed(6) : "—"}</span>
               <span class="k">Op lat</span><span class="v">${(typeof evt.operator_lat === "number") ? evt.operator_lat.toFixed(6) : "—"}</span>

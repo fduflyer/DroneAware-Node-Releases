@@ -233,20 +233,18 @@ INSTALLED_VERSION_PATH = "/opt/droneaware/version"
 
 
 def _read_fw_version() -> str:
-    try:
-        with open("/opt/droneaware/version") as f:
-            v = f.read().strip()
-            return v if v else fallback
-    except Exception:
-        pass
+    """The installed version, or "dev" when there is no version file.
+
+    Both branches read INSTALLED_VERSION_PATH — the same file — and the first
+    returned an undefined name (`fallback`) when the file was empty. The
+    NameError was swallowed by the bare `except`, so an empty version file
+    took the long way round to the same answer. One read, one fallback.
+    """
     try:
         with open(INSTALLED_VERSION_PATH) as f:
-            installed = f.read().strip()
-        if installed:
-            return installed
+            return f.read().strip() or "dev"
     except Exception:
-        pass
-    return "dev"
+        return "dev"
 
 FW_VERSION = _read_fw_version()
 
@@ -316,6 +314,38 @@ UA_TYPE = {
 # -- Remote ID Decoder ---------------------------------------------------------
 # (mirrors ble_feeder.py — pure functions, no shared state)
 
+OP_STATUS = {
+    0: "Undeclared",
+    1: "On Ground",
+    2: "Airborne",
+    3: "Emergency",
+    4: "Remote ID System Failure",
+}
+
+# ── ASTM in-band "not available" markers ─────────────────────────────────────
+# F3411 signals "unknown" with a value inside the normal range rather than a
+# flag, so a decoder that does the arithmetic and stops produces a plausible
+# measurement instead of a gap: a hovering aircraft at -62 m/s, an unset
+# altitude at -1000 m, an unknown speed at 915 km/h, an operator in the Gulf of
+# Guinea. Every one of those has been on a screen. Decode them to None and let
+# the UI say nothing.
+SPEED_UNKNOWN_MS      = 254.25   # max encodable value == "unknown"
+VSPEED_UNKNOWN_MS     = 63.0
+DIRECTION_UNKNOWN_DEG = 361
+ALT_UNSET_RAW         = (0x0000, 0xFFFF)
+# Older encoders park an unpopulated altitude at the bottom of the range
+# instead of at zero. Nothing this project observes flies below -200 m.
+ALT_FLOOR_M           = -200.0
+
+
+def _alt_or_none(raw: int) -> float | None:
+    """uint16 altitude (raw * 0.5 - 1000) with the unset markers removed."""
+    if raw in ALT_UNSET_RAW:
+        return None
+    value = raw * 0.5 - 1000.0
+    return None if value <= ALT_FLOOR_M else round(value, 1)
+
+
 def parse_basic_id(data: bytes) -> dict:
     if len(data) < 25:
         return {}
@@ -329,32 +359,59 @@ def parse_basic_id(data: bytes) -> dict:
     }
 
 
+def parse_self_id(data: bytes) -> dict:
+    """Decode ASTM F3411-22a Self ID message (25 bytes).
+
+    The free-text field operators actually fill in ("training flight",
+    "survey"), and the only place a human explains what the aircraft is doing.
+    Decoded but not previously extracted: the message type was named and its
+    contents thrown away.
+    """
+    if len(data) < 25:
+        return {}
+    return {
+        "self_id_type": data[1],
+        "self_id_text": data[2:25].rstrip(b'\x00').decode('ascii', errors='replace').strip(),
+    }
+
+
 def parse_location(data: bytes) -> dict:
     """
     Decode ASTM F3411-22a Location/Vector message (25 bytes).
-    Byte layout (matches server-side canonical decoder):
-      0     header (msg_type/version)
-      1     status flags (speed_mult bit 0, EW bit 1, height_type bit 2)
-      2     track direction (raw 0-179, +180 if EW bit set)
-      3     speed (encoding depends on speed_mult)
-      4     vertical speed (raw * 0.5 - 62.0)
-      5-8   latitude  (int32 LE, * 1e-7)
-      9-12  longitude (int32 LE, * 1e-7)
-     13-14  pressure altitude (uint16 LE, * 0.5 - 1000.0)
-     15-16  geometric altitude (uint16 LE, * 0.5 - 1000.0)
-     17-18  height AGL/above-takeoff (uint16 LE, * 0.5 - 1000.0)
+    Byte layout (verified against opendroneid-core-c and real captures):
+       1     status: op_status (high nibble), speed_mult bit 0, EW bit 1,
+             height_type bit 2
+       2     track direction (raw 0-179, +180 if EW bit set; 361 = unknown)
+       3     speed (encoding depends on speed_mult; 254.25 m/s = unknown)
+       4     vertical speed (SIGNED byte * 0.5 m/s; 63 = unknown)
+       5-8   latitude  (int32 LE, * 1e-7)
+       9-12  longitude (int32 LE, * 1e-7)
+      13-14  pressure altitude (uint16 LE, * 0.5 - 1000.0)
+      15-16  geometric altitude (uint16 LE, * 0.5 - 1000.0)
+      17-18  height above takeoff or AGL, per height_type
+
+    🚨 Byte 1 is a C bitfield in the reference implementation, and C bitfields
+    are little-endian: the FIRST field declared occupies the LOWEST bits.
+    Reading such a byte top-down from the prose spec inverts every field in
+    it. That is how height_type ended up backwards here and how the operator
+    location type came to be masked with 0x0F instead of 0x03.
     """
     if len(data) < 25:
         return {}
 
     status      = data[1]
-    speed_mult  = (status >> 0) & 0x01
+    speed_mult  = status & 0x01
     ew_bit      = (status >> 1) & 0x01
     height_type = (status >> 2) & 0x01
+    op_status   = (status >> 4) & 0x0F
 
     direction   = data[2] + (180 if ew_bit else 0)
     speed       = data[3] * 0.75 + 63.75 if speed_mult else data[3] * 0.25
-    vspeed      = data[4] * 0.5 - 62.0
+    # Signed: the wire carries roughly -62..+62 m/s as a two's-complement
+    # byte. Read as unsigned with a -62 offset, every hovering aircraft
+    # reported -62 m/s and every descent came out as a 60 m/s climb.
+    raw_v       = data[4]
+    vspeed      = ((raw_v - 256) if raw_v > 127 else raw_v) * 0.5
 
     lat = struct.unpack_from('<i', data, 5)[0] * 1e-7
     lon = struct.unpack_from('<i', data, 9)[0] * 1e-7
@@ -363,19 +420,28 @@ def parse_location(data: bytes) -> dict:
     # transmits lat>90 or lon>180 as a sentinel until GPS acquires).
     if abs(lat) > 90.0 or abs(lon) > 180.0:
         return {}
-
-    geo_alt = struct.unpack_from('<H', data, 15)[0] * 0.5 - 1000.0
-    height  = struct.unpack_from('<H', data, 17)[0] * 0.5 - 1000.0
+    # Exactly 0/0 is F3411's "no position", not a point in the Gulf of Guinea.
+    # The rest of the message is still good — an aircraft declaring an
+    # emergency before GPS lock still matters — so keep it without a position.
+    no_fix = (lat == 0.0 and lon == 0.0)
 
     return {
-        "latitude":       round(lat, 7),
-        "longitude":      round(lon, 7),
-        "altitude_geo":   round(geo_alt, 1),
-        "height_agl":     round(height, 1),
-        "ground_speed":   round(speed, 2),
-        "vertical_speed": round(vspeed, 2),
-        "heading":        round(direction, 1),
-        "height_type":    "AGL" if height_type == 0 else "Above Takeoff",
+        "latitude":       None if no_fix else round(lat, 7),
+        "longitude":      None if no_fix else round(lon, 7),
+        "altitude_geo":   _alt_or_none(struct.unpack_from('<H', data, 15)[0]),
+        "altitude_baro":  _alt_or_none(struct.unpack_from('<H', data, 13)[0]),
+        "height_agl":     _alt_or_none(struct.unpack_from('<H', data, 17)[0]),
+        "ground_speed":   None if speed >= SPEED_UNKNOWN_MS else round(speed, 2),
+        "vertical_speed": (None if abs(vspeed) >= VSPEED_UNKNOWN_MS
+                           else round(vspeed, 2)),
+        "heading":        (None if direction >= DIRECTION_UNKNOWN_DEG
+                           else round(direction, 1)),
+        # F3411: 0 is above the TAKEOFF point, 1 is above ground level. These
+        # were the wrong way round, so every height was labelled as the other.
+        "height_type":    "Above Takeoff" if height_type == 0 else "AGL",
+        # Carries EMERGENCY. Never decoded here before, so a node's own screen
+        # could not show what the network was already showing.
+        "op_status":      OP_STATUS.get(op_status, f"Unknown({op_status})"),
     }
 
 
@@ -516,12 +582,15 @@ def parse_system_msg(data: bytes) -> dict:
     """
     Decode ASTM F3411-22a System Message (16+ bytes).
     Byte layout (matches server-side canonical decoder):
-       1 (low nibble)  op_location_type  (d[1] & 0x0F)
+       1 (bits 0-1)    op_location_type  (d[1] & 0x03)
+       1 (bits 2-4)    classification_type
        2-5             operator latitude   (int32 LE, * 1e-7)
        6-9             operator longitude  (int32 LE, * 1e-7)
       10-11            area_count          (uint16 LE)
       12               area_radius_m       (raw * 10)
-      13-14            alt_takeoff_geo     (uint16 LE, * 0.5 - 1000.0)
+      13-14            area_ceiling_m      (uint16 LE, * 0.5 - 1000.0)
+      15-16            area_floor_m        (uint16 LE, * 0.5 - 1000.0)
+      18-19            operator_alt_geo    (uint16 LE, * 0.5 - 1000.0)
       20-23            drone_time          (uint32 LE, + F3411_EPOCH)
 
     🚨 drone_time is the only ABSOLUTE time anywhere in the broadcast, and it
@@ -537,31 +606,45 @@ def parse_system_msg(data: bytes) -> dict:
     """
     if len(data) < 16:
         return {}
-    op_location_type = data[1] & 0x0F
+    # 2 bits, not 4. Bits 2-4 of this byte are the classification type, and a
+    # 0x0F mask dragged them in: an EU-classified takeoff location decoded as
+    # 4, which is not a valid location type at all.
+    op_location_type    = data[1] & 0x03
+    classification_type = (data[1] >> 2) & 0x07
     op_lat = struct.unpack_from('<i', data, 2)[0] * 1e-7
     op_lon = struct.unpack_from('<i', data, 6)[0] * 1e-7
 
-    # Reject placeholder/pre-lock values (same convention as parse_location)
-    if abs(op_lat) > 90.0 or abs(op_lon) > 180.0:
+    # Out of range, or F3411's "unknown" 0/0 — which is a declaration that
+    # there is no operator position, not an operator in the Gulf of Guinea.
+    if abs(op_lat) > 90.0 or abs(op_lon) > 180.0 or (op_lat == 0.0 and op_lon == 0.0):
         op_lat = op_lon = None
 
     area_count    = struct.unpack_from('<H', data, 10)[0]
     area_radius_m = data[12] * 10
-    alt_takeoff   = struct.unpack_from('<H', data, 13)[0] * 0.5 - 1000.0
+    # 🚨 Bytes 13-14 are the operating-area CEILING; the operator altitude is
+    # at 18-19. Reading the ceiling as the operator altitude published
+    # -1000.0 on nearly every System message, because most aircraft leave the
+    # area fields unset and an unset altitude decodes to the bottom of the
+    # range.
+    area_ceiling_m = _alt_or_none(struct.unpack_from('<H', data, 13)[0])
+    area_floor_m   = _alt_or_none(struct.unpack_from('<H', data, 15)[0])
+    operator_alt   = (_alt_or_none(struct.unpack_from('<H', data, 18)[0])
+                      if len(data) >= 20 else None)
 
     out = {
-        "op_location_type": op_location_type,
-        "operator_lat":     round(op_lat, 7) if op_lat is not None else None,
-        "operator_lon":     round(op_lon, 7) if op_lon is not None else None,
-        "area_count":       area_count,
-        "area_radius_m":    area_radius_m,
-        "alt_takeoff_geo":  round(alt_takeoff, 1),
+        "op_location_type":    op_location_type,
+        "classification_type": classification_type,
+        "operator_lat":        round(op_lat, 7) if op_lat is not None else None,
+        "operator_lon":        round(op_lon, 7) if op_lon is not None else None,
+        "area_count":          area_count,
+        "area_radius_m":       area_radius_m,
+        "area_ceiling_m":      area_ceiling_m,
+        "area_floor_m":        area_floor_m,
+        "operator_alt_geo":    operator_alt,
+        # Kept under the old name too: it is what spooled history on deployed
+        # nodes already carries, and what this field was always meant to hold.
+        "alt_takeoff_geo":     operator_alt,
     }
-    # 🚨 Kept for the SPOOL and the offline UI, stripped before the POST.
-    # The node's own history should carry the aircraft's absolute time so a
-    # replay reads correctly even when this node's clock was wrong; the server
-    # decodes the same value from the raw hex itself and is not expecting the
-    # field. See LOCAL_ONLY_KEYS in Forwarder.
     dt = _decode_drone_time(data)
     if dt is not None:
         out["drone_time"] = dt
@@ -620,6 +703,8 @@ def decode_rid_message(raw_bytes: bytes, radio: str | None = None) -> dict | Non
         result.update(parse_basic_id(decode_bytes))
     elif msg_type == 0x1:
         result.update(parse_location(decode_bytes))
+    elif msg_type == 0x3:
+        result.update(parse_self_id(decode_bytes))
     elif msg_type == 0x4:
         result.update(parse_system_msg(decode_bytes))
         # Observed locally, never forwarded. This is the only absolute time in
