@@ -32,6 +32,7 @@ import signal
 import threading
 import uuid
 import os
+import random
 import re
 import subprocess
 import sys
@@ -238,6 +239,13 @@ REMOTE_ID_SERVICE_UUID = "0000fffa-0000-1000-8000-00805f9b34fb"
 # which is fine at a few events per flush and becomes an unbounded request
 # after an outage.
 DEFAULT_DRAIN_BATCH      = 200
+
+# A DNS recovery reconnects the whole fleet at once, and every node with a
+# backlog starts draining in the same second. Nodes with nothing buffered are
+# not the problem and are not delayed; a node holding a real backlog waits a
+# random moment first, so the fleet arrives spread out rather than together.
+DRAIN_START_JITTER_SEC = 90.0
+DRAIN_JITTER_BACKLOG = 500
 DEFAULT_BUFFER_MAX_BYTES = 50_000_000
 DEFAULT_BUFFER_WARN_PCT  = 75
 
@@ -1548,6 +1556,7 @@ class Forwarder:
         # v1.5.1: the batch currently being delivered, held across retries as
         # (idempotency_key, events, mark). Mirrors wifi_feeder — see _flush().
         self._inflight         = None
+        self._drain_jitter_done = False
         # Advisory pacing from the server's last reply. Not a 429 — deliberately
         # so, since a node must not re-send its buffer under load.
         self._pace_until       = 0.0
@@ -1623,6 +1632,20 @@ class Forwarder:
         self.last_flush = time.monotonic()
         self.spool.commit_staged()
         self.spool.prune()
+
+        # First drain of this process, and there is a real backlog behind it:
+        # wait a random moment so a fleet-wide reconnect does not arrive as one
+        # spike. Live traffic on a node with nothing buffered is never delayed.
+        if not self._drain_jitter_done:
+            self._drain_jitter_done = True
+            if self.held_events >= DRAIN_JITTER_BACKLOG:
+                delay = random.uniform(0.0, DRAIN_START_JITTER_SEC)
+                self._pace_until = time.time() + delay
+                log.info("[spool] %d events to send; starting in %.0fs so the "
+                         "fleet does not reconnect in one spike.",
+                         self.held_events, delay)
+                return
+
 
         # v1.5.1: a batch is assembled ONCE, stamped with an idempotency key,
         # and retried byte-identical until it is delivered or abandoned.
