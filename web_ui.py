@@ -167,6 +167,8 @@ WORLD_PACK_PATH = os.environ.get(
     "DRONEAWARE_WORLD_PACK_PATH", "/opt/droneaware/world.pmtiles")
 WORLD_PACK_URL = os.environ.get(
     "DRONEAWARE_WORLD_PACK_URL", "https://tiles.droneaware.io/world.pmtiles")
+# The world pack is downloaded by the CLI and the installer, not here; their
+# fallback lives with them.
 
 
 def _world_pack_path() -> str | None:
@@ -204,13 +206,15 @@ REGION_PACK_PATH = os.environ.get(
 # would mean a release every time the planet is rebuilt.
 TILE_UPSTREAM_URL = os.environ.get(
     "DRONEAWARE_TILE_URL", "https://tiles.droneaware.io/planet.pmtiles")
+TILE_FALLBACK_URL = os.environ.get(
+    "DRONEAWARE_TILE_FALLBACK_URL", "https://tiles.detent.network/planet.pmtiles")
 
 _tile_sess = None
 _tile_sess_lock = threading.Lock()
 
 # Reachability is cached: the map layer asks on every status poll, and a node
 # with no uplink must not spend 8s in a connect timeout each time.
-_tile_reach = {"at": 0.0, "ok": False}
+_tile_reach = {"at": 0.0, "ok": False, "url": TILE_UPSTREAM_URL}
 
 
 def _tile_session() -> "requests.Session":
@@ -233,16 +237,29 @@ def _tile_upstream_reachable() -> bool:
     if now - _tile_reach["at"] < 60:
         return _tile_reach["ok"]
     ok = False
-    try:
-        r = _tile_session().get(TILE_UPSTREAM_URL,
-                                headers={"Range": "bytes=0-7"}, timeout=6)
-        # Byte 0-6 spell PMTiles. A captive portal returning 200 with an HTML
-        # login page would otherwise read as a working tile host.
-        ok = r.status_code == 206 and r.content[:7] == b"PMTiles"
-    except Exception:
-        ok = False
-    _tile_reach.update(at=now, ok=ok)
-    return ok
+    # Primary first, every time, so the map comes home by itself once the
+    # hostname does. Unlike ingest there is no herd to worry about here: this
+    # runs at most once a minute, and only while someone has the map open.
+    for url in (TILE_UPSTREAM_URL, TILE_FALLBACK_URL):
+        if not url:
+            continue
+        try:
+            r = _tile_session().get(url, headers={"Range": "bytes=0-7"}, timeout=6)
+            # Byte 0-6 spell PMTiles. A captive portal returning 200 with an
+            # HTML login page would otherwise read as a working tile host.
+            ok = r.status_code == 206 and r.content[:7] == b"PMTiles"
+        except Exception:
+            ok = False
+        if ok:
+            _tile_reach.update(at=now, ok=True, url=url)
+            return True
+    _tile_reach.update(at=now, ok=False)
+    return False
+
+
+def _tile_url() -> str:
+    """The tile host that answered last. Checked by _tile_upstream_reachable."""
+    return _tile_reach.get("url") or TILE_UPSTREAM_URL
 
 
 def _region_pack_path() -> str | None:
@@ -554,7 +571,7 @@ def _pmtiles_dry_run(bbox: tuple, maxzoom: int, timeout: int = 45) -> dict:
     if not os.path.isfile(PMTILES_BIN):
         return {"error": "no_binary",
                 "detail": "The map extractor is not installed on this node."}
-    cmd = [PMTILES_BIN, "extract", TILE_UPSTREAM_URL, os.devnull,
+    cmd = [PMTILES_BIN, "extract", _tile_url(), os.devnull,
            "--bbox=%.6f,%.6f,%.6f,%.6f" % bbox,
            f"--maxzoom={maxzoom}", "--dry-run"]
     try:
@@ -2186,7 +2203,7 @@ def _run_extract(lat: float, lon: float, radius_km: float, maxzoom: int) -> None
         os.makedirs(os.path.dirname(REGION_PACK_PATH), exist_ok=True)
         # Two threads rather than the default four: kinder to a node on
         # domestic broadband, and the whole job is only tens of requests.
-        cmd = [PMTILES_BIN, "extract", TILE_UPSTREAM_URL, tmp,
+        cmd = [PMTILES_BIN, "extract", _tile_url(), tmp,
                "--bbox=%.6f,%.6f,%.6f,%.6f" % box,
                f"--maxzoom={maxzoom}", "--download-threads=2"]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
@@ -2342,7 +2359,7 @@ def region_pack():
         if v:
             headers[h] = v
     try:
-        up = _tile_session().get(TILE_UPSTREAM_URL, headers=headers,
+        up = _tile_session().get(_tile_url(), headers=headers,
                                  stream=True, timeout=(6, 30))
     except Exception as e:
         log.warning("[tiles] upstream unreachable: %s", e)

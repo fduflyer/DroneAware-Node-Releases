@@ -32,6 +32,12 @@ GITHUB_REPO="fduflyer/DroneAware-Node-Releases"  # CI stamps this with the build
 INSTALL_DIR="/opt/droneaware"
 CLI_DIR="/usr/local/bin"
 SERVER_URL="https://api.droneaware.io/api"
+# A second hostname on a different registrar backend. On 2026-09-30 a registrar
+# suspension took droneaware.io off DNS for 13+ hours; the server was healthy
+# throughout and the fleet still went from ~166 reporting receivers to 4,
+# because every node knew one name. Used only when the primary cannot be
+# reached at the transport level — never because of an HTTP status.
+SERVER_FALLBACK_URL="https://detent.network/api"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1054,6 +1060,10 @@ ADAPTIVE_DWELL=true
 # support@droneaware.io if you need to migrate or rename a node.
 NODE_ID=${NODE_ID}
 SERVER_URL=${SERVER_URL}
+# Used only when SERVER_URL cannot be reached at all (DNS/connect/TLS). The
+# node sticks with whichever answered and re-checks the primary every few
+# hours. Leave empty to disable the fallback entirely.
+SERVER_FALLBACK_URL=${SERVER_FALLBACK_URL}
 
 # BATCH_SIZE and FLUSH_INTERVAL control how often detections are forwarded to
 # the server. Increasing them holds events on the node longer, which can delay
@@ -1241,13 +1251,20 @@ enroll_node() {
         echo ""
         echo "  Contacting DroneAware network..."
 
-        local http_status response
-        http_status=$(curl -s --max-time 15 \
-            -o /tmp/droneaware_enroll.json \
-            -w "%{http_code}" \
-            -H "Content-Type: application/json" \
-            --data-binary "$body" \
-            "${SERVER_URL}/node/enroll" 2>/dev/null) || true
+        local http_status response base
+        for base in "$SERVER_URL" "$SERVER_FALLBACK_URL"; do
+            http_status=$(curl -s --max-time 15 \
+                -o /tmp/droneaware_enroll.json \
+                -w "%{http_code}" \
+                -H "Content-Type: application/json" \
+                --data-binary "$body" \
+                "${base}/node/enroll" 2>/dev/null) || true
+            # 000 is curl reporting it never got an answer: DNS, connect or TLS.
+            # Any real status means the server replied and this is its answer.
+            [[ -n "$http_status" && "$http_status" != "000" ]] && break
+            [[ "$base" == "$SERVER_FALLBACK_URL" ]] || \
+                echo "  Primary address unreachable — trying the backup address..."
+        done
         response=$(cat /tmp/droneaware_enroll.json 2>/dev/null || true)
 
         if [[ -z "$http_status" || "$http_status" == "000" ]]; then
@@ -1506,8 +1523,11 @@ SUDOERS
     # from the tile host while online, so a failed download must not abort
     # the Web UI install.
     echo "    Downloading offline basemap (15 MB)..."
-    if curl -fsSL --retry 3 --max-time 300 \
-            "https://tiles.droneaware.io/world.pmtiles" \
+    if curl -fsSL --retry 2 --max-time 300 \
+            "${TILES_URL:-https://tiles.droneaware.io/world.pmtiles}" \
+            -o "${INSTALL_DIR}/world.pmtiles.part" \
+       || curl -fsSL --retry 2 --max-time 300 \
+            "${TILES_FALLBACK_URL:-https://tiles.detent.network/world.pmtiles}" \
             -o "${INSTALL_DIR}/world.pmtiles.part"; then
         # Verify before it becomes the live pack — a truncated file or an
         # error page renamed into place renders a blank map with nothing to

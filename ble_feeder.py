@@ -17,6 +17,7 @@ Requirements:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import logging.handlers
@@ -330,6 +331,149 @@ def get_cpu_load() -> tuple[float | None, float | None, float | None]:
         return float(parts[0]), float(parts[1]), float(parts[2])
     except Exception:
         return None, None, None
+
+
+# ── Where this node publishes, and what happens when that stops existing ─────
+# On 2026-09-30 droneaware.io was suspended at the registrar. The server, the
+# database and the edge were all healthy; only DNS broke. The fleet went from
+# ~166 reporting receivers to 4, because every node knew exactly one hostname.
+#
+# A second hostname on a different registrar backend fixes that, but the
+# obvious implementation is worse than the outage, so note what this does NOT
+# do:
+#
+#   * It switches on TRANSPORT failure only — DNS, connect, TLS — never on an
+#     HTTP status. A 500, 429 or 422 means the server is reachable and
+#     talking; failing over on those turns one degraded backend into two.
+#   * It never tries both hosts for one request. The failed request stays
+#     failed and the spool keeps it; the NEXT request uses the new host. That
+#     keeps ingest load flat instead of doubling it.
+#   * It is sticky and drifts home slowly. The choice is written to disk, so a
+#     restart mid-outage does not march back into the hole, and the primary is
+#     re-probed on an interval of hours, jittered per node, so 166 receivers
+#     do not rediscover it in the same second and drain their spools together.
+#
+# The outage itself taught one thing the design had to absorb: the suspended
+# name still RESOLVED, to a registrar hold server that accepted no
+# connections. Nothing ever returned NXDOMAIN. A failover keyed on
+# name-resolution alone would have sat there all night.
+PRIMARY_API_BASE = (os.environ.get("SERVER_URL")
+                    or "https://api.droneaware.io/api").rstrip("/")
+# Overridable so a future fallback can be moved without a fleet release.
+FALLBACK_API_BASE = (os.environ.get("SERVER_FALLBACK_URL")
+                     or "https://detent.network/api").rstrip("/")
+ENDPOINT_STATE_PATH = os.environ.get(
+    "DRONEAWARE_ENDPOINT_STATE", "/var/lib/droneaware/endpoint.json")
+# A single failed request is a blip; a dead name is relentless. Three in a row
+# of something that runs every minute is ~3 minutes of real unreachability.
+ENDPOINT_FAILOVER_AFTER = 3
+ENDPOINT_PROBE_MIN_SEC = 6 * 3600
+ENDPOINT_PROBE_JITTER_SEC = 2 * 3600
+
+
+class _Endpoint:
+    """Which base URL to publish to, and when to try coming home.
+
+    Holds no connection state and performs no I/O except the failback probe,
+    so the spool and the forwarders are untouched by a switch: only the URL
+    the next attempt uses changes.
+    """
+
+    def __init__(self, node_id: str = ""):
+        # The jitter below is keyed off this, so it must be per node and the
+        # same on every restart. Empty here would give all 166 receivers an
+        # identical probe time, which is the herd this exists to avoid.
+        self.node_id = (node_id or os.environ.get("NODE_ID")
+                        or socket.gethostname() or "unknown")
+        self.base = PRIMARY_API_BASE
+        self.on_fallback = False
+        self._fails = 0
+        self._last_probe = 0.0
+        self._load()
+
+    # Jitter keyed off node_id, not random(): stable across restarts, so a
+    # node keeps its own slot in the hour instead of redrawing one each boot.
+    def _probe_interval(self) -> float:
+        digest = hashlib.sha256(self.node_id.encode("utf-8", "replace")).digest()
+        offset = int.from_bytes(digest[:4], "big") / 0xFFFFFFFF
+        return ENDPOINT_PROBE_MIN_SEC + offset * ENDPOINT_PROBE_JITTER_SEC
+
+    def _load(self) -> None:
+        try:
+            with open(ENDPOINT_STATE_PATH) as f:
+                state = json.load(f)
+        except Exception:
+            return
+        # Only a recorded fallback is restored, and only if it is still the
+        # fallback this build knows about: a stale file must not pin a node to
+        # a host that has since been retired.
+        if state.get("base") == FALLBACK_API_BASE:
+            self.base = FALLBACK_API_BASE
+            self.on_fallback = True
+            self._last_probe = float(state.get("last_probe") or 0.0)
+
+    def _save(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(ENDPOINT_STATE_PATH), exist_ok=True)
+            tmp = ENDPOINT_STATE_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"base": self.base, "on_fallback": self.on_fallback,
+                           "last_probe": self._last_probe,
+                           "updated_at": time.time()}, f)
+            os.replace(tmp, ENDPOINT_STATE_PATH)
+        except Exception:
+            pass          # a node that cannot write state still works, it just forgets
+
+    def url(self, path: str) -> str:
+        return self.base + path
+
+    def record_success(self) -> None:
+        self._fails = 0
+
+    def record_transport_failure(self) -> None:
+        """Count a DNS/connect/TLS failure, and switch hosts once it is clear
+        this is not a blip. Callers must NOT call this for an HTTP status."""
+        self._fails += 1
+        if self._fails < ENDPOINT_FAILOVER_AFTER:
+            return
+        self._fails = 0
+        other = FALLBACK_API_BASE if not self.on_fallback else PRIMARY_API_BASE
+        if other == self.base:
+            return
+        self.base = other
+        self.on_fallback = not self.on_fallback
+        self._last_probe = time.monotonic()
+        self._save()
+        log.warning(
+            "[endpoint] %s unreachable — publishing to %s from now on. "
+            "Nothing is lost: the spool holds everything already recorded.",
+            PRIMARY_API_BASE if self.on_fallback else FALLBACK_API_BASE, self.base)
+
+    def maybe_failback(self) -> None:
+        """While on the fallback, re-probe the primary on a long jittered
+        interval and move back only after a clean success."""
+        if not self.on_fallback:
+            return
+        now = time.monotonic()
+        if now - self._last_probe < self._probe_interval():
+            return
+        self._last_probe = now
+        try:
+            requests.get(PRIMARY_API_BASE + "/node-firmware/latest", timeout=8)
+        except requests.exceptions.ConnectionError:
+            self._save()
+            return
+        except Exception:
+            # Reachable but unhappy (status, slow read) still counts as home.
+            pass
+        self.base = PRIMARY_API_BASE
+        self.on_fallback = False
+        self._fails = 0
+        self._save()
+        log.info("[endpoint] %s is reachable again — publishing there.", self.base)
+
+
+ENDPOINT = _Endpoint()
 
 
 # ── Platform identity (v1.6.1) ───────────────────────────────────────────────
@@ -1384,7 +1528,9 @@ class Forwarder:
     def __init__(self, server_url: str, node_id: str,
                  batch_size: int = 200, flush_interval: float = 5.0,
                  token: str = "", feeder: str = "ble"):
-        self.url               = server_url.rstrip("/") + "/ingest"
+        # Kept for reference/logging; the live URL comes from ENDPOINT so a
+        # host switch needs no restart and touches no spool state.
+        self.configured_url    = server_url.rstrip("/") + "/ingest"
         self.node_id           = node_id
         self.batch_size        = batch_size
         self.flush_interval    = flush_interval
@@ -1519,7 +1665,7 @@ class Forwarder:
             # every retry of it, so the server can recognize a replay from the
             # header alone and drop it before decoding the body.
             headers["Idempotency-Key"] = key
-            r = requests.post(self.url, json=payload, headers=headers, timeout=5)
+            r = requests.post(ENDPOINT.url("/ingest"), json=payload, headers=headers, timeout=5)
             r.raise_for_status()
             # 🚨 Advance the watermark. Do NOT delete the segment: a 200 says
             # the events were accepted, not that the operator is done with
@@ -1529,6 +1675,7 @@ class Forwarder:
             with self._lock:
                 self._inflight = None
             self.sent_total += len(events)
+            ENDPOINT.record_success()
             self._read_pacing_hint(r)
             log.debug(f"Sent {len(events)} events ({self.sent_total} total)")
         except requests.RequestException as e:
@@ -1537,6 +1684,11 @@ class Forwarder:
             # it. 408 and 429 both explicitly ask to be retried; everything
             # else (timeout, connection reset, 5xx) is transient or ambiguous,
             # so the batch stays in flight and goes back out unchanged.
+            # DNS, connect or TLS failure — the host itself is unreachable, which
+            # is the only thing that may move this node to another hostname. A
+            # status code, however bad, means the server is there and talking.
+            if isinstance(e, requests.exceptions.ConnectionError):
+                ENDPOINT.record_transport_failure()
             status = getattr(getattr(e, "response", None), "status_code", None)
             permanent = (status is not None
                          and 400 <= status < 500
@@ -1808,7 +1960,7 @@ class BLEFeeder:
                 if not self.token:
                     continue
                 requests.post(
-                    "https://api.droneaware.io/api/node/heartbeat",
+                    ENDPOINT.url("/node/heartbeat"),
                     json={
                         # Per-feeder heartbeat: ble_* fields only (see note above)
                         "node_id":      self.node_id,
@@ -1842,6 +1994,8 @@ class BLEFeeder:
                     timeout=5,
                 )
             except requests.RequestException as e:
+                if isinstance(e, requests.exceptions.ConnectionError):
+                    ENDPOINT.record_transport_failure()
                 log.warning(f"FAULT heartbeat failed: {e}")
             except Exception as e:
                 log.warning(f"FAULT loop error: {e}")
@@ -2103,7 +2257,7 @@ class BLEFeeder:
                     try:
                         await asyncio.to_thread(
                             requests.post,
-                            "https://api.droneaware.io/api/node/heartbeat",
+                            ENDPOINT.url("/node/heartbeat"),
                             json={
                                 # Per-feeder heartbeat: ble_* fields only.
                                 # Do NOT include wifi_ok or wifi_fault — the
@@ -2157,8 +2311,14 @@ class BLEFeeder:
                             headers={"X-Node-Token": self.token},
                             timeout=5,
                         )
-                        log.debug("Heartbeat sent to droneaware.io")
+                        log.debug("Heartbeat sent to %s", ENDPOINT.base)
+                        ENDPOINT.record_success()
+                        # Every minute, on every node: the natural place to ask
+                        # whether the primary host is worth another look.
+                        ENDPOINT.maybe_failback()
                     except requests.RequestException as e:
+                        if isinstance(e, requests.exceptions.ConnectionError):
+                            ENDPOINT.record_transport_failure()
                         log.warning(f"Heartbeat failed: {e}")
             except asyncio.CancelledError:
                 return
