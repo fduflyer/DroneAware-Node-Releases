@@ -2197,6 +2197,17 @@ cmd_status() {
     echo "  Node ID  : $(_cfg_get "${INSTALL_DIR}/config.env" NODE_ID unknown)"
     # Only worth a line when it is NOT the primary: an operator asking "why is
     # my node quiet" needs to know it quietly moved to the backup address.
+    local shed_total=0 f
+    for f in /run/droneaware/wifi_state_2g.json /run/droneaware/wifi_state_5g.json \
+             /run/droneaware/wifi_state.json /run/droneaware/ble_state.json; do
+        [[ -f "$f" ]] || continue
+        local n
+        n=$(sed -n 's/.*"shed_total": *\([0-9]*\).*/\1/p' "$f" | head -1)
+        [[ -n "$n" ]] && shed_total=$((shed_total + n))
+    done
+    if [[ "$shed_total" -gt 0 ]]; then
+        echo -e "  Dropped  : ${BOLD}${shed_total}${NC} record(s) not retained by the server"
+    fi
     local ep_state="/var/lib/droneaware/endpoint.json"
     if [[ -f "$ep_state" ]] && grep -q '"on_fallback": *true' "$ep_state" 2>/dev/null; then
         local ep_base
