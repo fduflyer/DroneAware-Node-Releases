@@ -3,17 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="theme-color" content="#0A1228">
   <title>DroneAware Local Viewer</title>
-
   <!-- Bundled Leaflet (no CDN at runtime per brand guide) -->
   <link rel="stylesheet" href="/static/leaflet.css">
 
-  <!-- Brand mark favicon (paper airplane, green #10b981) — inlined as data URI
-       so the browser tab icon works without an additional asset request. -->
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='65 200 250 245'><g fill='none' stroke='%2310b981' stroke-width='15' stroke-linecap='round' stroke-linejoin='round' transform='translate%28-35 2.5%29'><path d='M283.2 351.8 L250 420 L216 330 L120 300 L192.8 266.6 L247.4 241.6 L302 216.5 L268 274 L333 249.5 L308.1 300.7 Z'/><path d='M216 330 L268 274'/></g></svg>">
-
-  <style>
+    <style>
     /* =========================================================================
        Color tokens — dark mode default, [data-theme="day"] override.
        Brand-mark green (#10b981) is reserved for the logo only; cyan
@@ -1303,6 +1297,16 @@
       }
     }
   </style>
+  
+  <meta name="theme-color" content="#0A1228">
+
+
+  
+  <!-- Brand mark favicon (paper airplane, green #10b981) — inlined as data URI
+       so the browser tab icon works without an additional asset request. -->
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='65 200 250 245'><g fill='none' stroke='%2310b981' stroke-width='15' stroke-linecap='round' stroke-linejoin='round' transform='translate%28-35 2.5%29'><path d='M283.2 351.8 L250 420 L216 330 L120 300 L192.8 266.6 L247.4 241.6 L302 216.5 L268 274 L333 249.5 L308.1 300.7 Z'/><path d='M216 330 L268 274'/></g></svg>">
+
+
 </head>
 <body>
   <!-- Header -->
