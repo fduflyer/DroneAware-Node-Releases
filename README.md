@@ -12,7 +12,7 @@ Nodes are already running in the US, Germany, and Canada - and growing daily.
 
 DroneAware Network is a community-built, open Remote ID detection network. The goal is to create a distributed, real-time view of drone activity with low-cost sensors - where the value isn't just the software, but the shared detection network everyone contributes to.
 
-Run one command and start detecting drones around you, from a few hundred yards to miles away depending on your setup::
+Run one command and start detecting drones around you, from a few hundred yards to miles away depending on your setup:
 
 ```bash
 curl -fsSL https://github.com/fduflyer/DroneAware-Node-Releases/releases/latest/download/install.sh | sudo bash
