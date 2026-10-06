@@ -3,6 +3,12 @@
 # Chooses the Bluetooth adapter the BLE feeder uses. Runs at every boot, and
 # from `droneaware refresh` with --no-reboot.
 #
+# The automatic mode only ever switches the built-in radio OFF (when a USB
+# adapter is working). It never switches it back on by itself: that would mean
+# editing the operator's boot configuration and rebooting the node because a
+# dongle was missing for one boot, which is not a conclusion worth drawing
+# automatically. Use BLE_ADAPTER_MODE=onboard, or Settings, to ask for it.
+#
 # BLE_ADAPTER_MODE in config.env:
 #   auto     (default) use a USB dongle when one is working, otherwise the
 #            Pi's built-in radio
@@ -141,17 +147,21 @@ else
         auto)
             if [[ -n "$USB_HCI" ]] && ! $overlay_set; then
                 want=add
-            elif [[ -z "$USB_BT_IDS" && -z "$USB_HCI" ]] && $overlay_set; then
-                # No USB Bluetooth device on the bus at all: the dongle really
-                # is gone, so give the built-in radio back. Both checks, because
-                # some dongles declare a vendor-specific class (ff) instead of
-                # e0/01/01 and btusb binds them by ID -- a working one of those
-                # shows only as a registered adapter. (One of those with NO
-                # driver is invisible here, so it falls back to the old
-                # behavior.)
-                want=remove
-            elif [[ -n "$USB_BT_IDS" && -z "$USB_HCI" ]] && $overlay_set; then
-                log "WARNING: USB Bluetooth device $USB_BT_IDS is plugged in but registered no adapter (driver or power problem). Leaving the built-in radio off rather than switching behind your back. Set BLE_ADAPTER_MODE=onboard to use it instead."
+            elif $overlay_set && [[ -z "$USB_HCI" ]]; then
+                # NEVER take the line back out on its own.
+                #
+                # It is there because a USB adapter was in use, and that is a
+                # standing instruction. A dongle missing for one boot can mean
+                # unplugged, a slow or faulty hub, or a chip the kernel never
+                # binds -- and a driverless dongle is INVISIBLE here, so "no
+                # USB Bluetooth device on the bus" does not mean the operator
+                # stopped wanting one. Removing the line rewrites their boot
+                # configuration and reboots the node to do it; getting that
+                # wrong on every boot is what this used to do.
+                #
+                # So the automatic path only ever adds. Taking the built-in
+                # radio back is a decision, and it has to be asked for.
+                log "WARNING: the built-in Bluetooth is switched off in $CONFIG_TXT and no USB adapter is working${USB_BT_IDS:+ (device $USB_BT_IDS is plugged in but registered no adapter -- driver or power)}. BLE cannot run until one of them is available. Reconnect the USB adapter, or choose the built-in radio in Settings (Node -> Bluetooth adapter), or set BLE_ADAPTER_MODE=onboard in $DA_CONFIG."
             fi
             ;;
     esac
