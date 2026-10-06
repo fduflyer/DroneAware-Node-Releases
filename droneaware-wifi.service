@@ -7,6 +7,14 @@ Wants=network-online.target
 Type=simple
 User=root
 EnvironmentFile=/opt/droneaware/config.env
+# The binaries are self-extracting: each unpacks its bundle into a temp
+# directory and reads from it for the life of the process. The daily tmpfiles
+# clean deletes anything in /tmp older than 10 days, which on a node left
+# running removes a live process's own files underneath it — the local map
+# page loses its interface files, and the process can die outright. A private
+# /tmp is excluded from that cleanup (/usr/lib/tmpfiles.d/systemd-tmp.conf),
+# so a service keeps what it unpacked for as long as it runs.
+PrivateTmp=yes
 ExecStart=/opt/droneaware/wifi_feeder \
     --node-id ${NODE_ID} \
     --server ${SERVER_URL} \

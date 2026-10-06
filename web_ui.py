@@ -1169,7 +1169,7 @@ _PHASE_A_HTML = """<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <h1>DroneAware Local Viewer — Phase A backend running</h1>
+  <h1>DroneAware Local Viewer — interface files missing</h1>\n  <p>The node is running and still recording. This page is a fallback shown when the interface files are unavailable; the service restarts itself within a minute and the map returns.</p>
   <p class="label">v__VERSION__ — Phase B (full UI) ships next</p>
   <div class="grid">
     <div class="card">
@@ -2452,6 +2452,33 @@ def _restore_system_library_path() -> None:
         os.environ.pop("LD_LIBRARY_PATH", None)
 
 
+
+def bundle_watchdog():
+    """Exit if the interface files this process unpacked disappear.
+
+    The binary unpacks itself into a temp directory and reads from it for as
+    long as it runs, so anything that tidies temp files can remove a live
+    process's own files. The page then renders a placeholder that means
+    nothing to an operator and never recovers on its own; the only cure is a
+    restart, which unpacks a fresh copy.
+
+    So: notice, say so, and exit non-zero. systemd restarts the service and
+    the page comes back by itself. Serving a broken page indefinitely is the
+    one outcome worth avoiding.
+    """
+    index = os.path.join(_static_root(), "index.html")
+    if not os.path.isfile(index):
+        return          # never had a bundle (source run) — nothing to watch
+    while True:
+        time.sleep(60)
+        if os.path.isfile(index):
+            continue
+        log.error("Interface files have gone from %s — most likely a system "
+                  "temp-file cleanup removed them while this was running. "
+                  "Restarting to unpack a fresh copy.", _static_root())
+        os._exit(1)
+
+
 def main():
     _restore_system_library_path()
     parser = argparse.ArgumentParser(
@@ -2475,6 +2502,7 @@ def main():
 
     threading.Thread(target=consumer_thread, daemon=True).start()
     threading.Thread(target=prune_thread, daemon=True).start()
+    threading.Thread(target=bundle_watchdog, daemon=True).start()
 
     log.info(f"HTTP server starting on http://{args.bind}:{args.port}/")
     app.run(host=args.bind, port=args.port, threaded=True, debug=False,
