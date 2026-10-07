@@ -1614,6 +1614,7 @@ _ensure_unit_files_current() {
 
     local -a names=("${_SYNCED_UNITS[@]}" droneaware-bt-select)
     local name dest mode rc attempted=0 changed=0 incomplete=0
+    local -a changed_units=()
     for name in "${names[@]}"; do
         if [[ "$name" == *.service ]]; then
             dest="${SYSTEMD_UNIT_DIR}/${name}"; mode=644
@@ -1657,6 +1658,7 @@ _ensure_unit_files_current() {
         if cp "${tmp}/${name}" "${dest}.new" && chmod "$mode" "${dest}.new" \
            && mv -f "${dest}.new" "$dest"; then
             changed=1
+            [[ "$name" == *.service ]] && changed_units+=("$name")
             info "${name} updated to the ${ver} version."
         else
             rm -f "${dest}.new"
@@ -1666,16 +1668,45 @@ _ensure_unit_files_current() {
     done
     rm -rf "$tmp"
 
-    # Reload so systemd holds the new definitions. Deliberately NO restart:
-    # "Refresh hardware" in the Web UI runs refresh from inside droneaware-web,
-    # and restarting that unit would kill the refresh doing the restarting.
-    # Settings read at stop time (TimeoutStopSec) apply as soon as this reloads;
-    # settings read at start (ExecStartPre, StateDirectory) apply at the next
-    # start. What those protect is enforced in this same refresh regardless —
-    # _ensure_webui_current re-grants the Web UI's access, and the spool creates
-    # its own directory.
+    # Reload so systemd holds the new definitions, then put them into effect.
+    #
+    # Reloading alone is not enough, and it reads as though it were: systemctl
+    # reports what the FILE says, so a setting can look applied while the
+    # running process still has the old one. A unit shipped with a fix is not
+    # a fix until the service restarts.
+    #
+    # Two deliberate exceptions:
+    #   * droneaware-web, when this refresh is running inside it — the Web UI's
+    #     "Refresh hardware" button does exactly that, and restarting the unit
+    #     here would kill the refresh doing the restarting. Hand it to systemd
+    #     to do once this has finished.
+    #   * droneaware-bt-select — a oneshot that decides whether to rewrite the
+    #     boot configuration and reboot. Refresh runs it directly, with
+    #     --no-reboot; starting the unit instead could reboot the node in the
+    #     middle of a refresh.
     if (( changed )); then
         systemctl daemon-reload
+        local unit
+        for unit in "${changed_units[@]}"; do
+            [[ "$unit" == droneaware-bt-select.service ]] && continue
+            systemctl is-active --quiet "$unit" 2>/dev/null || continue
+            if [[ "$unit" == droneaware-web.service ]] \
+               && grep -qs droneaware-web /proc/self/cgroup; then
+                if systemd-run --no-block --on-active=20s \
+                        --unit=droneaware-web-apply-unit \
+                        systemctl restart droneaware-web.service >/dev/null 2>&1; then
+                    info "The Web UI restarts in a moment to pick up its new service file."
+                else
+                    warn "droneaware-web.service was updated — restart it to apply: sudo systemctl restart droneaware-web"
+                fi
+                continue
+            fi
+            if systemctl restart "$unit" >/dev/null 2>&1; then
+                info "${unit} restarted to apply its new service file."
+            else
+                warn "${unit} was updated but did not restart — restart it when convenient: sudo systemctl restart ${unit}"
+            fi
+        done
     fi
 
     # Stamp only a COMPLETE check, so a partial one is retried next refresh.
