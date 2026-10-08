@@ -3672,6 +3672,10 @@ _LOCAL_ALIASED = {"message_type", "raw_hex", "latitude", "longitude",
 # Zipline corridor), and days of quieter traffic. Tunable independently
 # of the Forwarder cap via DRONEAWARE_LOCAL_BUFFER_MAX_BYTES.
 DEFAULT_LOCAL_BUFFER_MAX_BYTES = 10_000_000
+# How much of the cap a trim keeps. Trimming to the cap itself means the next
+# event is over it again, so a saturated buffer rewrites the whole file per
+# event; keeping four fifths makes a trim rare instead of constant.
+LOCAL_BUFFER_TRIM_RATIO = 0.8
 
 # Comma-separated list of "host:port" pairs the LocalPublisher sends
 # each detection to via UDP. Default is the LAN broadcast address; set
@@ -3805,19 +3809,24 @@ class LocalPublisher:
             pass
 
     def _trim(self):
-        """Drop oldest lines until file size <= max_buffer_bytes. Reads the
-        whole file, keeps lines from the end inward until under cap, rewrites.
-        Expensive (O(N)) but rare — at 10 MB cap, fires every few thousand
-        events at most."""
+        """Drop oldest lines until the file is comfortably under the cap.
+
+        Trimming to the cap itself was the bug: the next event put the file
+        back over it, so once a busy node filled this buffer every event
+        rewrote the whole thing, and the reader on the other side re-read it
+        each time. Leaving headroom turns that back into what the comment
+        always claimed — a rare O(N) rewrite, with the next one thousands of
+        events away."""
         try:
             with open(self.BUFFER_PATH, 'rb') as f:
                 raw = f.read()
             lines = raw.splitlines(keepends=True)
             kept_reversed = []
             total = 0
+            keep_bytes = int(self.max_buffer_bytes * LOCAL_BUFFER_TRIM_RATIO)
             for line_bytes in reversed(lines):
                 size = len(line_bytes)
-                if total + size > self.max_buffer_bytes:
+                if total + size > keep_bytes:
                     break
                 kept_reversed.append(line_bytes)
                 total += size
