@@ -157,6 +157,8 @@ DEFAULT_BUFFER_MAX_BYTES = int(os.environ.get(
 # (DRONEAWARE_LOCAL_BUFFER_MAX_BYTES, default 50 MB) still bounds RAM,
 # so this just changes the time-based eviction not the size limit.
 STALE_AGE_SEC      = 12 * 3600
+# How many recent detections to remember for duplicate suppression.
+RECENT_KEYS        = 50_000
 PRUNE_INTERVAL_SEC = 1.0
 
 # SSE per-client queue depth — slow clients drop events rather than
@@ -634,6 +636,13 @@ class DetectionStore:
         self._by_mac: dict[str, collections.deque] = {}
         self._total_bytes = 0
         self._max_bytes = max_bytes
+        # Detections already taken, so reading the same line twice is a no-op.
+        # The ring on disk is re-read whenever the publisher trims it, and
+        # without this every one of those lines counted as a new detection:
+        # stored again, and announced to every open page, which replayed the
+        # whole buffer across the map as though it were happening now.
+        self._seen_keys: collections.deque = collections.deque(maxlen=RECENT_KEYS)
+        self._seen: set = set()
 
     @staticmethod
     def _mac_of(event: dict) -> str | None:
@@ -678,7 +687,17 @@ class DetectionStore:
                 ts = None
         if not isinstance(ts, (int, float)):
             ts = time.time()
+        # Identity of a detection: which radio said it, when, and which
+        # message it was. One pack carries several message types sharing a
+        # timestamp, so the type belongs in the key.
+        key = (mac, round(float(ts), 3), event.get("type") or event.get("message_type"))
         with self._lock:
+            if key in self._seen:
+                return False
+            if len(self._seen_keys) == self._seen_keys.maxlen and self._seen_keys:
+                self._seen.discard(self._seen_keys[0])
+            self._seen_keys.append(key)
+            self._seen.add(key)
             if mac not in self._by_mac:
                 self._by_mac[mac] = collections.deque()
             self._by_mac[mac].append((event, size, ts))
