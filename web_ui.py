@@ -643,6 +643,12 @@ class DetectionStore:
         # whole buffer across the map as though it were happening now.
         self._seen_keys: collections.deque = collections.deque(maxlen=RECENT_KEYS)
         self._seen: set = set()
+        # Insertion order, so dropping the oldest detection is one step rather
+        # than a search. Finding it by scanning every aircraft was fine with a
+        # handful in the air and quadratic in busy airspace: once the store is
+        # full, every new detection paid that scan, and a node watching
+        # thousands of aircraft spent its whole CPU here.
+        self._order: collections.deque = collections.deque()
 
     @staticmethod
     def _mac_of(event: dict) -> str | None:
@@ -701,23 +707,27 @@ class DetectionStore:
             if mac not in self._by_mac:
                 self._by_mac[mac] = collections.deque()
             self._by_mac[mac].append((event, size, ts))
+            self._order.append(mac)
             self._total_bytes += size
             self._evict_to_cap_locked()
         return True
 
     def _evict_to_cap_locked(self):
-        """FIFO drop-oldest across all MACs until total <= cap. Caller
-        must hold self._lock."""
-        while self._total_bytes > self._max_bytes:
-            oldest_mac = None
-            oldest_ts = float("inf")
-            for mac, dq in self._by_mac.items():
-                if dq and dq[0][2] < oldest_ts:
-                    oldest_ts = dq[0][2]
-                    oldest_mac = mac
-            if oldest_mac is None:
-                break
-            _, size, _ = self._by_mac[oldest_mac].popleft()
+        """Drop oldest-first until total <= cap. Caller must hold self._lock.
+
+        Oldest means first recorded: detections arrive in time order, and each
+        aircraft's own queue is in time order, so the head of the insertion
+        list is the oldest thing held. Taking it is one step. Searching every
+        aircraft for it, as this used to, cost the whole CPU on a node
+        watching thousands of them.
+        """
+        while self._total_bytes > self._max_bytes and self._order:
+            oldest_mac = self._order.popleft()
+            dq = self._by_mac.get(oldest_mac)
+            if not dq:
+                # Already pruned for age; its slot here is just a leftover.
+                continue
+            _, size, _ = dq.popleft()
             self._total_bytes -= size
             if not self._by_mac[oldest_mac]:
                 del self._by_mac[oldest_mac]
@@ -736,6 +746,17 @@ class DetectionStore:
                     empty_macs.append(mac)
             for mac in empty_macs:
                 del self._by_mac[mac]
+            # Pruning by age leaves slots in the insertion list pointing at
+            # detections that are gone. Eviction skips them, but they would
+            # otherwise accumulate on a node that prunes more than it evicts,
+            # so rebuild the list once it is mostly leftovers. Rare, and
+            # proportional to what is actually held.
+            held = sum(len(dq) for dq in self._by_mac.values())
+            if len(self._order) > 2 * held + 1000:
+                rebuilt = sorted(
+                    ((ts, mac) for mac, dq in self._by_mac.items() for _, _, ts in dq),
+                    key=lambda pair: pair[0])
+                self._order = collections.deque(mac for _, mac in rebuilt)
 
     def snapshot(self) -> dict:
         """Build a JSON-serializable snapshot for the /api/detections endpoint.
