@@ -36,6 +36,7 @@ import errno
 import fcntl
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -83,6 +84,22 @@ DEFAULT_SUSTAINED_EVENTS_PER_MIN = 240
 DEFAULT_BURST_EVENTS_PER_MIN = 600
 DEFAULT_CREDIT_MAX_ROWS = 48000
 DEFAULT_ROWS_PER_EVENT = 5
+
+# Bounds on a rate the server advertises. A reply travels over the network, so
+# it is treated as data: zero or negative would stop delivery outright, and an
+# unbounded value would make the limiter ornamental. Clamping both ends means
+# the worst a bad reply can do is pace this node badly, never wedge it.
+#
+# The ceiling is a guardrail against a nonsensical reply, NOT a budget -- the
+# budget belongs on the server, where it can be changed per node without
+# shipping firmware. It is deliberately set above what a feeder can currently
+# achieve: a drain batch of 200 flushed once per one-second tick caps a feeder
+# near 12,000 events/min today, and because the tick awaits the POST, a
+# round-trip of a second or more holds it well below that. Pinning the ceiling
+# to today's arithmetic would quietly turn it into a binding limit the moment
+# the batch size rises or the flush stops being awaited, so it sits above it.
+BUDGET_MIN_EVENTS_PER_MIN = 1.0
+BUDGET_MAX_EVENTS_PER_MIN = 20_000.0
 
 # Reads from a segment are chunked at this size so a small batch request does
 # not pull the whole 4 MB tail off the card.
@@ -340,6 +357,97 @@ class NodeRateLimiter:
         # Enough headroom for one full batch so a single batch is never
         # permanently unaffordable, plus ten seconds of burst.
         self.burst_max = max(self.burst_rps * 10.0, 1000.0)
+        # The rates ACTUALLY in force. They begin at the configured values and
+        # are replaced by whatever the server last advertised — see
+        # set_budget(). Re-read from the shared file on every _load, so a reply
+        # that reached one feeder re-paces the other two as well.
+        self._rps = self.sustained_rps
+        self._brps = self.burst_rps
+        self._bmax = self.burst_max
+        self._from_server = False
+
+    def _apply_budget(self, st) -> None:
+        """Adopt the rates recorded in the shared file, if it carries any.
+
+        Absent, zero or unreadable values mean "no guidance yet" and leave the
+        configured floor in place, which is what makes an older server, a
+        proxy that rewrites bodies and a first batch after boot all behave the
+        same way.
+        """
+        try:
+            rps = float(st.get("rps") or 0.0)
+            brps = float(st.get("brps") or 0.0)
+        except (TypeError, ValueError):
+            rps = brps = 0.0
+        self._from_server = rps > 0.0
+        self._rps = rps if rps > 0.0 else self.sustained_rps
+        # Burst can never sit below the sustained rate, or the fast bucket
+        # would throttle below the slow one and the pacing would invert.
+        self._brps = max(brps if brps > 0.0 else self.burst_rps, self._rps)
+        self._bmax = max(self._brps * 10.0, 1000.0)
+
+    def set_budget(self, events_per_min, burst_events_per_min=None) -> bool:
+        """Record the upload budget the server advertised. True if it changed.
+
+        🚨 Written to the SHARED file, not held per process. One node has one
+        allowance and up to three feeders under a single node_id, so a budget
+        kept per process would be honoured three times over — the same trap
+        that made the limiter shared in the first place.
+
+        The figures arrive over the network, so they are data, not
+        instructions: both ends are clamped, and anything unusable leaves the
+        node on its own floor rather than stopping delivery.
+        """
+        try:
+            ev = float(events_per_min)
+        except (TypeError, ValueError):
+            return False
+        # NaN and infinity are both rejected rather than clamped: an allowance
+        # that is not a finite number is a broken reply, and treating infinity
+        # as "the maximum" would quietly adopt the ceiling on a bad payload.
+        if not math.isfinite(ev) or ev <= 0:
+            return False
+        ev = max(BUDGET_MIN_EVENTS_PER_MIN, min(ev, BUDGET_MAX_EVENTS_PER_MIN))
+        try:
+            bev = float(burst_events_per_min) if burst_events_per_min else 0.0
+        except (TypeError, ValueError):
+            bev = 0.0
+        if not math.isfinite(bev) or bev <= 0:
+            bev = 0.0
+        else:
+            bev = max(BUDGET_MIN_EVENTS_PER_MIN, min(bev, BUDGET_MAX_EVENTS_PER_MIN))
+
+        rps = ev * self.rows_per_event / 60.0
+        brps = max(bev * self.rows_per_event / 60.0, rps) if bev else rps
+
+        try:
+            os.makedirs(RUN_DIR, exist_ok=True)
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError as e:
+            log.debug(f"rate limiter unavailable, budget not recorded: {e}")
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            credits, burst, now = self._load(fd)
+            changed = (abs(self._rps - rps) > 1e-6
+                       or abs(self._brps - brps) > 1e-6)
+            self._from_server = True
+            self._rps, self._brps = rps, brps
+            self._bmax = max(brps * 10.0, 1000.0)
+            # Raising the rate must not retroactively hand out the credit the
+            # old rate never earned, so the buckets are carried across as they
+            # stand and simply refill faster from here.
+            self._store(fd, min(credits, self.credit_max),
+                        min(burst, self._bmax), now)
+            return changed
+        except OSError as e:
+            log.debug(f"rate limiter error, budget not recorded: {e}")
+            return False
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
     def _load(self, fd):
         try:
@@ -348,21 +456,29 @@ class NodeRateLimiter:
             st = json.loads(raw)
         except (OSError, ValueError):
             st = {}
+        self._apply_budget(st)
         now = time.time()
         last = float(st.get("ts", now))
         # A clock step backwards (NTP settling after boot, common on a Pi with
         # no RTC) must not hand out an unbounded refill or freeze the bucket.
         elapsed = max(0.0, min(now - last, 3600.0))
         credits = min(self.credit_max,
-                      float(st.get("credits", self.credit_max)) + self.sustained_rps * elapsed)
-        burst = min(self.burst_max,
-                    float(st.get("burst", self.burst_max)) + self.burst_rps * elapsed)
+                      float(st.get("credits", self.credit_max)) + self._rps * elapsed)
+        burst = min(self._bmax,
+                    float(st.get("burst", self._bmax)) + self._brps * elapsed)
         return credits, burst, now
 
     def _store(self, fd, credits, burst, now):
-        raw = json.dumps({"credits": round(credits, 2),
-                          "burst": round(burst, 2),
-                          "ts": now}).encode()
+        state = {"credits": round(credits, 2),
+                 "burst": round(burst, 2),
+                 "ts": now}
+        # 🚨 _store rewrites the whole file, so the advertised budget has to be
+        # carried through every write or the first feeder to take budget would
+        # silently drop the server's guidance for all three.
+        if self._from_server:
+            state["rps"] = round(self._rps, 4)
+            state["brps"] = round(self._brps, 4)
+        raw = json.dumps(state).encode()
         os.lseek(fd, 0, os.SEEK_SET)
         os.write(fd, raw)
         os.ftruncate(fd, len(raw))
@@ -388,8 +504,8 @@ class NodeRateLimiter:
             if credits >= rows and burst >= rows:
                 self._store(fd, credits - rows, burst - rows, now)
                 return 0.0
-            need_c = (rows - credits) / self.sustained_rps if credits < rows else 0.0
-            need_b = (rows - burst) / self.burst_rps if burst < rows else 0.0
+            need_c = (rows - credits) / self._rps if credits < rows else 0.0
+            need_b = (rows - burst) / self._brps if burst < rows else 0.0
             self._store(fd, credits, burst, now)
             return max(0.05, min(max(need_c, need_b), 300.0))
         except OSError as e:
@@ -411,7 +527,12 @@ class NodeRateLimiter:
             credits, burst, _ = self._load(fd)
             return {"credits_rows": int(credits),
                     "credits_max_rows": int(self.credit_max),
-                    "rows_per_event": self.rows_per_event}
+                    "rows_per_event": self.rows_per_event,
+                    # So an operator can see which pace is in force without
+                    # having to reason about where it came from.
+                    "events_per_min": round(self._rps * 60.0
+                                            / self.rows_per_event, 1),
+                    "pace_from_server": self._from_server}
         finally:
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)

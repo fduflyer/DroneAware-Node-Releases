@@ -2478,6 +2478,52 @@ ENDPOINT_STATE_PATH = os.environ.get(
 ENDPOINT_FAILOVER_AFTER = 3
 ENDPOINT_PROBE_MIN_SEC = 6 * 3600
 ENDPOINT_PROBE_JITTER_SEC = 2 * 3600
+# A resolver fault repeats every minute and says nothing new each time.
+ENDPOINT_LOCAL_LOG_SEC = 300.0
+
+# urllib3 only names this exception from 2.0 onward; on an older build a
+# resolver failure arrives as a plain NewConnectionError whose message is the
+# only evidence. Both paths are covered so the classification does not depend
+# on which urllib3 a given node happens to have installed.
+try:
+    from urllib3.exceptions import NameResolutionError as _NameResolutionError
+except Exception:                                      # pragma: no cover
+    _NameResolutionError = None
+
+_RESOLVER_HINTS = (
+    "name or service not known",
+    "temporary failure in name resolution",
+    "nodename nor servname provided",
+    "failed to resolve",
+    "no address associated with hostname",
+)
+
+
+def _is_resolver_failure(exc) -> bool:
+    """True when a request failed because THIS NODE could not resolve a name.
+
+    🚨 This is the difference between "the host is unreachable" and "nothing is
+    reachable". A resolver fault makes every hostname equally unusable, so
+    failing over trades one unresolvable name for another and then back again,
+    forever, while the real fault is local. Observed in the field: a node
+    logged 68 host switches at exact three-minute intervals during a local DNS
+    outage, with both API hostnames perfectly healthy throughout.
+
+    The chain is walked because requests wraps urllib3 which wraps socket, and
+    which layer carries the evidence varies by version.
+    """
+    depth = 0
+    while exc is not None and depth < 10:
+        depth += 1
+        if _NameResolutionError is not None and isinstance(exc, _NameResolutionError):
+            return True
+        if isinstance(exc, socket.gaierror):
+            return True
+        text = str(exc).lower()
+        if any(hint in text for hint in _RESOLVER_HINTS):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
 
 
 class _Endpoint:
@@ -2498,6 +2544,7 @@ class _Endpoint:
         self.on_fallback = False
         self._fails = 0
         self._last_probe = 0.0
+        self._last_local_log = 0.0
         self._load()
 
     # Jitter keyed off node_id, not random(): stable across restarts, so a
@@ -2539,9 +2586,31 @@ class _Endpoint:
     def record_success(self) -> None:
         self._fails = 0
 
-    def record_transport_failure(self) -> None:
-        """Count a DNS/connect/TLS failure, and switch hosts once it is clear
-        this is not a blip. Callers must NOT call this for an HTTP status."""
+    def _note_local_failure(self) -> None:
+        """A fault on this side of the link: report it, spend no strike."""
+        now = time.monotonic()
+        if now - self._last_local_log < ENDPOINT_LOCAL_LOG_SEC:
+            return
+        self._last_local_log = now
+        log.warning(
+            "[endpoint] cannot resolve %s — name resolution is failing on this "
+            "node, so another hostname would fail the same way and the switch "
+            "is being skipped. Nothing is lost: the spool holds everything "
+            "already recorded.", self.base)
+
+    def record_transport_failure(self, exc=None) -> None:
+        """Count a connect/TLS failure against the CURRENT host, and switch
+        hosts once it is clear this is not a blip. Callers must NOT call this
+        for an HTTP status.
+
+        Pass the exception when there is one. A resolver failure is counted
+        nowhere and switches nothing — see _is_resolver_failure. Called without
+        an exception the old behaviour stands, so an existing caller that has
+        none to offer still works.
+        """
+        if _is_resolver_failure(exc):
+            self._note_local_failure()
+            return
         self._fails += 1
         if self._fails < ENDPOINT_FAILOVER_AFTER:
             return
@@ -2751,6 +2820,20 @@ DEFAULT_DRAIN_BATCH      = 200
 # random moment first, so the fleet arrives spread out rather than together.
 DRAIN_START_JITTER_SEC = 90.0
 DRAIN_JITTER_BACKLOG = 500
+
+# The longest pause the node will accept from one reply. A pause is applied in
+# full and silently below PACE_LOG_MIN_SEC; at or above it the node says so,
+# because a quiet uploader and a deliberately paused one look identical in a
+# journal and the difference decides whether an operator starts debugging. Seen
+# in the field: a node sat still for the better part of an hour with its
+# uploads correctly paced and not one line to say why.
+PACE_HINT_MAX_SEC = 3600.0
+PACE_LOG_MIN_SEC = 10.0
+# And no more often than this. A deadline-based guard looked right and was not:
+# every reply pushes the deadline a little further, so "only report when the
+# pause is extended" reported on every single reply. A plain throttle gives one
+# line for one long pause and one line per interval for a run of short ones.
+PACE_LOG_INTERVAL_SEC = 300.0
 DEFAULT_BUFFER_MAX_BYTES = 50_000_000
 DEFAULT_BUFFER_WARN_PCT  = 75
 
@@ -2829,7 +2912,18 @@ class Forwarder:
         self._drain_jitter_done = False
         # Advisory pacing from the server's last reply. Not a 429 — deliberately
         # so, since a node must not re-send its buffer under load.
+        # 🚨 MONOTONIC, and the same in ble_feeder. A Pi has no RTC: it boots
+        # with a stale clock and steps when NTP settles, so a wall-clock
+        # deadline ends a pause early or late by the size of the step. The
+        # bucket in spool.py already guards the same hazard. The two feeders
+        # also have to agree, because they used to disagree -- one monotonic
+        # writer among wall-clock ones made the deadline unreachable and
+        # stopped a drain for the life of the process.
         self._pace_until       = 0.0
+        # When a pause was last reported (monotonic, independent of the
+        # _pace_until scale), so one pause is reported once rather than on
+        # every reply that re-states it.
+        self._pace_logged_at = 0.0
         # The shipping forwarder used batch_size purely as a flush TRIGGER and
         # then posted `list(self.buffer)` — the entire buffer, however large.
         # Under normal load that is a handful of events and this reads the
@@ -2872,7 +2966,7 @@ class Forwarder:
 
     def should_flush(self) -> bool:
         """Advisory: True if a flush is due. Called from background thread."""
-        if time.time() < self._pace_until:
+        if time.monotonic() < self._pace_until:
             return False
         with self._lock:
             if self._inflight is not None:
@@ -2908,7 +3002,7 @@ class Forwarder:
             self._drain_jitter_done = True
             if self.held_events >= DRAIN_JITTER_BACKLOG:
                 delay = random.uniform(0.0, DRAIN_START_JITTER_SEC)
-                self._pace_until = time.time() + delay
+                self._pace_until = time.monotonic() + delay
                 log.info("[spool] %d events to send; starting in %.0fs so the "
                          "fleet does not reconnect in one spike.",
                          self.held_events, delay)
@@ -2932,7 +3026,7 @@ class Forwarder:
         # through a lock file — see spool.NodeRateLimiter.
         wait = self.limiter.take(len(events))
         if wait > 0:
-            self._pace_until = time.time() + wait
+            self._pace_until = time.monotonic() + wait
             return
 
         payload = {"node_id": self.node_id, "events": _for_the_wire(events)}
@@ -2942,6 +3036,15 @@ class Forwarder:
             # every retry of it, so the server can recognize a replay from
             # the header alone and drop it before decoding the body.
             headers["Idempotency-Key"] = key
+            # When this ATTEMPT left the node, by the node's own clock.
+            # Deliberately re-stamped on every retry while the idempotency key
+            # stays fixed to the batch: together they let the server separate
+            # how long an event waited in the spool from how long the transport
+            # took. Without it the server sees only capture time and cannot
+            # tell a slow link from a long backlog. The node clock may be wrong
+            # -- a Pi has no RTC -- so this is evidence to be weighed with the
+            # heartbeat's clock_source, not a timestamp to trust outright.
+            payload["sent_at"] = datetime.now(timezone.utc).isoformat()
             r = requests.post(ENDPOINT.url("/ingest"), json=payload, headers=headers, timeout=5)
             r.raise_for_status()
             # 🚨 Advance the watermark. Do NOT delete the segment: a 200 says
@@ -2962,11 +3065,13 @@ class Forwarder:
             # retried. Everything else (timeout, connection reset, 5xx) is
             # transient or ambiguous, so the batch stays in flight and goes
             # back out unchanged under the same key.
-            # DNS, connect or TLS failure — the host itself is unreachable, which
-            # is the only thing that may move this node to another hostname. A
-            # status code, however bad, means the server is there and talking.
+            # A connect or TLS failure means this host is unreachable, which is
+            # the only thing that may move the node to another hostname. A
+            # status code, however bad, means the server is there and talking;
+            # and a resolver failure means NOTHING is reachable, which the
+            # endpoint sorts out from the exception rather than switching on.
             if isinstance(e, requests.exceptions.ConnectionError):
-                ENDPOINT.record_transport_failure()
+                ENDPOINT.record_transport_failure(e)
             status = getattr(getattr(e, "response", None), "status_code", None)
             permanent = (status is not None
                          and 400 <= status < 500
@@ -3011,8 +3116,20 @@ class Forwarder:
             hint = float(body.get("next_batch_after_ms") or 0) / 1000.0
         except Exception:
             hint = 0.0
-        if 0 < hint <= 3600:
-            self._pace_until = time.time() + hint
+        if 0 < hint <= PACE_HINT_MAX_SEC:
+            self._pace_until = time.monotonic() + hint
+            # Announce a pause once, when it is first extended past what has
+            # already been announced, so routine back-to-back pacing stays
+            # quiet but a long silence is always on the record.
+            if (hint >= PACE_LOG_MIN_SEC
+                    and time.monotonic() - self._pace_logged_at
+                        >= PACE_LOG_INTERVAL_SEC):
+                self._pace_logged_at = time.monotonic()
+                log.info("[upload] pausing %.0fs at the server's request "
+                         "(%d events waiting). Pacing, not a failure -- "
+                         "nothing is dropped while this holds.",
+                         hint, self.held_events)
+        self._read_budget(body)
         try:
             shed = int(body.get("shed") or 0)
         except Exception:
@@ -3022,6 +3139,38 @@ class Forwarder:
             log.warning("[upload] the server did not retain %d record(s) from this "
                         "batch (%d total) and asked the node to pause.",
                         shed, self.shed_total)
+
+    def _read_budget(self, body) -> None:
+        """Adopt the upload allowance the server advertises, if it does.
+
+        🚨 Before this, the server could only ever slow the node DOWN: the
+        pause hint was honoured but the node's own conservative floor capped
+        delivery whatever the server was willing to take. On a busy node that
+        floor is well under what one aircraft produces, so the spool grew for
+        as long as the aircraft flew and every live detection queued behind the
+        backlog. The floor has to be conservative — it is what an unenrolled or
+        newly flashed node paces to — so the server is given a way to raise it.
+
+        Advisory in both directions and backward compatible: a reply without
+        these fields leaves the node on its floor, which is exactly how every
+        server behaved before the field existed.
+        """
+        budget = body.get("upload_budget")
+        if isinstance(budget, dict):
+            ev = budget.get("events_per_min")
+            burst = budget.get("burst_events_per_min")
+        else:
+            ev = body.get("max_events_per_min")
+            burst = body.get("max_burst_events_per_min")
+        if ev is None:
+            return
+        try:
+            if self.limiter.set_budget(ev, burst):
+                log.info("[upload] pacing to the server's advertised allowance "
+                         "of %s events/min.", ev)
+        except Exception as e:
+            # A malformed allowance must never cost us the batch that carried it.
+            log.debug(f"[upload] could not apply the advertised allowance: {e}")
 
     def _maybe_warn(self):
         """One warning per fill, one info on drain."""
@@ -4345,7 +4494,7 @@ class WiFiFeeder:
             ENDPOINT.maybe_failback()
         except requests.RequestException as e:
             if isinstance(e, requests.exceptions.ConnectionError):
-                ENDPOINT.record_transport_failure()
+                ENDPOINT.record_transport_failure(e)
             log.warning(f"Heartbeat failed (feeder={payload.get('feeder', 'wifi[legacy]')}): {e}")
 
     def _try_recover_adapter(self) -> bool:
