@@ -892,6 +892,25 @@ broker = SSEBroker()
 
 # ---- Tmpfs ring file tail (the data source) ---------------------------------
 
+def _take_complete_lines(pending: bytes) -> tuple[list[bytes], bytes]:
+    """Split off every complete line, returning them and the unfinished tail.
+
+    One pass. Taking lines one at a time with `pending.split(b"\n", 1)` copies
+    everything still unread on each line, so the work grows with the square of
+    the buffer: fine for a poll's worth of new detections, and minutes of CPU
+    for the whole file at startup. A node with a 25 MB buffer spent twelve of
+    them pinned at a full core after every restart, including the restart an
+    update performs.
+    """
+    cut = pending.rfind(b"\n") + 1
+    if not cut:
+        return [], pending
+    # The slice ends with the newline, so splitting it leaves a trailing
+    # empty element; drop it rather than hand the caller a line that is not
+    # one.
+    return pending[:cut].split(b"\n")[:-1], pending[cut:]
+
+
 def consumer_thread():
     """Single thread that handles both startup replay and live tailing of
     /run/droneaware/detections.jsonl — the LocalPublisher's tmpfs ring file.
@@ -944,8 +963,8 @@ def consumer_thread():
                 cursor = current_size
 
                 events_added = 0
-                while b"\n" in pending:
-                    line, pending = pending.split(b"\n", 1)
+                lines, pending = _take_complete_lines(pending)
+                for line in lines:
                     line = line.strip()
                     if not line:
                         continue
