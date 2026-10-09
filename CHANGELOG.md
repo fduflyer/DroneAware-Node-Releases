@@ -10,6 +10,109 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.6.1.7] — 2026-10-09
+
+Seven patch releases followed 1.6.1 in under two weeks. Most came from one
+operator noticing something and saying so; the dates and numbers below are
+what was actually measured, on real nodes.
+
+### The node keeps publishing when its address disappears
+
+On 30 September the domain nodes publish to was suspended at the registrar
+over a missed verification email. Nothing was wrong with the servers,
+the database or the network — only DNS broke, for fifteen hours. The fleet
+went from about 166 reporting receivers to four, and detections from roughly
+7,400 an hour to none, because every node knew exactly one hostname. Each
+node's own map went blank for the same reason.
+
+Nodes now know a second address, on a different registrar, and move to it
+when the first cannot be reached. The behaviour is deliberately conservative:
+
+- It switches only when the connection itself fails, never because the server
+  returned an error. A server that is answering, badly, is still answering.
+- It never tries both addresses for one upload. The attempt fails, the
+  detections stay in the buffer, and the next attempt uses the other address.
+- It takes three failures in a row to move, so a brief blip does not count.
+- The choice is remembered across restarts, so a node restarted during an
+  outage does not walk back into it.
+- It returns to the normal address on its own, re-checking every few hours at
+  a moment unique to each node, so the fleet does not all come back at once.
+
+The outage taught one thing worth recording: the suspended name still
+resolved, to a holding server that accepted no connections. A node watching
+for the name to disappear would have waited all night.
+
+Proven during the outage itself: a node on the new build failed over and
+uploaded its entire backlog — 1,702 detections cleared in three minutes with
+nothing lost.
+
+### Your Bluetooth adapter setting stays where you put it
+
+A node using a USB Bluetooth adapter has the built-in radio switched off in
+its boot configuration. When no USB adapter appeared to be working, the node
+deleted that line and rebooted to turn the built-in radio back on — then did
+it again on the next boot, because nothing about the situation had changed.
+Operators were resetting a setting that kept coming back, on several nodes,
+for weeks.
+
+The earlier attempt at this fix covered an adapter that is visible but not
+working. It missed the case that actually bites: an adapter the system never
+recognises at all is indistinguishable from no adapter.
+
+The node now only ever switches the built-in radio off, never back on.
+Turning it back on rewrites your boot configuration and reboots the node, so
+it is asked for rather than assumed — in Settings, or with
+`BLE_ADAPTER_MODE=onboard`. When neither radio can be used, the log says so
+and names both ways out.
+
+### Three things that only went wrong on a node left running
+
+**The local map stopped working after about ten days.** The node unpacks its
+own files into temporary storage, and the system's routine cleanup deletes
+anything there older than ten days — including files a running service is
+still using. Each service now keeps its files where that cleanup will not
+reach them, and the web interface restarts itself if they ever vanish.
+
+**Fixes were installed without taking effect.** An update delivers new
+service definitions, but nothing restarted the services to pick them up, so a
+fix could be installed, report itself as applied, and not be. Found on a node
+immediately after updating, where two services had picked up their new
+definitions only by accident and a third had not.
+
+**The local viewer could sit at a full CPU core.** Three separate faults, all
+of which needed a node busy enough to fill its detection buffer:
+
+- The buffer was trimmed to exactly its limit, so the next detection put it
+  over again and the whole file was rewritten — on a busy node, per detection.
+- Reading it back started from the beginning every time it was trimmed, and
+  announced every line to any open page as though it had just happened. That
+  is why one operator saw every drone in the buffer replay across the map at
+  once.
+- Reading the buffer took lines one at a time, copying everything still unread
+  on each one, so the work grew with the square of the buffer. A node with a
+  25 MB buffer spent about twelve minutes pinned at a full core after every
+  restart, including the restart an update performs. It now takes under twelve
+  seconds on the same hardware.
+
+The 1.6.1.6 notes attributed that operator's CPU to how old detections are
+discarded. That was a real fault, and a real improvement — from 424 to 21,700
+detections a second on a node tracking thousands of aircraft — but it was not
+his problem, and saying so was wrong.
+
+### Smaller things
+
+- Heartbeats report the node's OS, kernel, Bluetooth stack version, Pi model
+  and where its clock came from, so supporting a node no longer starts by
+  asking its operator what they are running.
+- A node with a large backlog waits a random moment before uploading it, so a
+  fleet reconnecting at once does not arrive as a single spike.
+- The node follows the server's pacing guidance, and records anything the
+  server reports it could not keep, in its heartbeat and in
+  `droneaware status`.
+- The map falls back to streaming when a mobile node drives outside the area
+  it downloaded, instead of going blank.
+- The node's own name is shown on phone screens 375 pixels and wider.
+
 ## [1.6.1] — 2026-09-28
 
 ### Bluetooth recovers by itself
