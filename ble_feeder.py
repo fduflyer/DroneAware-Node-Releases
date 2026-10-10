@@ -1851,6 +1851,13 @@ class Forwarder:
                     self.dropped_total += len(events)
                     self.spool.commit(mark)
                     self._inflight = None
+            # A refusal the server wants retried still carries its guidance.
+            # Read it outside the lock: this parses a body and must not hold
+            # up the producer. A permanent 4xx is skipped -- that batch is
+            # never going out again, so there is nothing to pace.
+            resp = getattr(e, "response", None)
+            if resp is not None and not permanent:
+                self._read_upload_reply(resp, accepted=False)
             log.warning(
                 f"Flush failed: {e}  "
                 f"({'skipped — not retryable' if permanent else 'held for retry'}, "
@@ -1860,8 +1867,16 @@ class Forwarder:
                 f"dropped_total={self.dropped_total})"
             )
 
-    def _read_upload_reply(self, r):
+    def _read_upload_reply(self, r, accepted: bool = True):
         """Honour the server's pacing guidance, and record what it reports.
+
+        🚨 Also called for a batch the server REJECTED but asked us to retry
+        (408, 429, 5xx), with accepted=False. The guidance in such a reply is
+        the whole point of it -- a 429 that says when to come back was being
+        discarded, because the body used to be read only on success, and the
+        node then retried on its own cadence instead. A shed count is NOT read
+        on that path: nothing was stored, so counting one would overstate the
+        loss.
 
         The reply can ask the node to wait before sending again, and can report
         a count of records the server did not retain. Both are advisory: an
@@ -1896,6 +1911,8 @@ class Forwarder:
                          "nothing is dropped while this holds.",
                          hint, self.held_events)
         self._read_budget(body)
+        if not accepted:
+            return
         try:
             shed = int(body.get("shed") or 0)
         except Exception:
