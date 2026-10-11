@@ -2647,10 +2647,50 @@ cmd_test() {
     token=$(cat /etc/droneaware/token 2>/dev/null | tr -d '[:space:]')
     [[ -z "$token" ]] && fatal "No node credential found. Re-run the installer to enroll this node."
 
+    # Transmit from EVERY band's own adapter, not just WIFI_ADAPTER. A
+    # transmission goes out on whatever channel its adapter is tuned to, so on
+    # a two-adapter node a test sent only from the 5 GHz radio can never reach
+    # the 2.4 GHz feeder -- which reported 0 on exactly the band most nodes
+    # hear the most on. The feeders publish which interface each band actually
+    # opened, so read that rather than guess from config. One dual-band
+    # adapter serving both bands is transmitted on once. With no feeder state
+    # (feeders not running yet) the configured adapter is used, as before.
+    local run_dir="${DA_RUN_DIR:-/run/droneaware}"
+    local -a tx_ifaces=()
+    local tx_desc="" tx_bands="" shared=0 _band _st _if _mode _label
+    for _band in 2g 5g; do
+        _st=$(python3 -c 'import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit
+print(d.get("iface") or "-", d.get("scan_mode") or "-")' \
+            "${run_dir}/wifi_state_${_band}.json" 2>/dev/null)
+        read -r _if _mode <<< "${_st:-- -}"
+        [[ "$_if" == "-" || "$_mode" == "absent" ]] && continue
+        [[ -d "/sys/class/net/${_if}" ]] || continue
+        tx_bands+=" ${_band}"
+        if [[ "$_band" == "2g" ]]; then _label="2.4 GHz"; else _label="5 GHz"; fi
+        if [[ " ${tx_ifaces[*]} " == *" ${_if} "* ]]; then
+            tx_desc="${tx_desc/${_if} (2.4 GHz)/${_if} (2.4 + 5 GHz)}"
+            shared=1
+            continue
+        fi
+        tx_ifaces+=("$_if")
+        tx_desc+="${tx_desc:+, }${_if} (${_label})"
+    done
+    if (( ${#tx_ifaces[@]} == 0 )) && [[ -n "$iface" && -d "/sys/class/net/${iface}" ]]; then
+        tx_ifaces=("$iface")
+        tx_desc="$iface"
+    fi
+    # A shared adapter transmits on whichever band it happens to be tuned to,
+    # so the test cannot say it covered either one in particular.
+    (( shared )) && tx_bands=""
+
     # WiFi adapter must exist before we contact the server (avoids wasting a
     # rate-limit slot) or run the embedded transmitter (avoids ENODEV crash on
     # missing iface). Fail fast with an actionable message.
-    if [[ -z "$iface" || ! -d "/sys/class/net/${iface}" ]]; then
+    if (( ${#tx_ifaces[@]} == 0 )); then
         echo ""
         echo -e "  ${RED}✗  Cannot run test — WiFi adapter '${iface:-<none>}' not present.${NC}"
         echo ""
@@ -2715,7 +2755,7 @@ GPSPY
     echo "  Node     : ${node_id}"
     echo "  Test ID  : ${test_id}"
     echo "  Location : ${lat}, ${lon}"
-    echo "  Interface: ${iface}"
+    echo "  Interface: ${tx_desc}"
     echo ""
 
     # Ask the server for permission — it is the source of truth for rate limits
@@ -2784,10 +2824,11 @@ print(detail.get('message', str(detail)))" 2>/dev/null || true)
     echo ""
 
     # Transmit test beacons via Python (embedded)
-    python3 - "$iface" "$lat" "$lon" "$test_id" <<'PYEOF'
+    python3 - "$(IFS=,; echo "${tx_ifaces[*]}")" "$lat" "$lon" "$test_id" <<'PYEOF'
 import sys, socket, struct, time, math
 
-iface, lat, lon, uas_id = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+ifaces = [i for i in sys.argv[1].split(",") if i]
+lat, lon, uas_id = float(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
 
 # --- ODID builders (ASTM F3411-22a correct byte layout) ---
 
@@ -2899,8 +2940,19 @@ src_mac = bytes([0x60, 0x60, 0x1F, 0x00, 0x01, 0x02])
 basic_id  = build_basic_id(uas_id)
 system_msg = build_system_msg(lat, lon)   # operator = node location
 
-sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
-sock.bind((iface, 0))
+# One socket per adapter. An adapter that cannot be opened is reported and
+# left out rather than ending the test for the bands that can transmit.
+socks = []
+for name in ifaces:
+    try:
+        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+        s.bind((name, 0))
+        socks.append((name, s))
+    except OSError as e:
+        print(f"  !  {name}: cannot open for transmit ({e.strerror or e})")
+if not socks:
+    sys.exit(1)
+sent_ok = {name: 0 for name, _ in socks}
 
 steps    = len(waypoints)
 interval = 60.0 / steps
@@ -2910,19 +2962,26 @@ for i, (wlat, wlon) in enumerate(waypoints):
     pack = build_message_pack([basic_id, location, system_msg])
     frame = build_beacon(src_mac, pack)
 
-    # Send 3 times to cover channel hopper cycle
+    # Send 3 times to cover channel hopper cycle. Every adapter sends each
+    # repeat, so a two-band test takes no longer than a one-band test did.
     for _ in range(3):
-        try:
-            sock.send(frame)
-        except Exception:
-            pass
+        for name, s in socks:
+            try:
+                s.send(frame)
+                sent_ok[name] += 1
+            except Exception:
+                pass
         time.sleep(0.3)
 
     print(f"  [{i+1}/{steps}] lat={wlat:.6f} lon={wlon:.6f}")
     time.sleep(max(0, interval - 0.9))
 
-sock.close()
+for _, s in socks:
+    s.close()
 print("\n  Transmission complete.")
+for name, n in sent_ok.items():
+    if n == 0:
+        print(f"  !  {name} sent nothing -- its driver may not support transmitting in monitor mode.")
 PYEOF
 
     # Check local detection ring buffer (per-channel breakdown so the
@@ -2977,6 +3036,15 @@ PYJSON
         [[ "$detail" != "-" ]] && echo "       by channel : ${detail}"
         if [[ "$b24" -gt 0 && "$b5" -gt 0 ]]; then
             info "Both bands receiving — radio fully functional."
+        fi
+        # A band the test transmitted on but captured nothing from is worth
+        # naming outright: it is the difference between "this band was never
+        # tested" and "this band is not hearing".
+        if [[ "$tx_bands" == *2g* && "$b24" -eq 0 ]]; then
+            warn "Transmitted on 2.4 GHz but captured nothing there — check 'droneaware status'."
+        fi
+        if [[ "$tx_bands" == *5g* && "$b5" -eq 0 ]]; then
+            warn "Transmitted on 5 GHz but captured nothing there — check 'droneaware status'."
         fi
     fi
     echo ""
