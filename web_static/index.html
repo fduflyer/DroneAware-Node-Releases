@@ -3950,8 +3950,13 @@ ${multiSerialHTML}
         }
         row.appendChild(txt);
         if (d.available) {
-          row.appendChild(cfg.actionBtn("update", `Install ${d.latest}`,
-            "Download and install the latest release, then restart the feeders."));
+          const b = cfg.actionBtn("update", `Install ${d.latest}`,
+            "Download and install the latest release, then restart the feeders.");
+          // What success looks like, so the result can be judged by the
+          // version the node comes back on rather than by a reply the
+          // restarted server has no memory of.
+          b.dataset.target = d.latest;
+          row.appendChild(b);
         }
         box.appendChild(row);
         const h = document.createElement("h3");
@@ -4366,11 +4371,47 @@ ${multiSerialHTML}
         b.addEventListener("click", () => cfg.runAction(action, b));
         return b;
       },
+      // Wait out an update and say how it ended. The server that comes back
+      // is a fresh process with no memory of the request that started the
+      // update, so the outcome is read from the version it reports.
+      async awaitUpdate(btn, target) {
+        btn.textContent = "Updating — reconnecting…";
+        const deadline = Date.now() + 10 * 60 * 1000;
+        while (Date.now() < deadline) {
+          await new Promise(res => setTimeout(res, 3000));
+          let version;
+          try {
+            version = (await fetchJSON("/api/status", { timeout: 4000 })).version || "";
+          } catch (e) {
+            continue;                       // still restarting
+          }
+          if (!target || version === target) {
+            return { ok: true, message: `Updated to ${version}.` };
+          }
+          // Answering, but on the old version. Either the connection only
+          // blinked and this same server is still running the update, or
+          // the update ended without installing anything. Ask which.
+          let s;
+          try {
+            s = await fetchJSON("/api/action", { timeout: 4000 });
+          } catch (e) {
+            continue;
+          }
+          if (s.running) continue;
+          const detail = s.last && !s.last.ok ? s.last.detail : "";
+          return { ok: false, message: detail
+            || `Still running ${version} — the update did not finish. `
+             + "Update over SSH instead: sudo droneaware update" };
+        }
+        return { ok: false, message: "The node has not answered for 10 minutes. "
+          + "Check it over SSH: sudo droneaware status" };
+      },
       async runAction(action, btn) {
         const label = btn.textContent;
+        const isUpdate = action === "update";
         btn.disabled = true;
         btn.textContent = "Working…";
-        let ok = false, message = "";
+        let ok = false, message = "", dropped = false;
         try {
           const r = await (await fetch("/api/action", {
             method: "POST",
@@ -4379,14 +4420,30 @@ ${multiSerialHTML}
           })).json();
           if (r.error) throw new Error(r.detail || r.error);
           // The CLI restarts feeders, so poll rather than guess a duration.
-          for (let i = 0; i < 180; i++) {
+          // An update downloads first and can spend minutes doing it, so it
+          // gets the same fifteen minutes the server allows the CLI.
+          const polls = isUpdate ? 900 : 180;
+          for (let i = 0; i < polls; i++) {
             await new Promise(res => setTimeout(res, 1000));
-            const s = await fetchJSON("/api/action");
+            let s;
+            try {
+              s = await fetchJSON("/api/action");
+            } catch (e) {
+              // An update stops this page's own server in order to replace
+              // it, so a lost connection is the expected middle of the job.
+              // For any other action it is a real failure.
+              if (!isUpdate) throw e;
+              dropped = true;
+              break;
+            }
             if (!s.running && s.last) {
               ok = s.last.ok;
               message = ok ? `${action} completed.` : s.last.detail;
               break;
             }
+          }
+          if (isUpdate && (dropped || ok)) {
+            ({ ok, message } = await cfg.awaitUpdate(btn, btn.dataset.target || ""));
           }
           if (!message) message = `${action} is still running.`;
         } catch (e) {
@@ -4394,6 +4451,14 @@ ${multiSerialHTML}
         }
         btn.disabled = false;
         btn.textContent = label;
+
+        if (isUpdate && ok) {
+          // The server now answering is the new release and may serve a
+          // different page. Load that rather than keep driving this one.
+          cfg.status(`${message} Reloading…`, false, btn);
+          setTimeout(() => location.reload(), 4000);
+          return;
+        }
 
         // Only re-read on success — a reload rebuilds the form and would
         // throw away the failure text the operator has to act on. On

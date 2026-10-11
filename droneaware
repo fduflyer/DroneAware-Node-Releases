@@ -1842,6 +1842,46 @@ _ensure_webui_assets() {
 
 cmd_update() {
     require_root "update"
+
+    # 🚨 Pressed from the Web UI, this process lives inside
+    # droneaware-web.service's control group -- sudo does not move it out --
+    # and further down the update stops that service. systemd then kills the
+    # whole group, this update included, after every feeder has been stopped
+    # and before anything has been installed: the node is left not detecting,
+    # on the old version, until it is rebooted. Hand the update to a unit of
+    # its own so stopping the web service cannot reach it. Refresh guards its
+    # web restart the same way.
+    #
+    # --wait keeps this process attached, so a failure before the web service
+    # is stopped (a download error, say) still reaches the page as a failure.
+    # Once the update stops the web service, this waiting process is killed
+    # with it and the update carries on regardless. The unit name is fixed, so
+    # a second press while one is running is refused instead of racing it.
+    if [[ -z "${DRONEAWARE_UPDATE_DETACHED:-}" ]] \
+       && grep -qs droneaware-web /proc/self/cgroup; then
+        if systemctl is-active --quiet droneaware-update; then
+            echo "An update is already running on this node."
+            return 1
+        fi
+        local -a _env=(--setenv=DRONEAWARE_UPDATE_DETACHED=1)
+        [[ -n "${DRONEAWARE_ALLOW_PRERELEASE:-}" ]] \
+            && _env+=("--setenv=DRONEAWARE_ALLOW_PRERELEASE=${DRONEAWARE_ALLOW_PRERELEASE}")
+        [[ -n "${DRONEAWARE_NO_SERVICE_START:-}" ]] \
+            && _env+=("--setenv=DRONEAWARE_NO_SERVICE_START=${DRONEAWARE_NO_SERVICE_START}")
+        local _since _rc
+        _since=$(date +%s)
+        systemd-run --quiet --wait --collect --unit=droneaware-update \
+            "${_env[@]}" /usr/local/bin/droneaware "$@"
+        _rc=$?
+        if (( _rc != 0 )); then
+            # The update wrote to the journal, not to this process, so bring
+            # its last words back for the page to show.
+            journalctl -u droneaware-update --since "@${_since}" -o cat \
+                --no-pager 2>/dev/null | tail -n 25
+        fi
+        return "$_rc"
+    fi
+
     # --prerelease opts in to release candidates, the same as
     # DRONEAWARE_ALLOW_PRERELEASE=1. The variable alone was not enough: sudo
     # refuses to set one on its command line whenever the last sudoers rule
