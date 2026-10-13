@@ -4,7 +4,7 @@
 
 Detections from nodes already running on the network:
 
-![DroneAware_Screenshot1](https://github.com/fduflyer/DroneAware-Node-Releases/blob/c6f2f37dc3cdacef408afa28104e1fcccff734e3/Global%20Detections.png)
+![DroneAware_Screenshot1](docs/images/global-detections.png)
 
 See drones flying near you in real time - most people never see Remote ID unless they build something like this. 
 
@@ -23,11 +23,11 @@ Your new DroneAware node will listen for FAA-mandated Remote ID broadcasts from 
 in your area and forward them to the DroneAware Network, where they appear on a
 live map at [droneaware.io](https://droneaware.io/live.html).
 
-![DroneAware_Screenshot2](https://github.com/fduflyer/DroneAware-Node-Releases/blob/c6f2f37dc3cdacef408afa28104e1fcccff734e3/New%20Jersey%20Detections.png)
+![DroneAware_Screenshot2](docs/images/new-jersey-detections.png)
 
 Once connected, you'll also get real-time email alerts anytime your node(s) detect a drone. You can also go back and view all of your detections by date and time to watch a replay of their flight paths. 
 
-![DroneAware Screenshot2](https://github.com/fduflyer/DroneAware-Node-Releases/blob/10c30b8860323ae1a3d88da870fb7073cec8d9a1/IMG_3538.png)
+![DroneAware Screenshot2](docs/images/drone-detected-alert.png)
 
 ---
 
