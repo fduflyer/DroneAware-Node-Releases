@@ -77,6 +77,19 @@ EOF
         info "Added v1.1.3 GPS_BAUD option to config.env"
     fi
 
+    # v1.6.2.2 — GPS_SOURCE. Blank behaves the same as before the key existed.
+    if ! grep -q '^GPS_SOURCE=' "$cfg"; then
+        [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
+        cat >> "$cfg" <<'EOF'
+
+# ─── GPS source (added by droneaware update for v1.6.2.2+) ───
+# Blank = auto: read through gpsd when gpsd on this node has a receiver,
+# otherwise read the serial port. gpsd = always gpsd. serial = always the port.
+GPS_SOURCE=
+EOF
+        info "Added v1.6.2.2 GPS_SOURCE option to config.env"
+    fi
+
     # v1.2.2 additions — 5 GHz scanning (dual-band adapter support)
     if ! grep -q '^WIFI_5G_ENABLED=' "$cfg"; then
         [[ "$backed_up" == "0" ]] && cp "$cfg" "${cfg}.bak.$(date +%s)" && backed_up=1
@@ -618,7 +631,7 @@ _cfg_get() {
 # ---------------------------------------------------------------------------
 # Mirrored from install.sh so cmd_update and cmd_gps_diagnose can run the
 # same remediation on already-installed nodes. KEEP IN SYNC with the
-# `_sniff_gps_protocol` / `_check_gpsd_conflict` / `_check_gps_protocol` /
+# `_sniff_gps_protocol` / `_gpsd_receivers` / `_check_gpsd` / `_check_gps_protocol` /
 # `_print_protocol_manual_fix` functions in install.sh — any edit to one
 # must be applied to the other or the two paths will drift.
 
@@ -657,40 +670,68 @@ _print_protocol_manual_fix() {
     echo ""
 }
 
-_check_gpsd_conflict() {
-    local gpsd_present=no
-    if systemctl is-enabled gpsd.socket >/dev/null 2>&1 || \
-       systemctl is-active gpsd >/dev/null 2>&1 || \
-       systemctl is-active gpsd.socket >/dev/null 2>&1 || \
-       dpkg -l gpsd 2>/dev/null | grep -q '^ii'; then
-        gpsd_present=yes
+# Receivers the node's gpsd is serving, one path per line. Non-zero when no
+# gpsd answers or it has none. The same question wifi_feeder's _gpsd_serving()
+# asks, the same way.
+_gpsd_receivers() {
+    python3 - <<'PY' 2>/dev/null
+import json, socket, sys
+try:
+    s = socket.create_connection(("127.0.0.1", 2947), timeout=2)
+    s.sendall(b"?DEVICES;\n")
+    buf = b""
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+        for line in buf.split(b"\n")[:-1]:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(msg, dict) and msg.get("class") == "DEVICES":
+                paths = [d.get("path") for d in msg.get("devices") or []
+                         if isinstance(d, dict) and d.get("path")]
+                if paths:
+                    print("\n".join(paths))
+                sys.exit(0 if paths else 1)
+except OSError:
+    pass
+sys.exit(1)
+PY
+}
+
+# v1.6.2.2: DroneAware reads GPS through gpsd whenever gpsd has the receiver,
+# so gpsd is no longer stopped or masked here. Masking it broke the other
+# software on the node that needed it (ADS-B feeders, chrony time sources).
+# $1 is GPS_SOURCE. Returns 0 when DroneAware will read the port itself, so
+# the caller should check the receiver's protocol; 1 when gpsd has it.
+_check_gpsd() {
+    local source="$1" receivers
+    if receivers=$(_gpsd_receivers); then
+        receivers=${receivers//$'\n'/, }
+        if [[ "$source" == "serial" ]]; then
+            warn "gpsd is serving ${receivers}, but GPS_SOURCE=serial tells DroneAware to read the port itself."
+            warn "Two readers on one receiver corrupt each other's data. Remove GPS_SOURCE from config.env, or stop gpsd."
+        else
+            info "gpsd is serving ${receivers} — DroneAware will read GPS through it."
+        fi
+        return 1
     fi
-    if [[ "$gpsd_present" == "no" ]]; then
-        info "gpsd not present — no conflict."
-        return 0
+    if [[ "$(systemctl is-enabled gpsd.socket 2>/dev/null)" == "masked" ]] || \
+       [[ "$(systemctl is-enabled gpsd 2>/dev/null)" == "masked" ]]; then
+        info "gpsd is masked (earlier DroneAware versions offered to do that)."
+        echo "    If other software on this node needs gpsd, unmask it. DroneAware now"
+        echo "    reads GPS through gpsd whenever gpsd has the receiver:"
+        echo "      sudo systemctl unmask gpsd gpsd.socket"
+        echo "      sudo systemctl enable --now gpsd.socket"
+    elif dpkg -l gpsd 2>/dev/null | grep -q '^ii'; then
+        info "gpsd is installed but has no receiver — DroneAware reads the port itself."
+    else
+        info "gpsd not installed."
     fi
-    echo ""
-    echo "  gpsd is installed on this system. gpsd would seize the GPS serial"
-    echo "  port, preventing DroneAware from reading GPS data. DroneAware reads"
-    echo "  /dev/tty* directly and does not need gpsd."
-    echo ""
-    local resp
-    read -rp "  Disable gpsd? [Y/n]: " resp </dev/tty
-    if [[ "${resp,,}" == "n" || "${resp,,}" == "no" ]]; then
-        warn "gpsd left running — GPS may not work in DroneAware."
-        return 0
-    fi
-    systemctl stop gpsd gpsd.socket 2>/dev/null || true
-    systemctl disable gpsd gpsd.socket 2>/dev/null || true
-    systemctl mask gpsd gpsd.socket 2>/dev/null || true
-    pkill -x gpsd 2>/dev/null || true
-    # v1.4.12.2+: give the kernel a moment to release the tty after
-    # gpsd's exit. Without this, the immediately-following protocol
-    # sniff sees an empty/still-locked port and misreports "unknown
-    # protocol" — surfaced during v1.4.12.1's cmd_update run on
-    # njpi-120hotfix. 3s is empirically enough for pl2303/ftdi/cdc-acm.
-    sleep 3
-    info "gpsd stopped, disabled, and masked."
+    return 0
 }
 
 _check_gps_protocol() {
@@ -752,17 +793,21 @@ _check_gps_protocol() {
 }
 
 # Called from cmd_update after binaries are staged but before services
-# start. Reads GPS_DEVICE from config.env; skips cleanly when not set.
+# start. Reads GPS_DEVICE from config.env. A blank one (auto-detect, the usual
+# case) still gets the gpsd check when gpsd is installed: that is how an
+# operator finds out an earlier version masked it.
 _gps_sanity_check_update() {
     local cfg="${INSTALL_DIR}/config.env"
-    local gps_dev
+    local gps_dev gps_source
     gps_dev=$(_cfg_get "$cfg" GPS_DEVICE)
-    if [[ -z "$gps_dev" ]]; then
+    gps_source=$(_cfg_get "$cfg" GPS_SOURCE)
+    if [[ -z "$gps_dev" ]] && ! dpkg -l gpsd 2>/dev/null | grep -q '^ii'; then
         return 0
     fi
     heading "GPS Configuration Check"
-    _check_gpsd_conflict
-    _check_gps_protocol "$gps_dev"
+    if _check_gpsd "${gps_source,,}" && [[ -n "$gps_dev" ]]; then
+        _check_gps_protocol "$gps_dev"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -2676,15 +2721,22 @@ lon         = s.get("lon")
 protocol    = s.get("protocol")     # v1.4.12+: nmea|sirf|ubx|unknown
 fix_quality = s.get("fix_quality")  # v1.4.12+: from $GxGGA field 6
 sats        = s.get("sats_in_use")  # v1.4.12+: from $GxGGA field 7
+source      = s.get("source") or "serial"  # v1.6.2.2+: serial|gpsd
 updated_at  = s.get("updated_at") or 0
 age         = time.time() - updated_at
 
 def dev_prefix():
+    if source == "gpsd":
+        return f"{device} via gpsd"
     return f"{device} @ {baud} baud" if baud is not None else f"{device}"
 
-def sats_phrase():
-    # "N sats" only when we have a GGA-derived count; empty otherwise.
-    return f", {sats} sats" if sats is not None else ""
+def detail(tail):
+    # "NMEA" names what this feeder parses; through gpsd it parses nothing.
+    # "N sats" only when we have a satellite count.
+    parts = [] if source == "gpsd" else ["NMEA"]
+    if sats is not None:
+        parts.append(f"{sats} sats")
+    return ", ".join(parts + [tail])
 
 if status == "not_configured":
     # Terminal state — wifi_feeder writes this once at startup (when
@@ -2716,13 +2768,20 @@ elif status == "no_signal":
     print(f"  GPS      : {device} — nothing transmitting (no receiver attached?)")
 elif status == "no_nmea":
     print(f"  GPS      : {device} — device exists but no valid NMEA detected")
+elif status == "not_gps":
+    print(f"  GPS      : {device} — not a GPS receiver; no longer probed")
+    print(f"             if it is your GPS, set GPS_DEVICE in config.env")
+elif status == "gpsd_no_device":
+    print("  GPS      : via gpsd — gpsd has no receiver")
+elif status == "gpsd_unreachable":
+    print("  GPS      : GPS_SOURCE=gpsd, but gpsd is not running")
 elif status == "reading":
     # No fix yet. Show sats-in-use if we've seen a GGA, else fall back
     # to the pre-v1.4.12 wording.
-    print(f"  GPS      : {dev_prefix()} — NMEA{sats_phrase()}, no fix yet")
+    print(f"  GPS      : {dev_prefix()} — {detail('no fix yet')}")
 elif status == "fix":
     # Have a fix. Sats + lat/lon on one line.
-    print(f"  GPS      : {dev_prefix()} — NMEA{sats_phrase()}, fix (lat={lat}, lon={lon})")
+    print(f"  GPS      : {dev_prefix()} — {detail(f'fix (lat={lat}, lon={lon})')}")
 else:
     print(f"  GPS      : {status}")
 PYEOF
@@ -3294,6 +3353,38 @@ cmd_install_webui() {
     fi
 }
 
+# One field of the GPS state file wifi_feeder writes; empty if unavailable.
+_gps_state_field() {
+    python3 -c 'import json,sys; s=json.load(open("/run/droneaware/gps_state.json")); print(s.get(sys.argv[1]) or "")' "$1" 2>/dev/null
+}
+
+_print_gps_state_file() {
+    echo "  Recent GPS state (/run/droneaware/gps_state.json):"
+    python3 - <<'PY'
+import json, time, sys
+try:
+    with open("/run/droneaware/gps_state.json") as f:
+        s = json.load(f)
+except FileNotFoundError:
+    print("    state file missing — wifi_feeder not running, or hasn't written yet")
+    sys.exit(0)
+except Exception as e:
+    print(f"    state file unreadable: {e}")
+    sys.exit(0)
+age = int(time.time() - (s.get("updated_at") or 0))
+print(f"    age:          {age}s")
+print(f"    source:       {s.get('source') or 'serial'}")
+print(f"    device:       {s.get('device')}")
+print(f"    status:       {s.get('status')}")
+print(f"    protocol:     {s.get('protocol')}")
+print(f"    baud:         {s.get('baud')}")
+print(f"    fix_quality:  {s.get('fix_quality')}")
+print(f"    sats_in_use:  {s.get('sats_in_use')}")
+print(f"    lat, lon:     {s.get('lat')}, {s.get('lon')}")
+PY
+    echo ""
+}
+
 cmd_gps_diagnose() {
     require_root "gps-diagnose"
     echo ""
@@ -3301,16 +3392,40 @@ cmd_gps_diagnose() {
     echo ""
 
     local cfg="${INSTALL_DIR}/config.env"
-    local gps_dev gps_baud node_mobile
+    local gps_dev gps_baud node_mobile gps_source
     gps_dev=$(_cfg_get "$cfg" GPS_DEVICE)
     gps_baud=$(_cfg_get "$cfg" GPS_BAUD)
     node_mobile=$(_cfg_get "$cfg" NODE_MOBILE)
+    gps_source=$(_cfg_get "$cfg" GPS_SOURCE)
+    gps_source=${gps_source,,}
 
     echo "  Config (${cfg}):"
     printf  "    GPS_DEVICE   = %s\n" "${gps_dev:-<empty>}"
     printf  "    GPS_BAUD     = %s\n" "${gps_baud:-<empty — will auto-detect>}"
+    printf  "    GPS_SOURCE   = %s\n" "${gps_source:-<empty — gpsd if it has a receiver, else the port>}"
     printf  "    NODE_MOBILE  = %s\n" "${node_mobile:-<empty>}"
     echo ""
+
+    # v1.6.2.2: when gpsd has the receiver, DroneAware reads through it. This
+    # command must not open the port then: sniffing it would steal gpsd's data
+    # and stty would change the baud rate underneath gpsd.
+    local receivers
+    if [[ "$gps_source" != "serial" ]] && receivers=$(_gpsd_receivers); then
+        echo "  Source:"
+        info "gpsd is serving ${receivers//$'\n'/, } — DroneAware reads GPS through it"
+        echo "    (not opening the port: gpsd owns it)"
+        echo ""
+        _print_gps_state_file
+        echo "  Verdict:"
+        case "$(_gps_state_field status)" in
+            fix)     echo -e "    ${GREEN}GPS looks healthy.${NC}" ;;
+            reading) echo "    gpsd has a receiver but no fix yet. Wait for sky view + satellite lock." ;;
+            *)       echo "    wifi_feeder has not reported through gpsd yet. Check 'sudo droneaware status'"
+                     echo "    in a minute, and 'gpspipe -w -n 10' to see what gpsd itself reports." ;;
+        esac
+        echo ""
+        return 0
+    fi
 
     # If GPS_DEVICE is empty in config.env but wifi_feeder auto-discovered
     # a device, use the state file's device path so the diagnostic still
@@ -3365,14 +3480,13 @@ cmd_gps_diagnose() {
     else
         # Look for gpsd or wifi_feeder in the ownership list
         if echo "$owners" | grep -q gpsd; then
-            echo -e "    ${RED}✗${NC}  gpsd holds the port — DroneAware cannot read GPS"
+            # Reachable only with GPS_SOURCE=serial: otherwise a gpsd holding
+            # the receiver took the gpsd branch above.
+            echo -e "    ${RED}✗${NC}  gpsd holds the port, and GPS_SOURCE=serial tells DroneAware to read it too"
             echo "$owners" | sed 's/^/      /'
             echo ""
-            echo "  Remediation:"
-            echo "    sudo systemctl stop gpsd gpsd.socket"
-            echo "    sudo systemctl mask gpsd gpsd.socket"
-            echo "    sudo pkill -x gpsd"
-            echo "    # then re-run this command"
+            echo "  Remediation: remove GPS_SOURCE from ${cfg} so DroneAware reads through"
+            echo "  gpsd, then: sudo systemctl restart droneaware-wifi"
             echo ""
             return 0
         elif echo "$owners" | grep -qE "wifi_feeder|python"; then
@@ -3385,31 +3499,10 @@ cmd_gps_diagnose() {
     fi
     echo ""
 
-    # gpsd latent-risk check: gpsd may be installed and enabled but not
-    # currently holding the port (its default behavior is to open the
-    # device on-demand when a client connects). fuser doesn't see this
-    # case, but the moment the operator runs cgps / gpspipe / etc., the
-    # port gets seized. Flag it proactively — same signals as the
-    # installer's _check_gpsd_conflict.
+    # Same check the installer and updater run. A gpsd that later gets a
+    # receiver is not a conflict any more: wifi_feeder hands the port over.
     echo "  gpsd status:"
-    local gpsd_present=no
-    if systemctl is-enabled gpsd.socket >/dev/null 2>&1 || \
-       systemctl is-active gpsd >/dev/null 2>&1 || \
-       systemctl is-active gpsd.socket >/dev/null 2>&1 || \
-       dpkg -l gpsd 2>/dev/null | grep -q '^ii'; then
-        gpsd_present=yes
-    fi
-    if [[ "$gpsd_present" == "no" ]]; then
-        info "not installed — no latent conflict"
-    else
-        if echo "$owners" | grep -q gpsd; then
-            warn "actively holding the port (see above)"
-        else
-            warn "installed and enabled — will seize the port on next cgps / gpspipe / gpsctl invocation"
-            echo "    Recommended: sudo systemctl mask gpsd gpsd.socket"
-            echo "                 sudo apt purge gpsd    # keep gpsd-clients for the gpsctl utility"
-        fi
-    fi
+    _check_gpsd "$gps_source" || true
     echo ""
 
     echo "  Protocol detection:"
@@ -3432,28 +3525,7 @@ cmd_gps_diagnose() {
     fi
     echo ""
 
-    echo "  Recent GPS state (/run/droneaware/gps_state.json):"
-    python3 - <<'PY'
-import json, time, sys
-try:
-    with open("/run/droneaware/gps_state.json") as f:
-        s = json.load(f)
-except FileNotFoundError:
-    print("    state file missing — wifi_feeder not running, or hasn't written yet")
-    sys.exit(0)
-except Exception as e:
-    print(f"    state file unreadable: {e}")
-    sys.exit(0)
-age = int(time.time() - (s.get("updated_at") or 0))
-print(f"    age:          {age}s")
-print(f"    status:       {s.get('status')}")
-print(f"    protocol:     {s.get('protocol')}")
-print(f"    baud:         {s.get('baud')}")
-print(f"    fix_quality:  {s.get('fix_quality')}")
-print(f"    sats_in_use:  {s.get('sats_in_use')}")
-print(f"    lat, lon:     {s.get('lat')}, {s.get('lon')}")
-PY
-    echo ""
+    _print_gps_state_file
 
     # Verdict: reads the effective protocol. If we did a live sniff, use
     # that. If the sniff was skipped (wifi_feeder holds the port — the
@@ -3473,7 +3545,14 @@ PY
             echo "      sudo systemctl restart droneaware-wifi"
             echo "      sudo droneaware gps-diagnose   # to re-verify"
             ;;
-        unknown) echo "    Could not identify protocol. Check the puck's power/wiring and try 'sudo dmesg | tail -20'." ;;
+        unknown)
+            if [[ "$(_gps_state_field status)" == "not_gps" ]]; then
+                echo "    This device answers, but not as a GPS, so wifi_feeder stopped probing it."
+                echo "    If it is your GPS, set GPS_DEVICE (and GPS_BAUD) in ${cfg}."
+            else
+                echo "    Could not identify protocol. Check the puck's power/wiring and try 'sudo dmesg | tail -20'."
+            fi
+            ;;
         "")      echo "    Not enough data yet. Wait ~10s for wifi_feeder to detect and re-run." ;;
     esac
     echo ""

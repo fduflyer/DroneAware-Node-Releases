@@ -1150,7 +1150,18 @@ def _server_reachable() -> bool:
 
 def _gps_device_present() -> bool:
     """Whether a GPS device exists. Mirrors the feeder's own discovery order
-    rather than trusting GPS_DEVICE, which is blank on auto-detect nodes."""
+    rather than trusting GPS_DEVICE, which is blank on auto-detect nodes.
+
+    The feeder's state file answers first when it is fresh: through gpsd
+    (v1.6.2.2) the receiver can be on a port none of the paths below name."""
+    try:
+        with open(GPS_STATE_PATH) as f:
+            s = json.load(f)
+        if time.time() - (s.get("updated_at") or 0) <= 120 \
+                and s.get("status") in ("reading", "fix"):
+            return True
+    except Exception:
+        pass
     dev = (_read_config_env("GPS_DEVICE") or "").strip()
     if dev:
         return os.path.exists(dev)
