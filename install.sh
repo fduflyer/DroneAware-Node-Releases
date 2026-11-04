@@ -739,9 +739,9 @@ install_packages() {
     _apt_run "Reading package lists" update -qq || _apt_failed
     # gpsd-clients gives us `gpsctl` for the GPS protocol auto-fix
     # (SiRF/UBX → NMEA). --no-install-recommends is important: without it
-    # apt pulls gpsd itself, which would seize the GPS port and prevent
-    # DroneAware from reading it. gpsd-clients works standalone in the
-    # `gpsctl -f -n /dev/xxx` direct-to-device mode we use.
+    # apt pulls gpsd itself. DroneAware reads through a gpsd the operator
+    # runs (v1.6.2.2), but does not install one. gpsd-clients works
+    # standalone in the `gpsctl -f -n /dev/xxx` direct-to-device mode we use.
     _apt_run "Installing packages" install -y --no-install-recommends \
         bluez bluetooth iw rfkill curl gpsd-clients || _apt_failed
     # Non-fatal: a node with no Bluetooth hardware can still run the WiFi
@@ -766,11 +766,11 @@ install_packages() {
 # 6.5. GPS sanity check (v1.4.12+)
 # ---------------------------------------------------------------------------
 # Runs after install_packages (so gpsctl is available) and before we start
-# services. Two independent checks — both skip cleanly if there's no GPS
-# device to configure (static nodes, mobile nodes without a puck yet):
+# services. Two checks — both skip cleanly if there's no GPS device to
+# configure (static nodes, mobile nodes without a puck yet) and no gpsd:
 #
-#   1. gpsd detection: gpsd would seize the serial port and block
-#      DroneAware from reading GPS. Prompt to mask + kill it.
+#   1. gpsd detection (v1.6.2.2): when gpsd has the receiver, DroneAware
+#      reads through it and check 2 is skipped. gpsd is never masked.
 #   2. Protocol check: puck may be in SiRF/UBX binary mode (common gotcha
 #      with BU-353S4 and similar). DroneAware needs NMEA. Attempt an
 #      auto-fix via `gpsctl -f -n`; print manual instructions if that
@@ -819,39 +819,68 @@ _print_protocol_manual_fix() {
     echo ""
 }
 
-_check_gpsd_conflict() {
-    local gpsd_present=no
-    if systemctl is-enabled gpsd.socket >/dev/null 2>&1 || \
-       systemctl is-active gpsd >/dev/null 2>&1 || \
-       systemctl is-active gpsd.socket >/dev/null 2>&1 || \
-       dpkg -l gpsd 2>/dev/null | grep -q '^ii'; then
-        gpsd_present=yes
+# Receivers the node's gpsd is serving, one path per line. Non-zero when no
+# gpsd answers or it has none. The same question wifi_feeder's _gpsd_serving()
+# asks, the same way.
+_gpsd_receivers() {
+    python3 - <<'PY' 2>/dev/null
+import json, socket, sys
+try:
+    s = socket.create_connection(("127.0.0.1", 2947), timeout=2)
+    s.sendall(b"?DEVICES;\n")
+    buf = b""
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+        for line in buf.split(b"\n")[:-1]:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(msg, dict) and msg.get("class") == "DEVICES":
+                paths = [d.get("path") for d in msg.get("devices") or []
+                         if isinstance(d, dict) and d.get("path")]
+                if paths:
+                    print("\n".join(paths))
+                sys.exit(0 if paths else 1)
+except OSError:
+    pass
+sys.exit(1)
+PY
+}
+
+# v1.6.2.2: DroneAware reads GPS through gpsd whenever gpsd has the receiver,
+# so gpsd is no longer stopped or masked here. Masking it broke the other
+# software on the node that needed it (ADS-B feeders, chrony time sources).
+# $1 is GPS_SOURCE. Returns 0 when DroneAware will read the port itself, so
+# the caller should check the receiver's protocol; 1 when gpsd has it.
+_check_gpsd() {
+    local source="$1" receivers
+    if receivers=$(_gpsd_receivers); then
+        receivers=${receivers//$'\n'/, }
+        if [[ "$source" == "serial" ]]; then
+            warn "gpsd is serving ${receivers}, but GPS_SOURCE=serial tells DroneAware to read the port itself."
+            warn "Two readers on one receiver corrupt each other's data. Remove GPS_SOURCE from config.env, or stop gpsd."
+        else
+            info "gpsd is serving ${receivers} — DroneAware will read GPS through it."
+        fi
+        return 1
     fi
-    if [[ "$gpsd_present" == "no" ]]; then
-        info "gpsd not present — no conflict."
-        return 0
+    if [[ "$(systemctl is-enabled gpsd.socket 2>/dev/null)" == "masked" ]] || \
+       [[ "$(systemctl is-enabled gpsd 2>/dev/null)" == "masked" ]]; then
+        info "gpsd is masked (earlier DroneAware versions offered to do that)."
+        echo "    If other software on this node needs gpsd, unmask it. DroneAware now"
+        echo "    reads GPS through gpsd whenever gpsd has the receiver:"
+        echo "      sudo systemctl unmask gpsd gpsd.socket"
+        echo "      sudo systemctl enable --now gpsd.socket"
+    elif dpkg -l gpsd 2>/dev/null | grep -q '^ii'; then
+        info "gpsd is installed but has no receiver — DroneAware reads the port itself."
+    else
+        info "gpsd not installed."
     fi
-    echo ""
-    echo "  gpsd is installed on this system. gpsd would seize the GPS serial"
-    echo "  port, preventing DroneAware from reading GPS data. DroneAware reads"
-    echo "  /dev/tty* directly and does not need gpsd."
-    echo ""
-    local resp
-    read -rp "  Disable gpsd? [Y/n]: " resp </dev/tty
-    if [[ "${resp,,}" == "n" || "${resp,,}" == "no" ]]; then
-        warn "gpsd left running — GPS may not work in DroneAware."
-        return 0
-    fi
-    systemctl stop gpsd gpsd.socket 2>/dev/null || true
-    systemctl disable gpsd gpsd.socket 2>/dev/null || true
-    systemctl mask gpsd gpsd.socket 2>/dev/null || true
-    pkill -x gpsd 2>/dev/null || true
-    # v1.4.12.2+: give the kernel a moment to release the tty after
-    # gpsd's exit. Without this, the immediately-following protocol
-    # sniff sees an empty/still-locked port and misreports "unknown
-    # protocol". 3s is empirically enough for pl2303/ftdi/cdc-acm.
-    sleep 3
-    info "gpsd stopped, disabled, and masked."
+    return 0
 }
 
 _check_gps_protocol() {
@@ -913,13 +942,15 @@ _check_gps_protocol() {
 
 gps_sanity_check() {
     # No GPS device configured (static without GPS, or mobile with no puck
-    # plugged in yet) → nothing to check.
-    if [[ -z "${GPS_DEVICE:-}" ]]; then
+    # plugged in yet) and no gpsd → nothing to check. A fresh install has no
+    # GPS_SOURCE yet, so this is always the auto behavior.
+    if [[ -z "${GPS_DEVICE:-}" ]] && ! dpkg -l gpsd 2>/dev/null | grep -q '^ii'; then
         return 0
     fi
     heading "GPS Configuration Check"
-    _check_gpsd_conflict
-    _check_gps_protocol
+    if _check_gpsd "" && [[ -n "${GPS_DEVICE:-}" ]]; then
+        _check_gps_protocol
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1041,6 +1072,9 @@ NODE_LAT=${NODE_LAT:-}
 NODE_LON=${NODE_LON:-}
 GPS_DEVICE=${GPS_DEVICE:-}
 GPS_BAUD=
+# Blank = read through gpsd when gpsd on this node has a receiver, otherwise
+# read the serial port. gpsd = always gpsd. serial = always the port.
+GPS_SOURCE=
 
 # ─── Channel hopper ───────────────────────────────────────────────────────
 # "true" = adaptive (channel-6 biased, sweep+sticky — recommended).

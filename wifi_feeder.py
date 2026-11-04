@@ -254,6 +254,10 @@ FW_VERSION = _read_fw_version()
 _gps_lat  = None
 _gps_lon  = None
 _gps_lock = threading.Lock()
+# Last status written to the GPS state file, and whether this process runs the
+# GPS reader at all (a --band=5g feeder does not; its peer does).
+_gps_status = None
+_gps_owner  = False
 
 
 # -- Constants -----------------------------------------------------------------
@@ -3243,7 +3247,8 @@ def _write_gps_state(*, device: str | None = None, baud: int | None = None,
                      lat: float | None = None, lon: float | None = None,
                      protocol: str | None = None,
                      fix_quality: int | None = None,
-                     sats_in_use: int | None = None) -> None:
+                     sats_in_use: int | None = None,
+                     source: str = "serial") -> None:
     """Atomically write the current GPS state for the CLI to read.
     Soft-fails on any I/O error — state-file display is informational,
     feeder operation continues regardless of whether this succeeds.
@@ -3260,6 +3265,10 @@ def _write_gps_state(*, device: str | None = None, baud: int | None = None,
                         or a receiver that never fixes looks identical to a
                         stopped feeder to the staleness check in the CLI.
       fix             — most recent $GPRMC was "A" (active/valid); lat/lon populated
+      not_gps         — auto-detected device answered, but never as a GPS;
+                        no longer opened (v1.6.2.2). GPS_DEVICE forces it.
+      gpsd_no_device  — reading through gpsd, which has no receiver (v1.6.2.2)
+      gpsd_unreachable — GPS_SOURCE=gpsd but no gpsd answers (v1.6.2.2)
 
     Extended fields (v1.4.12+):
       protocol        — "nmea" | "sirf" | "ubx" | "unknown"; whatever the
@@ -3268,10 +3277,15 @@ def _write_gps_state(*, device: str | None = None, baud: int | None = None,
                         5=RTK float, 6=estimated. None if no GGA seen yet.
       sats_in_use     — GGA field 7: satellites contributing to the fix.
                         None if no GGA seen yet.
+      source          — "serial" (this feeder reads the port) or "gpsd"
+                        (v1.6.2.2: reading through the node's gpsd).
     """
+    global _gps_status
+    _gps_status = status
     try:
         os.makedirs(os.path.dirname(_GPS_STATE_PATH), exist_ok=True)
         state = {
+            "source":       source,
             "device":       device,
             "baud":         baud,
             "status":       status,
@@ -3315,6 +3329,8 @@ _UBX_SYNC  = b"\xb5\x62"    # u-blox UBX frame start
 # it even while there is nothing to report.
 GPS_SILENT_RETRY_SEC = 60
 GPS_PROTOCOL_WARN_EVERY_SEC = 3600
+# Unrecognized replies in a row before an auto-detected device is left alone.
+GPS_UNKNOWN_GIVE_UP = 3
 _gps_quiet = {"warned_silent": False, "last_protocol_warn": 0.0}
 
 
@@ -3359,6 +3375,46 @@ def detect_gps_protocol(device: str) -> tuple[str, int | None]:
     return ("unknown" if heard_anything else "silent", None)
 
 
+# USB vendors whose serial ports are never a GPS receiver. Probing one is not
+# harmless: every open asserts DTR/RTS, and an ESP32's native USB port reads
+# that as "reset into the bootloader" -- on NJ001 it parked an ESP32-C5 in
+# download mode every 30 s. Auto-detect skips these; naming one in GPS_DEVICE
+# still uses it.
+_NOT_GPS_USB_VENDORS = {
+    "303a": "Espressif (ESP32 native USB)",
+    "2341": "Arduino",
+    "2a03": "Arduino",
+    "2e8a": "Raspberry Pi Pico (RP2040)",
+}
+_gps_skip_logged: set = set()
+
+
+def _usb_vendor(device: str) -> str | None:
+    """USB vendor ID behind a /dev/tty* node, from sysfs. None if not USB."""
+    name = os.path.basename(os.path.realpath(device))
+    path = os.path.realpath(f"/sys/class/tty/{name}/device")
+    # ttyACM* links to the USB interface, ttyUSB* to a port below it; the
+    # vendor ID is on the device a level or two up.
+    for _ in range(4):
+        try:
+            with open(os.path.join(path, "idVendor")) as f:
+                return f.read().strip().lower()
+        except OSError:
+            path = os.path.dirname(path)
+    return None
+
+
+def _known_not_gps(device: str) -> bool:
+    board = _NOT_GPS_USB_VENDORS.get(_usb_vendor(device) or "")
+    if board is None:
+        return False
+    if device not in _gps_skip_logged:
+        _gps_skip_logged.add(device)
+        log.info(f"[GPS] Skipping {device}: {board} board, not a GPS "
+                 "receiver. Set GPS_DEVICE to use it anyway.")
+    return True
+
+
 def find_gps_device() -> str | None:
     """Locate a GPS serial device, in priority order:
       1. GPS_DEVICE env var if set (always wins, even if path doesn't exist —
@@ -3367,7 +3423,8 @@ def find_gps_device() -> str | None:
          configuration the auto-discovery doesn't cover.
       2. USB serial dongles: /dev/ttyUSB* (FTDI etc.) and /dev/ttyACM* (CDC).
          Probed for every node regardless of mobile/static — the operator
-         plugged something in, we honor it.
+         plugged something in, we honor it. Boards that are never a GPS
+         (ESP32, Arduino, Pico) are skipped; see _NOT_GPS_USB_VENDORS.
       3. GPIO / on-board UART paths: /dev/serial0 (Pi 3+/4/5 default mini
          UART), /dev/ttyAMA0 (PL011 — Pi 1/2/Zero or swapped-bt configs),
          /dev/ttyS0 (mini UART direct fallback). ONLY probed when
@@ -3397,7 +3454,8 @@ def find_gps_device() -> str | None:
     # feeder could read a different device than last time and report no GPS
     # while the receiver sat there working.
     usb_candidates = sorted(glob.glob('/dev/ttyUSB*')) + sorted(glob.glob('/dev/ttyACM*'))
-    usb_candidates = [c for c in usb_candidates if os.path.exists(c)]
+    usb_candidates = [c for c in usb_candidates
+                      if os.path.exists(c) and not _known_not_gps(c)]
     if usb_candidates:
         return usb_candidates[0]
 
@@ -3639,12 +3697,29 @@ def _clock_source() -> str | None:
 
 
 
-def gps_reader_thread(device: str):
-    """Background thread: reads NMEA sentences, updates _gps_lat/_gps_lon,
-    and surfaces current state to /run/droneaware/gps_state.json for the
-    droneaware CLI's status command."""
+def _read_serial_gps(device: str, yield_to_gpsd: bool) -> None:
+    """Reads NMEA sentences from the port, updates _gps_lat/_gps_lon, and
+    surfaces current state to /run/droneaware/gps_state.json for the
+    droneaware CLI's status command.
+
+    Runs until a gpsd starts serving on this node (when yield_to_gpsd), then
+    closes the port and returns: gpsd will be reading the same receiver, and
+    two readers on one tty corrupt each other's data.
+    """
     global _gps_lat, _gps_lon
+    # Configured by hand means the operator says it is a GPS; keep trying.
+    # Found by auto-detect, it gets a few chances and is then left alone.
+    explicit = bool(os.environ.get("GPS_DEVICE", "").strip())
+    unknown_streak = 0
+    gave_up = False
     while True:
+        if yield_to_gpsd and _gpsd_serving():
+            log.info(f"[GPS] gpsd has started — releasing {device} to it")
+            return
+        if gave_up:
+            _write_gps_state(device=device, status="not_gps", protocol="unknown")
+            time.sleep(GPS_SILENT_RETRY_SEC)
+            continue
         try:
             # Device-presence check up front — distinguishes "configured
             # but missing" from "exists but won't talk" in the state file.
@@ -3681,6 +3756,17 @@ def gps_reader_thread(device: str):
                 time.sleep(GPS_SILENT_RETRY_SEC)
                 continue
             _gps_quiet["warned_silent"] = False   # something spoke; start over
+            unknown_streak = unknown_streak + 1 if protocol == "unknown" else 0
+            if not explicit and unknown_streak >= GPS_UNKNOWN_GIVE_UP:
+                # Talking, but not NMEA, SiRF or UBX, time after time: this is
+                # some other serial device, and every probe resets it.
+                gave_up = True
+                log.warning(
+                    f"[GPS] {device} answers, but never as a GPS receiver — "
+                    "no longer probing it. If it is your GPS, set GPS_DEVICE "
+                    "(and GPS_BAUD if it is not 4800/9600/38400/115200)."
+                )
+                continue
             if protocol != "nmea":
                 _write_gps_state(device=device, status="wrong_protocol",
                                  protocol=protocol, baud=sniff_baud)
@@ -3733,12 +3819,19 @@ def gps_reader_thread(device: str):
                 log.info(f"[GPS] Reading from {device} at {baud} baud")
                 last_nmea  = time.time()
                 last_write = last_nmea
+                last_gpsd_check = time.monotonic()
                 _write_gps_state(device=device, baud=baud, status="reading",
                                  last_nmea_at=last_nmea, protocol="nmea")
                 while True:
                     line = ser.readline().decode('ascii', errors='ignore').strip()
                     if line:
                         last_nmea = time.time()
+
+                    if yield_to_gpsd and time.monotonic() - last_gpsd_check >= GPSD_RECHECK_SEC:
+                        last_gpsd_check = time.monotonic()
+                        if _gpsd_serving():
+                            log.info(f"[GPS] gpsd has started — releasing {device} to it")
+                            return
 
                     # Heartbeat the state file even with no fix. It used to be
                     # written once above and then ONLY on a valid RMC fix, so a
@@ -3818,6 +3911,260 @@ def gps_reader_thread(device: str):
             _write_gps_state(device=device, status="no_nmea")
             log.warning(f"[GPS] Unexpected error: {e} — retrying in 10s")
             time.sleep(10)
+
+
+# -- GPS through gpsd (v1.6.2.2) -----------------------------------------------
+#
+# Other software on a node may need gpsd -- ADS-B feeders commonly do -- and
+# gpsd owns the receiver's port. Earlier versions offered to mask gpsd so this
+# feeder could read the port itself, which broke whatever depended on it. When
+# a gpsd is serving, this feeder is now one of its clients instead, over its
+# JSON socket. Nothing of gpsd's is shipped or linked.
+
+GPSD_ADDR = ("127.0.0.1", 2947)
+GPSD_RECHECK_SEC = 60
+
+
+def _gps_source_setting() -> str:
+    """GPS_SOURCE from config.env: "gpsd", "serial", or "auto" (blank)."""
+    value = os.environ.get("GPS_SOURCE", "").strip().lower()
+    if value in ("gpsd", "serial"):
+        return value
+    if value not in ("", "auto"):
+        log.warning(f"[GPS] Unknown GPS_SOURCE '{value}' — using auto")
+    return "auto"
+
+
+def _gpsd_devices() -> list | None:
+    """Receivers the node's gpsd knows about; None when no gpsd answers.
+
+    A socket-activated gpsd starts on this connection, which is what having
+    its socket enabled asks for.
+    """
+    try:
+        sock = socket.create_connection(GPSD_ADDR, timeout=2.0)
+    except OSError:
+        return None
+    buf = b""
+    try:
+        with sock:
+            sock.sendall(b"?DEVICES;\n")
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    try:
+                        msg = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(msg, dict) and msg.get("class") == "DEVICES":
+                        return [d for d in msg.get("devices") or []
+                                if isinstance(d, dict)]
+    except OSError:
+        pass
+    return []
+
+
+def _gpsd_serving() -> bool:
+    """Whether a gpsd on this node has a receiver to serve.
+
+    A gpsd that answers with no receiver does not count. gpsd's defaults
+    pick up USB receivers by hotplug but not one wired to the Pi's UART, so
+    an installed, idle gpsd is common and the serial port is the only way to
+    that receiver.
+    """
+    return bool(_gpsd_devices())
+
+
+def _gpsd_time(value) -> float | None:
+    """Epoch seconds from a TPV "time" (ISO 8601, UTC)."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _read_gpsd(leave_without_receiver: bool) -> None:
+    """Reads position and time from the node's gpsd until it goes away, or
+    (when leave_without_receiver) until it has had no receiver for a minute,
+    so the caller can try the serial port instead.
+
+    Writes the same state file as the serial reader, so `droneaware status`,
+    the web UI and the BLE feeder need not know which one is running.
+    """
+    global _gps_lat, _gps_lon
+    try:
+        sock = socket.create_connection(GPSD_ADDR, timeout=5)
+    except OSError as e:
+        log.warning(f"[GPS] Could not reach gpsd: {e}")
+        return
+    log.info("[GPS] gpsd is running on this node — reading GPS through it")
+    device = baud = fix_quality = sats_in_use = None
+    last_report = None
+    last_write = 0.0
+    no_receiver_since = time.monotonic()
+    buf = b""
+
+    def write_state():
+        with _gps_lock:
+            lat, lon = _gps_lat, _gps_lon
+        if device is None:
+            status = "gpsd_no_device"
+        else:
+            status = "fix" if lat is not None else "reading"
+        _write_gps_state(source="gpsd", device=device, baud=baud, status=status,
+                         last_nmea_at=last_report, lat=lat, lon=lon,
+                         fix_quality=fix_quality, sats_in_use=sats_in_use)
+
+    with sock:
+        try:
+            sock.sendall(b'?WATCH={"enable":true,"json":true}\n')
+        except OSError as e:
+            log.warning(f"[GPS] gpsd connection failed: {e}")
+            return
+        write_state()
+        while True:
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                chunk = None
+            except OSError as e:
+                log.warning(f"[GPS] Lost the connection to gpsd: {e}")
+                return
+            if chunk == b"":
+                log.warning("[GPS] gpsd closed the connection")
+                return
+            if chunk:
+                buf += chunk
+                *lines, buf = buf.split(b"\n")
+                if len(buf) > 65536:       # no newline in 64 KB: not gpsd
+                    buf = b""
+                for raw in lines:
+                    try:
+                        msg = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
+                    cls = msg.get("class")
+                    if cls == "DEVICES":
+                        devs = [d for d in msg.get("devices") or [] if isinstance(d, dict)]
+                        device = devs[0].get("path") if devs else None
+                        baud = devs[0].get("bps") if devs else None
+                        write_state()
+                    elif cls == "DEVICE":
+                        # gpsd announces a removed receiver as "activated": 0.
+                        if "activated" in msg and not msg["activated"]:
+                            if msg.get("path") == device:
+                                device = baud = None
+                        else:
+                            device = msg.get("path") or device
+                            baud = msg.get("bps", baud)
+                        write_state()
+                    elif cls == "SKY":
+                        used = msg.get("uSat")
+                        if used is None and isinstance(msg.get("satellites"), list):
+                            used = sum(1 for s in msg["satellites"]
+                                       if isinstance(s, dict) and s.get("used"))
+                        if isinstance(used, int):
+                            sats_in_use = used
+                    elif cls == "TPV":
+                        last_report = time.time()
+                        device = msg.get("device") or device
+                        mode = msg.get("mode") or 0
+                        if mode < 2:               # 0/1: no fix
+                            fix_quality = 0
+                            continue
+                        # Same scale as GGA field 6: 1 = GPS, 2 = DGPS.
+                        fix_quality = 2 if msg.get("status") == 2 else 1
+                        epoch = _gpsd_time(msg.get("time"))
+                        if epoch is not None:
+                            GPS_CLOCK.observe(epoch)
+                        lat, lon = msg.get("lat"), msg.get("lon")
+                        if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+                            continue
+                        with _gps_lock:
+                            _gps_lat, _gps_lon = round(lat, 6), round(lon, 6)
+                        write_state()
+                        last_write = time.time()
+            # Refreshed even with nothing to report, for the same reason as
+            # the serial reader: an old file reads as a stopped feeder.
+            if time.time() - last_write >= 20.0:
+                write_state()
+                last_write = time.time()
+            if device is not None:
+                no_receiver_since = time.monotonic()
+            elif (leave_without_receiver
+                  and time.monotonic() - no_receiver_since >= GPSD_RECHECK_SEC):
+                log.info("[GPS] gpsd has no receiver — trying the serial port")
+                return
+
+
+def gps_thread() -> None:
+    """Owns this node's GPS for the life of the feeder.
+
+    gpsd when one is serving, the serial port otherwise, and decided again
+    whenever the current source goes away rather than once at startup: gpsd
+    can arrive after the feeder (software installed later, a socket that
+    starts on first use), and reading the port underneath it would corrupt
+    both streams. GPS_SOURCE=gpsd or =serial pins the choice.
+    """
+    setting = _gps_source_setting()
+    announced_none = False
+    while True:
+        if setting == "gpsd" or (setting == "auto" and _gpsd_serving()):
+            _read_gpsd(leave_without_receiver=(setting == "auto"))
+            if setting == "gpsd" and _gpsd_devices() is None:
+                _write_gps_state(source="gpsd", status="gpsd_unreachable")
+            time.sleep(10)
+            continue
+
+        device = find_gps_device()
+        if device is None:
+            if not announced_none:
+                announced_none = True
+                log.info("[GPS] No GPS dongle detected — position will not be reported")
+            _write_gps_state(status="not_configured")
+            if setting == "serial":
+                return
+            time.sleep(GPSD_RECHECK_SEC)
+            continue
+        announced_none = False
+        log.info(f"[GPS] Dongle detected at {device}")
+        _write_gps_state(device=device, status="detecting_baud")
+        _read_serial_gps(device, yield_to_gpsd=(setting == "auto"))
+
+
+_GPS_LIVE = ("reading", "fix")
+
+
+def _gps_for_heartbeat() -> tuple[bool, float | None, float | None]:
+    """has_gps, lat, lon for a heartbeat.
+
+    has_gps means a receiver is delivering data, through either reader. It
+    used to be os.path.exists(GPS_DEVICE or /dev/ttyUSB0), which is false for
+    every auto-detected receiver (GPS_DEVICE is blank by design) and anything
+    not at ttyUSB0, so the dashboard said NO GPS beside a live fix (#110).
+
+    A --band=5g feeder runs no reader, so it reports what its peer wrote.
+    """
+    if _gps_owner:
+        with _gps_lock:
+            return _gps_status in _GPS_LIVE, _gps_lat, _gps_lon
+    try:
+        with open(_GPS_STATE_PATH) as f:
+            s = json.load(f)
+    except (OSError, ValueError):
+        return False, None, None
+    if time.time() - (s.get("updated_at") or 0) > 120:
+        return False, None, None
+    return s.get("status") in _GPS_LIVE, s.get("lat"), s.get("lon")
 
 
 # -- Local Publisher -----------------------------------------------------------
@@ -4578,12 +4925,10 @@ class WiFiFeeder:
                 )
                 if not self.token:
                     continue
-                with _gps_lock:
-                    lat, lon = _gps_lat, _gps_lon
+                has_gps, lat, lon = _gps_for_heartbeat()
                 cpu_temp = get_cpu_temp()
                 cpu_pct  = get_cpu_percent()
                 load_1m, load_5m, load_15m = get_cpu_load()
-                has_gps  = os.path.exists(os.environ.get("GPS_DEVICE", "/dev/ttyUSB0"))
                 mobile   = os.environ.get("NODE_MOBILE", "false").lower() == "true"
                 common = {
                     "node_id":      self.node_id,
@@ -4649,11 +4994,9 @@ class WiFiFeeder:
                 )
                 if self.token:
                     try:
-                        with _gps_lock:
-                            lat, lon = _gps_lat, _gps_lon
+                        has_gps, lat, lon = _gps_for_heartbeat()
                         wifi_ok, wifi_adp = get_wifi_health(self.iface)
                         cpu_temp          = get_cpu_temp()
-                        has_gps           = os.path.exists(os.environ.get("GPS_DEVICE", "/dev/ttyUSB0"))
                         mobile            = os.environ.get("NODE_MOBILE", "false").lower() == "true"
                         common = {
                             # Per-feeder heartbeat: wifi_* fields only.
@@ -4820,22 +5163,15 @@ def main():
     # exclusive locking by default). Convention: --band=2g owns GPS
     # (arbitrary but deterministic); --band=5g skips the reader entirely
     # and relies on the peer to update the shared /run/droneaware/gps_state.json.
-    # --band=auto (single-adapter mode) owns GPS as always.
+    # --band=auto (single-adapter mode) owns GPS as always. The same holds
+    # for gpsd since v1.6.2.2: one client per node is plenty.
     if args.band == "5g":
         log.info("[GPS] --band=5g: skipping GPS reader (peer 2g feeder owns "
                  "the serial port; state file is shared)")
     else:
-        gps_device = find_gps_device()
-        if gps_device:
-            log.info(f"[GPS] Dongle detected at {gps_device}")
-            # Seed initial state so `droneaware status` has something to show
-            # before the reader thread has a chance to update it.
-            _write_gps_state(device=gps_device, status="detecting_baud")
-            t = threading.Thread(target=gps_reader_thread, args=(gps_device,), daemon=True)
-            t.start()
-        else:
-            log.info("[GPS] No GPS dongle detected — position will not be reported")
-            _write_gps_state(status="not_configured")
+        global _gps_owner
+        _gps_owner = True
+        threading.Thread(target=gps_thread, daemon=True).start()
 
     feeder = WiFiFeeder(
         iface=args.iface,
