@@ -18,7 +18,13 @@ on:
         type: boolean
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest. The pinned arm-runner-action below installs
+    # qemu-user-static, which Ubuntu 26.04 no longer ships (it is a virtual
+    # package there), so on 26.04 the build fails ~15s in, before any of our
+    # code runs. Every release through v1.6.2.1 was built on 24.04. The host
+    # only runs QEMU and the image tools; the binaries are compiled inside the
+    # Bookworm image pinned below, so this does not change what nodes get.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
       # This build takes five packages, all of them from Ubuntu's own mirror:
