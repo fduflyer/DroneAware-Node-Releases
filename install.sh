@@ -1307,10 +1307,16 @@ enroll_node() {
         fi
 
         if [[ "$http_status" == "409" ]]; then
-            warn "That node name is already taken by another account. Please choose a different name."
+            local server_msg suggested
+            server_msg=$(echo "$response" | grep -oP '"detail"\s*:\s*"\K[^"]+' || true)
+            suggested=$(echo "$response" | grep -oP '"suggested_node_id"\s*:\s*"\K[^"]+' || true)
+            [[ "$suggested" =~ ^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$ ]] || suggested=""
+            warn "${server_msg:-That node name is already taken by another account. Please choose a different name.}"
             echo ""
+            [[ -n "$suggested" ]] && echo "  Press Enter to use ${suggested}, or type a different name."
             while true; do
-                read -rp "  New node nickname: " NODE_ID </dev/tty
+                read -rp "  New node nickname${suggested:+ [$suggested]}: " NODE_ID </dev/tty
+                NODE_ID="${NODE_ID:-$suggested}"
                 NODE_ID="${NODE_ID// /-}"
                 NODE_ID="${NODE_ID,,}"
                 if [[ -z "$NODE_ID" ]]; then
@@ -1323,6 +1329,13 @@ enroll_node() {
                     break
                 fi
             done
+            # The body was serialized before this loop. Without rebuilding it the new
+            # name is never sent, and every retry is refused until the token expires.
+            if ! body=$(_build_enroll_body \
+                "$NODE_ID" "$enrollment_token" "$NODE_MOBILE" \
+                "$has_gps_json" "$lat_json" "$lon_json"); then
+                fatal "Failed to serialize enrollment body. Confirm python3 is installed: 'sudo apt install python3'"
+            fi
             continue
         elif [[ "$http_status" == "200" || "$http_status" == "201" ]]; then
             local node_credential
